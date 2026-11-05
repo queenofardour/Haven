@@ -1,0 +1,225 @@
+using System.Diagnostics;
+using System.Numerics;
+using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.ImGuiFileDialog;
+using Dalamud.Interface.Textures;
+using Dalamud.Interface.Textures.TextureWraps;
+using Dalamud.Interface.Windowing;
+using Dalamud.Plugin.Services;
+using Haven.Core;
+using HavenNative;
+using Stagehand.Api;
+using static Haven.HavenTokens;
+
+namespace Haven;
+
+// Haven's Settings window: adapts the controller and engine to SettingsUi, and owns the
+// file dialog used for import and export (also from the launcher's ⋯ menu).
+internal sealed class SettingsWindow : Window, IDisposable
+{
+    private readonly HousingController housing;
+    private readonly NativeEngine engine;
+    private readonly ICommandManager commands;
+    private readonly ITextureProvider textures;
+    // Settings → Custom content: the owner's pictures, rebuilt every 2 seconds rather than every frame, and their thumbnails.
+    private SettingsPicture[] pictures = [];
+    private DateTime picturesAt;
+    private readonly Dictionary<string, Task<IDalamudTextureWrap?>> thumbnails = [];
+    private readonly FileDialogManager files = new();
+    private readonly SettingsState state = new();
+    // The footer shows what the player's own actions here reported (HousingController.StatusVersion past the last
+    // one), not whatever Haven last said elsewhere: a home deleted in the launcher left its message under About.
+    private int statusSince = int.MaxValue;
+    private static readonly string Version = typeof(Plugin).Assembly.GetName().Version?.ToString(3) ?? "alpha";
+    // Reports a completed file action outside the footer status (a Dalamud notification).
+    public System.Action<string>? Notify;
+    /// <summary>Opens "What's new" (the latest versions' notes).</summary>
+    public System.Action? ShowChangelog;
+
+    public SettingsWindow(HousingController housing, NativeEngine engine, ICommandManager commands, IDataManager data, ITextureProvider textures)
+        : base("Haven settings###Haven.Settings", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
+    {
+        this.housing = housing; this.engine = engine; this.commands = commands; this.textures = textures;
+        Size = new Vector2(640, 620); SizeCondition = ImGuiCond.FirstUseEver;
+        SizeConstraints = new() { MinimumSize = new Vector2(520, 480), MaximumSize = new Vector2(float.MaxValue) };
+    }
+
+    private SettingsPicture[] Pictures()
+    {
+        // What the server holds is checked, not remembered: the operator may have cleared it.
+        housing.Run(housing.CheckPicturesOnServer);
+        if (DateTime.UtcNow - picturesAt < TimeSpan.FromSeconds(2)) return pictures;
+        picturesAt = DateTime.UtcNow;
+        SettingsPicture Row(string hash, PictureDetails d, string title) => new(hash, d.Size, d.Height > 0 ? d.Width / (float)d.Height : 1, title,
+            $"{ContentSizes.Megabytes(d.Size)} · {(d.FromCommunity ? "from the former community gallery" : d.LastStored != null ? "on Haven's server" : "not on Haven's server; uploaded when you place it")}", d.Homes);
+        var mine = housing.MyPictures().Select(h => (Hash: h, Details: housing.Details(h))).ToArray();
+        return pictures = mine.Select(p => Row(p.Hash, p.Details, p.Details.Width > 0 ? $"{p.Details.Width} × {p.Details.Height}" : "Picture")).ToArray();
+    }
+
+    private ImTextureID? Thumbnail(string hash)
+    {
+        if (!thumbnails.TryGetValue(hash, out var task))
+            thumbnails[hash] = task = Task.Run<IDalamudTextureWrap?>(() => housing.PictureThumbnail(hash) is {} t
+                ? textures.CreateFromRaw(RawImageSpecification.Rgba32(t.Width, t.Height), t.Rgba, "Haven settings picture") : null);
+        return task.IsCompletedSuccessfully ? task.Result?.Handle : null;
+    }
+
+    public void Dispose()
+    {
+        foreach (var task in thumbnails.Values) if (task.IsCompletedSuccessfully) task.Result?.Dispose();
+        thumbnails.Clear();
+    }
+
+    public void Show(int tab = 0, Guid? home = null)
+    {
+        state.Tab = tab; if (home != null) state.Home = home;
+        statusSince = int.MaxValue;
+        IsOpen = true; BringToFront();
+    }
+
+    public override void PreDraw()
+    {
+        HavenKit.PushTheme();
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, Px(Space5, Space4)); ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, Px(RadiusWindow));
+    }
+    public override void PostDraw() { ImGui.PopStyleVar(2); HavenKit.PopTheme(); }
+
+    public override void Draw()
+    {
+        var relay = engine.HousingRelay;
+        var model = new SettingsModel(engine.HousingAmbientEffects, engine.HousingAmbientSounds, AmbientBudget.MaxEffects, AmbientBudget.MaxSounds,
+            housing.Houses.Select(h => new SettingsHome(h.Id, h.Name)).ToArray(),
+            housing.Store.DirectoryPath, housing.Store.DeletedDirectoryPath, engine.HousingRelayUrl, RelayConnectionFailure.HostedEndpoint, engine.HousingHostCode,
+            housing.CanStartVisit, housing.IsSharedVisit,
+            [$"Stagehand: {housing.StagehandStatus} · native hooks {(engine.HousingCanLoad ? "resolved" : "unavailable")}",
+             $"Active collision parts: {housing.ColliderCount}", housing.FixtureStatus,
+             "Editing imported Stagehand objects updates Haven's saved copy. Close Stagehand's own preview to avoid duplicates."],
+            relay.IsRecovering ? relay.RecoveryStatus : housing.StatusVersion > statusSince ? housing.Status : "", "Version " + Version)
+        {
+            LayoutsFolder = housing.LayoutsFolder, GroupsFolder = housing.GroupsFolder,
+            Chat = engine.HousingChat,
+            WarnMinionProps = engine.HousingWarnMinionProps,
+            WarnTiltedSeats = engine.HousingWarnTiltedSeats,
+            Pictures = state.Tab == 2 ? Pictures() : [],
+            Furniture = state.Tab == 2 ? [.. housing.Furniture.Library.Select(f => new SettingsFurniture(f.Hash, f.Item.Name,
+                f.Item.BaseItem == 0 ? "A prop made from a minion model" : "Built on " + (housing.Catalogue.Find(f.Item.BaseItem)?.Name ?? "an unknown item"), housing.FurnitureHomes(f.Hash)))] : [],
+            Animations = state.Tab == 2 ? [.. housing.Animations.Library.Select(a => new SettingsFurniture(a.Hash, a.Item.Name,
+                a.Item.Stored != null ? "On Haven's server" : "On this PC only", housing.AnimationHomes(a.Hash)))] : [],
+            AnimationProps = state.Tab == 2 ? [.. housing.Gear.Installed.Values] : [],
+            PropChoices = housing.Gear.Remembered,
+            Songs = state.Tab == 2 && state.Content == 1 ? [.. housing.Songs.Library.Select(s => new SettingsSong(s.Hash, s.Song.Title,
+                $"{s.Song.Milliseconds / 60000}:{s.Song.Milliseconds / 1000 % 60:00} · {(s.Song.Stored != null ? "on Haven's server" : "on this PC only")}",
+                housing.SongHomes(s.Hash), s.Song.Stored != null && !s.Song.FromCommunity))] : [],
+            Usage = housing.PictureUsage is {} u ? new(u.OwnerBytes, u.OwnerLimit, u.UploadsToday, u.UploadsPerDay, u.PoolBytes, u.PoolLimit, u.At) : null,
+            Thumbnail = Thumbnail,
+            Account = new(housing.Account.SignedIn, housing.Account.Name, housing.Account.SigningIn, housing.Account.Problem, housing.Account.Code),
+        };
+        var command = SettingsUi.Draw(state, model);
+        if (command.Action != SettingsAction.None) Execute(command);
+    }
+
+    private void Execute(SettingsCommand command)
+    {
+        statusSince = housing.StatusVersion;
+        switch (command.Action)
+        {
+            case SettingsAction.Close: IsOpen = false; break;
+            case SettingsAction.SignIn: housing.Account.SignIn(engine.HousingRelayUrl, OpenLink); break;
+            case SettingsAction.SignOut: housing.Account.SignOut(); break;
+            case SettingsAction.CancelSignIn: housing.Account.Cancel(); break;
+            case SettingsAction.DeletePicture: housing.Run(() => housing.DeleteOriginal(command.Text, command.First)); picturesAt = default; break;
+            case SettingsAction.DeleteUnusedPictures: housing.Run(housing.DeleteUnusedPictures); picturesAt = default; break;
+            case SettingsAction.DeleteFurniture: housing.Run(() => housing.DeleteFurniture(command.Text)); break;
+            case SettingsAction.DeleteAnimations: housing.Run(() => housing.DeleteAnimations(command.Text)); break;
+            case SettingsAction.RemoveProps: housing.Run(housing.RemoveAnimationProps); break;
+            case SettingsAction.ForgetPropChoices: housing.Gear.ForgetChoices(); break;
+            case SettingsAction.DeleteSong: housing.Run(() => housing.DeleteSong(command.Text, command.First)); break;
+            case SettingsAction.Ambience: housing.Run(() => housing.SetAmbience(command.First, command.Second)); break;
+            case SettingsAction.Chat: housing.Run(() => engine.SetHousingChat(command.Chat)); break;
+            case SettingsAction.WarnMinionProps: housing.Run(() => engine.HousingWarnMinionProps = command.First); break;
+            case SettingsAction.WarnTiltedSeats: housing.Run(() => engine.HousingWarnTiltedSeats = command.First); break;
+            case SettingsAction.Changelog: ShowChangelog?.Invoke(); break;
+            case SettingsAction.Import: Import(); break;
+            case SettingsAction.Export: Export(command.Home); break;
+            case SettingsAction.OpenHomes: OpenFolder(housing.Store.DirectoryPath); break;
+            case SettingsAction.OpenDeleted: OpenFolder(housing.Store.DeletedDirectoryPath); break;
+            case SettingsAction.OpenLayouts: OpenFolder(housing.LayoutsFolder); break;
+            case SettingsAction.OpenGroups: OpenFolder(housing.GroupsFolder); break;
+            case SettingsAction.SaveRelay: housing.Run(() => engine.SetHousingRelay(command.Text)); break;
+            case SettingsAction.UseHostedRelay: housing.Run(() => engine.SetHousingRelay(RelayConnectionFailure.HostedEndpoint)); break;
+            case SettingsAction.SaveCode: housing.Run(() => { engine.SetHousingVisitCodes(command.Text, engine.HousingGuestCode); housing.VisitCode = command.Text; }); break;
+            case SettingsAction.CopyCode: ImGui.SetClipboardText(command.Text); break;
+            case SettingsAction.NewCode:
+                var code = System.Security.Cryptography.RandomNumberGenerator.GetHexString(16).ToLowerInvariant();
+                housing.Run(() => { engine.SetHousingVisitCodes(code, engine.HousingGuestCode); housing.VisitCode = code; });
+                break;
+        }
+    }
+
+    public void Import() => files.OpenFileDialog("Import a Haven home", "Haven homes{.json}", (ok, paths) =>
+    {
+        if (!ok || paths.Count == 0) return;
+        var path = paths[0];
+        housing.Run(() => { housing.Import(path); Notify?.Invoke($"Imported {Path.GetFileName(path)} as a new home."); });
+    }, 1, housing.Store.DirectoryPath);
+
+    // A MakePlace layout joins the saved layouts; done receives it once saved.
+    public void ImportMakePlace(Func<HomeLayout, uint?> shell, Action<Guid> done) => files.OpenFileDialog("Import a MakePlace layout", "MakePlace layouts{.json}", (ok, paths) =>
+    {
+        if (!ok || paths.Count == 0) return;
+        var path = paths[0];
+        housing.Run(() => { var result = housing.ImportMakePlace(path, shell); done(result.Layout); Notify?.Invoke(result.Summary("Imported " + Path.GetFileName(path))); });
+    }, 1, Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+
+    // An image for a picture frame; picked receives its path.
+    public void PickPicture(Action<string> picked) => files.OpenFileDialog("Choose a picture", "Pictures{.png,.jpg,.jpeg,.bmp,.gif,.tga}", (ok, paths) =>
+    {
+        if (ok && paths.Count > 0) picked(paths[0]);
+    }, 1, Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+
+    public void PickSong(Action<string> picked) => files.OpenFileDialog("Choose a song", "Songs{.mp3,.ogg,.wav,.flac}", (ok, paths) =>
+    {
+        if (ok && paths.Count > 0) picked(paths[0]);
+    }, 1, Environment.GetFolderPath(Environment.SpecialFolder.MyMusic));
+
+    // A furniture mod for custom furniture: a .pmp, or a Penumbra mod folder.
+    public void PickFurnitureMod(bool folder, Action<string> picked)
+    {
+        if (folder) files.OpenFolderDialog("Choose a Penumbra mod folder", (ok, path) => { if (ok && path.Length > 0) picked(path); });
+        else files.OpenFileDialog("Choose a furniture mod", "Penumbra mods{.pmp}", (ok, paths) => { if (ok && paths.Count > 0) picked(paths[0]); }, 1);
+    }
+
+    // An animation mod for pose balls: a .pmp, or a Penumbra mod folder.
+    public void PickAnimationMod(bool folder, Action<string> picked)
+    {
+        if (folder) files.OpenFolderDialog("Choose a Penumbra animation mod folder", (ok, path) => { if (ok && path.Length > 0) picked(path); });
+        else files.OpenFileDialog("Choose an animation mod", "Penumbra mods{.pmp}", (ok, paths) => { if (ok && paths.Count > 0) picked(paths[0]); }, 1);
+    }
+
+    public void Export(Guid id)
+    {
+        if (housing.Houses.FirstOrDefault(h => h.Id == id) is not { } home) return;
+        var name = string.Concat(home.Name.Split(Path.GetInvalidFileNameChars())).Trim();
+        files.SaveFileDialog("Export a Haven home", "Haven homes{.json}", (name.Length > 0 ? name : "home") + ".haven", ".json", (ok, path) =>
+        {
+            if (!ok) return;
+            housing.Run(() => { housing.Export(home, path); Notify?.Invoke($"Exported {home.Name} to {Path.GetFileName(path)}."); });
+        }, Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+    }
+
+    // Discord's sign-in page, in the player's own browser.
+    private void OpenLink(string url)
+    {
+        try { Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true }); }
+        catch (Exception ex) { housing.Run(() => throw new InvalidOperationException("The browser could not be opened: " + ex.Message)); }
+    }
+
+    private void OpenFolder(string path)
+    {
+        try { Directory.CreateDirectory(path); Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true }); }
+        catch (Exception ex) { housing.Run(() => throw new InvalidOperationException("The folder could not be opened: " + ex.Message)); }
+    }
+
+    // The file dialog draws every frame, whether or not Settings is open, so the launcher can use it too.
+    public void DrawDialogs() => files.Draw();
+}

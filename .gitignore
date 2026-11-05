@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+.idea/
+.tools/
+artifacts/
+*.user
+*.suo
+node_modules/
+.wrangler/
+.env
+.env.*
+infra/cloudflare/wrangler.deploy.json

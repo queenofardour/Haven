@@ -1,0 +1,14 @@
+**/bin
+**/obj
+.git
+.tools
+.research
+artifacts
+infra
+tests
+tools
+docs
+**/node_modules
+**/.wrangler
+**/.env*
+**/*.user

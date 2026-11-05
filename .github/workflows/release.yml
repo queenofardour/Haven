@@ -1,0 +1,76 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+concurrency:
+  group: haven-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install .NET 10 SDK
+        shell: pwsh
+        run: |
+          $feed = 'https://builds.dotnet.microsoft.com/dotnet'
+          $sdk = (Invoke-RestMethod "$feed/release-metadata/10.0/releases.json").'latest-sdk'
+          $installer = Join-Path $env:RUNNER_TEMP 'dotnet-install.ps1'
+          $root = Join-Path $env:RUNNER_TEMP 'dotnet'
+          Invoke-WebRequest "$feed/scripts/v1/dotnet-install.ps1" -OutFile $installer
+          & $installer -Version $sdk -AzureFeed $feed -InstallDir $root
+          if ($LASTEXITCODE) { throw ".NET SDK $sdk install failed." }
+          "DOTNET_ROOT=$root" >> $env:GITHUB_ENV
+          "DOTNET_MULTILEVEL_LOOKUP=0" >> $env:GITHUB_ENV
+          $root >> $env:GITHUB_PATH
+      - name: Download Dalamud development assemblies
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'dalamud'
+          Invoke-WebRequest https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -OutFile "$env:RUNNER_TEMP/dalamud.zip"
+          Expand-Archive "$env:RUNNER_TEMP/dalamud.zip" $destination
+          "DALAMUD_HOME=$destination" >> $env:GITHUB_ENV
+      - name: Check the tag matches the version
+        id: version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content src/Haven/Haven.csproj -Raw)).Project.PropertyGroup.Version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'The tag must match the version in Haven.csproj.' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build and run the checks
+        shell: pwsh
+        run: ./scripts/build.ps1
+      - name: Package the plugin and its source
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipBuild
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAVEN_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = if (Test-Path "docs/updates/UPDATE-$env:HAVEN_VERSION.md") { "docs/updates/UPDATE-$env:HAVEN_VERSION.md" } else { $null }
+          $arguments = @("v$env:HAVEN_VERSION", "artifacts/Haven-alpha-$env:HAVEN_VERSION.zip", "artifacts/Haven-source-$env:HAVEN_VERSION.zip", '--title', "Haven $env:HAVEN_VERSION")
+          if ($notes) { $arguments += @('--notes-file', $notes) } else { $arguments += @('--notes', "Haven $env:HAVEN_VERSION") }
+          gh release create @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the release failed; the plugin list was not changed.' }
+      - name: Update the plugin list
+        shell: pwsh
+        env:
+          HAVEN_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./scripts/new-repository-manifest.ps1 -Repository $env:GITHUB_REPOSITORY -OutputDirectory "$env:RUNNER_TEMP/feed"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          $branch = 'feed'
+          git fetch origin $branch 2>$null
+          if ($LASTEXITCODE -eq 0) { git checkout -B $branch "origin/$branch" } else { git checkout --orphan $branch; git rm -rf . | Out-Null }
+          Copy-Item "$env:RUNNER_TEMP/feed/pluginmaster.json" pluginmaster.json -Force
+          git add pluginmaster.json
+          git commit -m "Haven $env:HAVEN_VERSION"
+          git push origin $branch

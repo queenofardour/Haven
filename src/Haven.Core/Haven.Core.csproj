@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MessagePack" Version="2.5.307" />
+    <!-- Custom music: MP3 and Ogg decoding, Ogg Vorbis encoding (all MIT; see THIRD_PARTY_NOTICES.md). -->
+    <PackageReference Include="NLayer" Version="3.0.0" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="OggVorbisEncoder" Version="1.2.2" />
+    <Compile Include="../Haven/Native/Upstream/Wire/HMSyncWireTypes.cs" Link="Wire/NativeWire.cs" />
+    <!-- World pieces' names, filled later from the offline tool's contact sheets. -->
+    <EmbeddedResource Include="World/world-names.json" LogicalName="Haven.Core.World.world-names.json" />
+    <EmbeddedResource Include="World/world-hidden.txt" LogicalName="Haven.Core.World.world-hidden.txt" />
+  </ItemGroup>
+</Project>

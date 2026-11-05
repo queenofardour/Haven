@@ -1,0 +1,3177 @@
+// Derived from Enceladeum/HMapSync at 8140dbb04cfbfa59da9ff0c3f4e787978d368303. AGPL-3.0-or-later. See THIRD_PARTY_NOTICES.md.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Game;              // b111: WeatherManager (SetNextWeather transition path)
+using FFXIVClientStructs.FFXIV.Client.Graphics.Environment;
+using Lumina.Excel.Sheets;
+
+namespace HavenNative.Services;
+
+/// <summary>
+/// S326 - Map-state backbone. Host-authoritative environment control for a loaded map: TIME (Eorzea hour),
+/// WEATHER (from the territory's legal WeatherRate set, plus 0 = atmospheric/undefined), and BGM. The host sets
+/// these; they are broadcast and replayed to peers (wire fields on TransformData / a dedicated map-state message),
+/// applied on map load AND changeable mid-session. NPC-removal is a wire flag here too (functionality lands later).
+///
+/// READS (sheet-derived, no guesswork - confirmed against Weatherman's DataProvider + the CSV column layout):
+///   • Legal weather for a territory = TerritoryType.WeatherRate → WeatherRate.Weather[0..7] (weather IDs), names
+///     from Weather.Name. We prepend 0 ("Default / atmospheric") as an always-valid choice (Hyperborea's trick:
+///     weather 0 gives atmospheric effects with no defined weather). Integer prefixes stripped - names only.
+///   • BGM names: the BGM sheet is PATHS ONLY (no titles). Friendly names come from the Orchestrion sheet
+///     (keyed by Orchestrion row id - the precise BGM-sheet-id ↔ Orchestrion mapping is finalized when the BGM
+///     playback helper lands; OrchestrionPath.File is a path string, NOT a BGM ref). "None" (0) is always offered.
+///
+/// WRITES:
+///   • Weather: EnvManager.Instance()->ActiveWeather (byte). Setting it directly re-skins the sky/effects.
+///     (Weatherman patches the render path for persistence; we set the field + re-assert after load, which is
+///     enough for a static RP scene. If the game overwrites it on its own weather tick, the re-assert poll catches it.)
+///   • Time: EnvManager exposes the Eorzea time; we set the day-time seconds. (Mirrors Weatherman's time write.)
+///   • BGM: scene-based, more involved - deferred to the plugin/BGM path (Orchestrion's BGMManager pattern). This
+///     service owns the DATA (what BGM id) and the wire; the actual scene push is a thin helper.
+///
+/// HOST-ONLY: only the session host may set map state. Peers receive + apply. Enforced at the command/plugin layer.
+/// </summary>
+public unsafe class MapSettingsService
+{
+    private readonly IDataManager dataManager;
+    private readonly IPluginLog log;
+    private readonly TimeFreezeService timeFreeze;
+    private readonly WeatherCramService weatherCram;
+    private readonly WeatherPresetStore weatherPresets;
+    private readonly KeyframeSetStore keyframeSets;   // PATH I b163: durable day-night graft library
+    private readonly Dictionary<uint, List<(byte id, string name, bool legal)>> lvbWeatherCache = new();
+    // NB-39: cutscene stage-bg → authored default weather, read straight from the stage's own .lvb (bypasses the donor
+    // territory entirely). Cached by bg path. See GetStageDefaultWeather + the Reassert stage branch.
+    private readonly Dictionary<string, byte> stageWeatherCache = new();
+    // NB-39: the active cutscene stage's bg, set by DoLoad before the post-load reassert; null on a plain zone load.
+    // When set, Reassert resolves the load-time NATIVE weather from the STAGE's authored .lvb, not the donor territory
+    // (a cutscene borrows whatever real zone you launched from as its donor — an interior donor = weather 0 = None, the
+    // "cutscenes all pop as None/atmospheric" bug). Donor is the graceful fallback when the stage .lvb has no weather.
+    public string? ActiveStageBgForWeather { get; set; }
+
+    // b173: NATIVE-SKY BLACK RESCUE. On some instance/cutscene territories (e.g. The Clyteum 1345) a weather id sits IN the
+    // loaded env bank (so IsWeatherInLoadedBank passes and the dropdown/promotion offers it as native) yet resolves to a
+    // DEGENERATE/black EnvState — the map was only authored to render a couple of its weathers, and the rest index an empty
+    // env slot. Native ApplyWeather writes ActiveWeather and the sky recomputes BLACK. The extra-preset CHIP for the same id
+    // renders fine because it RESTAMPS a good donor block over that black native EnvState every frame — that is exactly the
+    // "dropdown Clear Skies is black but the chip Clear Skies works" disconnect the operator reported. We cannot predict
+    // black statically (in-bank ≠ has-valid-env-data), so we VERIFY after the fact: a native apply arms a short deferred
+    // check; ~N frames later (once the native recompute has run) we sample the resolved EnvState, and if it came back black
+    // AND we hold a good sky for that id (a time-marching graft set or a baked static preset) we upgrade to it — reproducing
+    // the working chip. Non-degenerate natives (Fair Skies, Snow) read populated and are left untouched, so the cases the
+    // operator likes native stay native. Weather 0 (None-Atmospheric, the deliberate dramatic-lighting blank) is never armed.
+    private byte pendingVerifyId;
+    private int pendingVerifyFrames;
+
+    public MapSettingsService(IDataManager dataManager, IPluginLog log, TimeFreezeService timeFreeze, WeatherCramService weatherCram, WeatherPresetStore weatherPresets, KeyframeSetStore keyframeSets, ISigScanner sig)
+    {
+        this.dataManager = dataManager;
+        this.log = log;
+        this.timeFreeze = timeFreeze;
+        this.weatherCram = weatherCram;
+        this.weatherPresets = weatherPresets;
+        this.keyframeSets = keyframeSets;
+        orchestrion = new HousingMusicStream(sig, log);
+    }
+
+    // ── Current host-set state (the authoritative values the host has chosen; broadcast to peers) ──
+    // 0/unset sentinels: WeatherId 0 is a VALID choice (atmospheric), so "unset" is tracked separately.
+    public bool HasState { get; private set; }         // has the host set anything this session?
+    public byte WeatherId { get; set; }                 // 0 = default/atmospheric (valid); else a legal weather id
+    public uint WeatherDonor { get; set; }              // b183: day/night sky-graft donor tt (0 = static weather, no graft) — paired with WeatherId
+    public ushort EorzeaHour { get; set; } = 12;        // 0..23, the forced Eorzea hour (with minute below)
+    public byte EorzeaMinute { get; set; }              // 0..59
+    public bool TimeForced { get; set; }                // is time being held? (vs let it flow naturally)
+    public uint BgmId { get; set; }                     // 0 = none/silence; else a BGM sheet row id
+    public bool RemoveNpcs { get; set; }                // host flag - despawn all event NPCs (S328aa)
+    public bool HideQuestSigns { get; set; }            // host flag - hide over-head quest markers only (S328aa)
+
+    public void MarkStateSet() => HasState = true;
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // SHEET READS - dropdown population
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Legal weather choices for a territory: (id, displayName). Always begins with (0, "Default / atmospheric").
+    /// Then the WeatherRate.Weather[] entries for the territory, de-duplicated, names from Weather.Name, integer
+    /// prefixes stripped (names only). Returns just the (0) entry if the territory or its rate row is unresolvable.
+    /// </summary>
+    // v0.7.471 - TERRITORY-SCOPED WEATHER PROMOTIONS.
+    //
+    // Some territories accept a weather that isn't in their WeatherRate set, so it only ever appeared behind
+    // "Show more presets" (debug-gated). These three want CutScene (59) in the ordinary picker. Verified against
+    // Weather.csv (`59,CutScene,CutScenery,,,,,0`) and TerritoryType/WeatherRate:
+    //
+    //   958  (m5f2)  rate 133 -> native [15, 9, 7, 4, 3, 2, 1]
+    //   1011 (ec029) rate 27  -> native [15]           <- one weather, hence how bare it feels
+    //   1120 (ec048) rate 58  -> native [1]            <- likewise
+    //
+    // 59 is in NONE of those sets, so the promotion is purely additive on all three.
+    //
+    // WEATHER 0 ("None - Atmospheric") AND THE WeatherId==0 SENTINEL - the accurate, current picture (this block was
+    // reversed several times; the reversals are collapsed here). Two facts, not one:
+    //   (1) An EXPLICIT pick of 0 (or any debug id) DOES reach peers. Since v0.7.475 PushMapState ships an explicit
+    //       pick VERBATIM via the weatherOverride path (HavenNativePlugin.PushMapState) - it does NOT re-derive through
+    //       GetLegalWeather, so "cannot be broadcast" is FALSE for the pick itself. (An earlier revision of this
+    //       comment claimed the opposite; that revision predates the verbatim-broadcast refactor and is wrong.)
+    //   (2) What 0 does NOT do is PERSIST across a map-load reassert. Reassert() (below, ~line 735) and the load-time
+    //       native-weather engage (~line 744) both gate on `WeatherId != 0`, treating 0 as "host set nothing" and
+    //       falling back to the zone's native sky. So a held "None - Atmospheric" is dropped on the next load. Fixing
+    //       THAT cleanly needs a separate HasWeather bool (mirror TimeForced) so "explicitly None" is distinguishable
+    //       from "unset" - deferred as an edge case (see the Maintenance Manual known-issues, Part 7).
+    // GetLegalWeather still starts its list with (0, "Default / atmospheric") so the picker can offer it; the caveat
+    // above is only about persistence, not selectability.
+    //
+    // WHY NUMERIC IDS. The first cut of this resolved names against the Weather sheet, on the reasoning that an
+    // unverified id fails silently-and-wrongly while a name miss fails visibly. That reasoning was sound and the
+    // premise is now gone: with the CSVs on hand the id is ground truth, so the resolver was pure risk surface
+    // (a sheet enumeration + a string match, either of which could fail quietly inside the enclosing try/catch -
+    // and one of which did). Verified constant beats runtime lookup.
+    private static readonly Dictionary<uint, byte[]> PromotedWeather = new()
+    {
+        [958]  = new byte[] { 59, 150 },   // CutScene; Apocalypse (150) - in 958's LVB/debug set, renders natively when forced, so promote it to the ordinary picker
+        [1011] = new byte[] { 59 },   // CutScene
+        [1120] = new byte[] { 59 },   // CutScene
+        [1345] = new byte[] { 4 },    // Fog - m6d2, native set is [15] only; verified Weather.csv `4,Fog,foggy`
+    };
+
+    /// <summary>v0.7.473 - `/havenengine weatherdiag`. Dumps every input the weather picker and chip grid decide from, for
+    /// the loaded zone, so "why isn't X in the dropdown" is answered by reading rather than by inference. Exists
+    /// because two successive static reads of this path produced two wrong answers.</summary>
+    public void DumpWeatherDiag(uint territoryId)
+    {
+        try
+        {
+            log.Information("[HavenNative] [WXDIAG] territory=" + territoryId);
+            byte def = GetDefaultWeather(territoryId);
+            byte live = GetActiveWeather();
+            // NB-42: also dump the WeatherManager-RESOLVED current weather (GetCurrentWeather). On scripted/battle
+            // zones this exposes the desync at a glance: def (WeatherRate roll) can differ from displayed/resolved (the
+            // sky the engine actually shows). Host vs peer: compare `displayed`/`resolved` — if they differ across
+            // clients on the same zone, that's the weather desync; the reassert now broadcasts the RENDERED byte.
+            byte resolved = 0;
+            try { var wm = FFXIVClientStructs.FFXIV.Client.Game.WeatherManager.Instance(); if (wm != null) resolved = wm->GetCurrentWeather(); } catch { }
+            log.Information("[HavenNative] [WXDIAG] defaultWeather(WeatherRate roll)=" + def + " (" + WeatherName(def) + ")"
+                + "  displayed(EnvManager+0x26)=" + live + " (" + WeatherName(live) + ")"
+                + "  resolved(WeatherManager)=" + resolved + " (" + WeatherName(resolved) + ")");
+            // ⚠ The dropdown SKIPS any entry equal to defaultWeather (it's rendered as the "(native)" row above the
+            // separator). So if a promoted id equals defaultWeather it is present in the list and invisible below.
+            var legal = GetLegalWeather(territoryId);
+            log.Information("[HavenNative] [WXDIAG] GetLegalWeather -> " + legal.Count + " entries: "
+                + string.Join(", ", legal.Select(x => x.id + ":" + x.name)));
+            bool has59 = legal.Exists(x => x.id == 59);
+            log.Information("[HavenNative] [WXDIAG] CutScene(59) in legal set = " + has59
+                + (has59 && def == 59 ? "  ← AND equals defaultWeather, so the dropdown skips it (renders as \"(native)\")" : ""));
+
+            var lvb = GetLvbWeathers(territoryId);
+            log.Information("[HavenNative] [WXDIAG] LVB weathers -> " + lvb.Count + ": "
+                + string.Join(", ", lvb.Select(x => x.id + ":" + x.name + (x.legal ? "(legal)" : "(extra)"))));
+            // v0.7.474: report BOTH chip modes. The first cut modelled only the LVB path and reported "1 chip"
+            // while the debug grid was showing ~70 - because debug mode passes includeAll:true, which appends
+            // every used weather beyond the LVB set. A diagnostic that models one branch of the thing it is
+            // diagnosing is worse than none: it reads as authoritative and disagrees with the screen.
+            foreach (var dbg in new[] { false, true })
+            {
+                var zw = GetZoneWeathers(territoryId, dbg);
+                var chips = zw.Where(x => !x.legal && x.id != 0 && x.id != def).ToList();
+                log.Information("[HavenNative] [WXDIAG] chips (debugMode=" + dbg + ") -> " + chips.Count + ": "
+                    + string.Join(", ", chips.Select(x => x.id + ":" + x.name)));
+            }
+        }
+        catch (Exception ex) { log.Error("[HavenNative] [WXDIAG] failed: " + ex.Message); }
+    }
+
+    public List<(byte id, string name)> GetLegalWeather(uint territoryId)
+    {
+        var result = new List<(byte, string)> { (0, "Default / atmospheric") };
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            if (terrSheet == null || !terrSheet.HasRow(territoryId)) return result;
+            var terr = terrSheet.GetRow(territoryId);
+
+            var rateSheet = dataManager.GetExcelSheet<WeatherRate>();
+            uint rateId = terr.WeatherRate.RowId;
+            if (rateSheet == null || !rateSheet.HasRow(rateId)) return result;
+            var rate = rateSheet.GetRow(rateId);
+
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            if (weatherSheet == null) return result;
+
+            var seen = new HashSet<byte> { 0 };
+            // WeatherRate.Weather is a fixed-length collection (8) of weather-id refs.
+            foreach (var wRef in rate.Weather)
+            {
+                var wid = (byte)wRef.RowId;
+                if (wid == 0 || seen.Contains(wid)) continue;
+                if (!weatherSheet.HasRow(wid)) continue;
+                var name = weatherSheet.GetRow(wid).Name.ToString();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                seen.Add(wid);
+                result.Add((wid, name));
+            }
+
+            // v0.7.471: append this territory's promotions AFTER the sheet set, so the native weathers keep their
+            // usual order and the promoted one lands at the bottom of the picker as the odd one out.
+            if (PromotedWeather.TryGetValue(territoryId, out var promos))
+                foreach (var pid in promos)
+                {
+                    if (pid == 0 || seen.Contains(pid) || !weatherSheet.HasRow(pid)) continue;
+                    var pname = weatherSheet.GetRow(pid).Name.ToString();
+                    // Unlike the native loop above, an empty name does NOT skip the entry here: the promotion is
+                    // deliberate and a blank label in some client language shouldn't make it vanish silently.
+                    if (string.IsNullOrWhiteSpace(pname)) pname = "Weather " + pid;
+                    seen.Add(pid);
+                    result.Add((pid, pname));
+                }
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] GetLegalWeather(" + territoryId + ") failed: " + ex.Message);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// A weather id's display name (names only). 0 → "Default / atmospheric". Falls back to "Weather {id}".
+    /// </summary>
+    public string WeatherName(byte id)
+    {
+        if (id == 0) return "Default / atmospheric";
+        try
+        {
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            if (weatherSheet != null && weatherSheet.HasRow(id))
+            {
+                var n = weatherSheet.GetRow(id).Name.ToString();
+                if (!string.IsNullOrWhiteSpace(n)) return n;
+            }
+        }
+        catch { /* fall through */ }
+        return "Weather " + id;
+    }
+
+    // S327e: read the BGM the game is CURRENTLY playing (scene 0 = the zone/field theme priority). Lets the Music row
+    // show the actual track even before the host picks one, and keeps the name when paused. The friendly title still
+    // needs the Orchestrion community CSV (deferred) - this returns the id, named "Track N" for now.
+    public uint GetCurrentBgm()
+    {
+        try
+        {
+            // An active orchestrion override plays off the BGM director (the scene holds silence), so report the
+            // namespaced roll selection instead of the scene read - keeps the Music row + picker highlight honest.
+            if (currentOrchestrionSel != 0) return currentOrchestrionSel;
+            var bgm = FFXIVClientStructs.FFXIV.Client.Game.BGMSystem.Instance();
+            if (bgm == null || bgm->Scenes.LongCount <= 0) return 0;
+            ushort playing = bgm->Scenes.First->PlayingBgmId;   // 0x0E - what's actually audible
+            ushort target = bgm->Scenes.First->BgmId;           // 0x0C
+            return playing != 0 ? playing : (uint)target;
+        }
+        catch { return 0; }
+    }
+
+    // S327b/f: current Eorzea time-of-day as HH:MM. Delegates to TimeFreezeService, which reads ClientTime.EorzeaTime
+    // (the field the renderer uses) - when frozen that's our held value, when not it's the live recomputed clock.
+    public (int hour, int minute) GetEorzeaTimeOfDay() => timeFreeze.GetTimeOfDay();
+
+    // S327b: resolve a territory's display name (PlaceName) for the "Zone: <name> (ID)" header. Empty if unnamed.
+    public string GetZoneName(uint territoryId)
+    {
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            if (terrSheet != null && terrSheet.HasRow(territoryId))
+                return terrSheet.GetRow(territoryId).PlaceName.ValueNullable?.Name.ToString() ?? "";
+        }
+        catch { /* fall through */ }
+        return "";
+    }
+
+    /// <summary>
+    /// The territory's DEFAULT BGM id (TerritoryType.BGM), used to preload the BGM dropdown's default choice.
+    /// </summary>
+    // (Removed CurrentZoneDefaultBgm - it read GameMain.CurrentTerritoryTypeId, which does NOT reflect a synthetic
+    // HMS load: the packet filter hides the real zone change, so GameMain still reports the apartment/previous zone.
+    // That produced "plays the last map's track" bugs. Callers now pass the TRUE loaded-zone id, GetDefaultBgm(id).)
+
+    public uint GetDefaultBgm(uint territoryId)
+    {
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            if (terrSheet != null && terrSheet.HasRow(territoryId))
+            {
+                uint tb = terrSheet.GetRow(territoryId).BGM.RowId;
+                // Instanced zones (1345 Clyteum etc.) carry the SILENCE PLACEHOLDER (1001); their real music is defined
+                // STATICALLY on the content via ContentFinderCondition → InstanceContent.BGM (1345 → CFC 1011 →
+                // InstanceContent 104 → BGM 20264 "Untested Voyager"). Use ONLY that static value - do NOT fall back to
+                // the live scene read (it returns whatever's playing mid-transition = the PREVIOUS zone's track, which
+                // is what produced the "Kugane"/"880 Cartos" MISMATCHES). If the content has no BGM either, return the
+                // placeholder so it resolves to SILENCE - a correct silence beats a wrong track.
+                // NB (b229): the polymorphic concrete-file resolver introduced in b228 REGRESSED the picker - it dropped
+                // instanced duties whose live BGM chain the shipped datamining sheets don't fully mirror (the NieR
+                // alliance raids: Copied Factory / Puppets' Bunker vanished, having worked on b227). Reverted to feeding
+                // the game's own BGM SCENE id, which the native BGM director resolves (incl. positional sub-area music).
+                if (tb == SilencePlaceholderBgm)
+                {
+                    uint ic = ResolveInstanceContentBgm(territoryId);
+                    // b232 TOWER FIX (diagnosed live 2026-09-21): IC.BGM == SilenceTrackBgm (1 = BGM_Null) is an
+                    // EXPLICIT-silence marker (The Tower at Paradigm's Breach, IC 30105). Returning it makes the caller
+                    // PlayBgm(1), which PINS the scene to BGM_Null and SUPPRESSES the zone's native positional (LGB)
+                    // music - which is exactly why the Tower was silent while the other two NieR raids played: they
+                    // carry IC.BGM == 0 and fall through to the placeholder 1001, which the native director resolves
+                    // POSITIONALLY into their real track (Factory→737, Bunker→783 "Fortress of Lies"). Treat IC-silence
+                    // the same as "no static override" so the Tower falls through to 1001 too and its theme plays.
+                    return (ic != 0 && ic != SilenceTrackBgm) ? ic : tb;   // real content BGM, else placeholder (→ native director)
+                }
+                return tb;
+            }
+        }
+        catch { /* fall through */ }
+        return 0;
+    }
+
+    // Resolve a territory's music via the instanced-content chain: TerritoryType.ContentFinderCondition →
+    // .Content (InstanceContent) → .BGM. Returns 0 if the territory isn't instanced content or has no BGM override.
+    // (Access pattern mirrors ZoneLoadService's proven TerritoryType.ContentFinderCondition.ValueNullable?.Content.)
+    private uint ResolveInstanceContentBgm(uint territoryId)
+    {
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            if (terrSheet == null || !terrSheet.HasRow(territoryId)) return 0;
+            var cfc = terrSheet.GetRow(territoryId).ContentFinderCondition.ValueNullable;
+            if (cfc == null) return 0;
+            // Content is an UNTYPED RowRef (it can point at different sheets by ContentType) - resolve it explicitly
+            // as InstanceContent. Returns default (RowId 0) if it isn't an InstanceContent row.
+            var ic = cfc.Value.Content.GetValueOrDefault<InstanceContent>();
+            if (ic == null) return 0;
+            return ic.Value.BGM.RowId;
+        }
+        catch { return 0; }
+    }
+
+    // DEBUG-ONLY diagnostic: describe how a territory's BGM resolves in the LIVE sheets (which differ from the shipped
+    // datamining CSVs for some instanced content). Prints TerritoryType.BGM + InstanceContent.BGM, classifies each as a
+    // concrete track / BGMSituation / BGMSwitch, and expands situation slots to their concrete .scd files. Used to nail
+    // down instanced-music chains (e.g. why one NieR raid is silent while the others play). Not surfaced in normal help.
+    public List<string> DescribeBgmChain(uint territoryId)
+    {
+        var lines = new List<string>();
+        try
+        {
+            var terr = dataManager.GetExcelSheet<TerritoryType>();
+            if (terr == null || !terr.HasRow(territoryId)) { lines.Add("TT " + territoryId + ": not in TerritoryType"); return lines; }
+            var row = terr.GetRow(territoryId);
+            string place = row.PlaceName.ValueNullable?.Name.ToString() ?? "";
+            uint tb = row.BGM.RowId;
+            lines.Add("TT " + territoryId + " (" + place + "): TT.BGM=" + tb + " " + ClassifyBgm(tb));
+            AppendSituation(lines, tb);
+            uint ic = ResolveInstanceContentBgm(territoryId);
+            lines.Add("  IC.BGM=" + ic + " " + ClassifyBgm(ic));
+            AppendSituation(lines, ic);
+            lines.Add("  live-playing=" + GetCurrentBgm());
+        }
+        catch (Exception ex) { lines.Add("diag error: " + ex.Message); }
+        return lines;
+    }
+
+    private string ClassifyBgm(uint v)
+    {
+        if (v == 0) return "(none)";
+        if (v == SilenceTrackBgm) return "(silence)";
+        if (v >= 50000) return "(BGMSwitch)";
+        if (IsBgmSituation(v)) return "(BGMSituation)";
+        return "(concrete: " + BgmFilePath(v) + ")";
+    }
+
+    private void AppendSituation(List<string> lines, uint v)
+    {
+        if (!IsBgmSituation(v)) return;
+        var slots = GetSituationSlots(v);
+        if (slots.Count == 0) { lines.Add("    situation " + v + ": all-silence (no audible slots)"); return; }
+        foreach (var (bgmId, label) in slots)
+            lines.Add("    situation " + v + " [" + label + "] -> BGM " + bgmId + "  " + BgmFilePath(bgmId));
+    }
+
+    private string BgmFilePath(uint id)
+    {
+        try
+        {
+            var b = dataManager.GetExcelSheet<BGM>();
+            if (b != null && b.HasRow(id)) return b.GetRow(id).File.ToString();
+        }
+        catch { }
+        return "?";
+    }
+
+    // b236: LAST-RESORT name derived from the track's own .scd file (BGM sheet File column), for concrete ids that no
+    // sheet place-name and no LGB trigger reaches. This is the user's thesis made concrete - "the files live in the
+    // client": the game ships a file path for every track, even the NieR alliance-raid pack (music/ex3/BGM_EX3_Ytc_NN.scd)
+    // and the director-resolved field variants (music/ex4/BGM_EX4_Field_Gar_Day.scd) that surface as bare ids at play time.
+    //   Prettify: drop the dir + ".scd", strip the leading "BGM_" and the "EX#_"/"ORCH_" section token, spaces for
+    //   underscores. So 855 -> "Field Gar Day", 737 -> "Ytc 06". Cryptic-ish but strictly more informative than "Track N"
+    //   and, crucially, it names raid/field tracks WITHOUT entering the zone. Only consulted AFTER the sheet + LGB lookups
+    //   miss, so it never overrides a good name. BGM_Null (silence) is excluded. Cached (misses included) - sheet reads
+    //   aren't free and BgmName is called per-frame.
+    private readonly Dictionary<uint, string?> bgmFileDerivedNameCache = new();
+    private string? BgmFileDerivedName(uint id)
+    {
+        if (bgmFileDerivedNameCache.TryGetValue(id, out var cached)) return cached;
+        string? result = null;
+        try
+        {
+            var b = dataManager.GetExcelSheet<BGM>();
+            if (b != null && b.HasRow(id))
+            {
+                var path = b.GetRow(id).File.ToString();   // e.g. music/ex4/BGM_EX4_Field_Gar_Day.scd
+                if (!string.IsNullOrEmpty(path) && path.EndsWith(".scd", StringComparison.OrdinalIgnoreCase)
+                    && path.IndexOf("BGM_Null", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    var slash = path.LastIndexOf('/');
+                    var basename = slash >= 0 ? path.Substring(slash + 1) : path;
+                    basename = basename.Substring(0, basename.Length - 4);            // drop ".scd"
+                    if (basename.StartsWith("BGM_", StringComparison.OrdinalIgnoreCase)) basename = basename.Substring(4);
+                    var us = basename.IndexOf('_');
+                    if (us > 0)
+                    {
+                        var head = basename.Substring(0, us);
+                        if ((head.StartsWith("EX", StringComparison.OrdinalIgnoreCase) && head.Length <= 4)
+                            || head.Equals("ORCH", StringComparison.OrdinalIgnoreCase))
+                            basename = basename.Substring(us + 1);
+                    }
+                    var pretty = basename.Replace('_', ' ').Trim();
+                    if (pretty.Length > 0) result = pretty;
+                }
+            }
+        }
+        catch { }
+        bgmFileDerivedNameCache[id] = result;   // cache misses too, to avoid repeat sheet reads
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // LGB BGM SCAN (b233). The territory→track link for POSITIONAL music. The NieR alliance raids (Copied Factory /
+    // Puppets' Bunker / Tower) carry TerritoryType.BGM = the silence placeholder (1001) and InstanceContent.BGM =
+    // 0/silence, so no territory-keyed sheet reaches their music - the native BGM director resolves it from MapRange
+    // trigger boxes in the zone's LGB (LayerCommon.MapRangeInstanceObject.BGM, gated by BGMEnabled). We parse those
+    // triggers directly. Lumina reads the LGB straight from sqpack, so this works from ANYWHERE (no need to be in the
+    // zone) - which is exactly what the runtime-observation approach (b232 NoteLiveTrack) could not do. The MapRange.BGM
+    // value is POLYMORPHIC (concrete track / BGMSituation 1001-1407 / BGMSwitch >=50000); DescribeZoneLgbBgm classifies
+    // + expands each so we can see what the raids actually bind before wiring the picker.
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    // LGB names that can carry MapRange BGM triggers, in probe order. (bg = geometry+ranges, planmap = dungeon/instance
+    // ranges, planevent = event-instance ranges; the rest are scanned defensively.) All are unioned + deduped by BGM id.
+    private static readonly string[] BgmLgbNames = { "bg", "planmap", "planevent", "planlive", "sound", "planner" };
+
+    // Every distinct MapRange BGM trigger in a territory's LGBs. First-seen order across the probe list, deduped by BGM
+    // id. `layer` is the LGB layer name; `enabled`/`weather`/`inOnly` are the raw trigger gates for diagnostics.
+    // b244: `throttleRatio` > 0 enables ADAPTIVE DUTY-CYCLE throttling of the sqpack reads. After each LGB read we sleep
+    // (readTime × throttleRatio), capped, so the parser holds the lock for at most 1/(1+ratio) of wall time - the render
+    // thread is guaranteed the rest. This is what makes a big World/City LGB read stop hitching FPS: the cost of one read
+    // is followed by a proportional pause, spacing contention out instead of bursting. 0 = no throttle (the diagnostic path).
+    private List<(uint bgm, byte enabled, uint weather, byte inOnly, string layer)> ScanZoneMapRangeBgm(uint territoryId, int throttleRatio = 0)
+    {
+        var outp = new List<(uint, byte, uint, byte, string)>();
+        try
+        {
+            var terr = dataManager.GetExcelSheet<TerritoryType>();
+            if (terr == null || !terr.HasRow(territoryId)) return outp;
+            var bg = terr.GetRow(territoryId).Bg.ToString();
+            if (string.IsNullOrEmpty(bg)) return outp;
+            var lastSlash = bg.LastIndexOf('/');
+            var levelPath = lastSlash >= 0 ? bg[..lastSlash] : bg;   // e.g. ffxiv/wsx/dun/w1d1/level
+            var seen = new HashSet<uint>();
+            foreach (var name in BgmLgbNames)
+            {
+                var path = "bg/" + levelPath + "/" + name + ".lgb";
+                Lumina.Data.Files.LgbFile? f;
+                long t0 = throttleRatio > 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+                try { f = dataManager.GetFile<Lumina.Data.Files.LgbFile>(path); } catch { continue; }
+                // b244: adaptive duty-cycle back-off - sleep proportional to how long THIS read actually took, so an
+                // expensive read is followed by a proportional pause (the render thread gets the lock back), while cheap
+                // reads barely pause. Capped so a pathological read can't stall the parse forever.
+                if (throttleRatio > 0)
+                {
+                    double readMs = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                    int sleepMs = (int)Math.Min(50.0, Math.Max(1.0, readMs * throttleRatio));
+                    System.Threading.Thread.Sleep(sleepMs);
+                }
+                if (f == null) continue;
+                foreach (var layer in f.Layers)
+                {
+                    if (layer.InstanceObjects == null) continue;
+                    foreach (var o in layer.InstanceObjects)
+                    {
+                        if (o.AssetType != Lumina.Data.Parsing.Layer.LayerEntryType.MapRange) continue;
+                        if (o.Object is not Lumina.Data.Parsing.Layer.LayerCommon.MapRangeInstanceObject mr) continue;
+                        if (mr.BGM == 0) continue;
+                        if (!seen.Add(mr.BGM)) continue;
+                        outp.Add((mr.BGM, mr.BGMEnabled, mr.Weather, mr.BGMPlayZoneInOnly, layer.Name ?? ""));
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] ScanZoneMapRangeBgm(" + territoryId + ") failed: " + ex.Message); }
+        return outp;
+    }
+
+    // Expand a BGMSwitch (id >= 50000) into the distinct, non-silence concrete BGM ids its subrows reference. A BGMSwitch
+    // is a subrow sheet: each subrow is a Quest-gated candidate track (Bunker's switch 50035 fans out to 780/781/783/
+    // 824/825/732 across story progression). For the picker we want EVERY track it can ever select, so we union all
+    // subrows' BGM refs. Silence (1) and empty (0) dropped. (API: GetSubrowExcelSheet<T>().TryGetRow → iterate subrows.)
+    private List<uint> ExpandBgmSwitch(uint switchId)
+    {
+        var outp = new List<uint>();
+        var seen = new HashSet<uint>();
+        try
+        {
+            var s = dataManager.GetSubrowExcelSheet<BGMSwitch>();
+            if (s != null && s.TryGetRow(switchId, out var subs))
+            {
+                foreach (var sub in subs)
+                {
+                    uint id = sub.BGM.RowId;
+                    if (id == 0 || id == SilenceTrackBgm) continue;
+                    if (seen.Add(id)) outp.Add(id);
+                }
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] ExpandBgmSwitch(" + switchId + ") failed: " + ex.Message); }
+        return outp;
+    }
+
+    // DEBUG-ONLY diagnostic (Stage 1 of the LGB-BGM work): dump every MapRange BGM trigger a territory's LGBs carry,
+    // each classified (concrete/situation/switch) and fully expanded to its concrete .scd tracks, so we can see exactly
+    // what the NieR raids bind positionally. Reveals whether MapRange.BGM is a concrete id (name it directly), a
+    // BGMSituation (expand slots), or a BGMSwitch (expand subrows) - which decides how the picker integration is built.
+    public List<string> DescribeZoneLgbBgm(uint territoryId)
+    {
+        var lines = new List<string>();
+        try
+        {
+            var terr = dataManager.GetExcelSheet<TerritoryType>();
+            if (terr == null || !terr.HasRow(territoryId)) { lines.Add("TT " + territoryId + ": not in TerritoryType"); return lines; }
+            var row = terr.GetRow(territoryId);
+            string place = row.PlaceName.ValueNullable?.Name.ToString() ?? "";
+            string bg = row.Bg.ToString();
+            lines.Add("TT " + territoryId + " (" + place + "): bg=" + bg);
+            var triggers = ScanZoneMapRangeBgm(territoryId);
+            if (triggers.Count == 0) { lines.Add("  no MapRange BGM triggers found in any LGB"); return lines; }
+            foreach (var (bgm, enabled, weather, inOnly, layer) in triggers)
+            {
+                lines.Add("  MapRange BGM=" + bgm + " " + ClassifyBgm(bgm)
+                    + "  [enabled=" + enabled + " inZoneOnly=" + inOnly + " weather=" + weather + " layer='" + layer + "']");
+                AppendSituation(lines, bgm);                            // if it's a situation, list its slots
+                if (bgm >= 50000)                                       // if it's a switch, list its candidate tracks
+                {
+                    var cands = ExpandBgmSwitch(bgm);
+                    if (cands.Count == 0) lines.Add("    switch " + bgm + ": no candidate tracks");
+                    foreach (var c in cands)
+                        lines.Add("    switch " + bgm + " -> BGM " + c + "  " + BgmFilePath(c));
+                }
+            }
+        }
+        catch (Exception ex) { lines.Add("lgb diag error: " + ex.Message); }
+        return lines;
+    }
+
+    // S327l/m/o: LOCATION-BASED BGM NAMING. The game has no readable BGM-id → song-title map (Orchestrion's sheet is
+    // keyed by Orchestrion RowId ≠ BGM RowId; titles live only in Orchestrion's community CSV). We name each BGM by the
+    // PLACE/DUTY that plays it - "Terncliff", "Clyteum" - which is what an RP host actually wants ("play THIS location's
+    // music", not "Rambunctious Waltz of Faeries, movement 2"). Sources, all in-game:
+    //  • Open-world / most zones: TerritoryType.BGM (<1000 = direct file track) + TerritoryType.PlaceName.
+    //  • INSTANCED content (dungeons/raids/trials): TerritoryType.BGM is usually the SILENCE PLACEHOLDER (1001); the real
+    //    track is on the content - ContentFinderCondition → InstanceContent.BGM - named by the DUTY name (CFC.Name).
+    //    (Verified: 1345 → CFC 1011 → InstanceContent 104 → BGM 20264. ~558 placeholder territories resolve this way.)
+    // The silence placeholder (1001) itself is excluded from naming. Distinct BGMs sharing a name get "#N" suffixes.
+    // NB (b229): the b228 concrete-file "situation slot" resolver was reverted here - see EnsureBgmNames / GetDefaultBgm.
+    private const uint SilencePlaceholderBgm = 1001;
+    // Orchestrion rolls play through a SEPARATE system (not BGM ids), so selections carrying a roll are namespaced into
+    // a high id range: a value >= OrchestrionIdBase encodes an Orchestrion roll (rollId = value - OrchestrionIdBase).
+    // This keeps the single-uint BGM selection + wire format intact (real BGM ids max ~20312, far below the base).
+    internal const uint OrchestrionIdBase = 0x40000000;   // 1,073,741,824
+    private Dictionary<uint, string>? bgmZoneName;
+    // b231: situation ids kept NAMED (for the "Zone default (...)" label + playback) but HIDDEN from the browse list,
+    // because we surface their concrete slot tracks instead (see EnsureBgmNames Pass 3). Clicking a hidden situation id
+    // still resolves via the director; we just don't list the indirection alongside its expanded slots.
+    private HashSet<uint>? bgmHideFromList;
+
+    // A BGM field value in [1001,1407] is a BGMSituation id, NOT a concrete BGM (the BGM sheet has NO rows in that range
+    // - verified: BGM 1000 is the last real row, 1001+ are situation-only). The native director resolves a situation to
+    // one of its slot tracks by time-of-day / battle state. So TerritoryType.BGM = a situation id is how instanced music
+    // (incl. the NieR alliance raids) is bound: the picker entry plays the situation, the director picks the concrete slot.
+    private bool IsBgmSituation(uint v)
+    {
+        if (v < 1001 || v > 1407) return false;
+        try { var s = dataManager.GetExcelSheet<BGMSituation>(); return s != null && s.HasRow(v); }
+        catch { return false; }
+    }
+
+    // The distinct, non-silence concrete slot tracks of a BGMSituation, each tagged with a time-of-day/state label.
+    // Order = Day, Night, Battle, Dawn, Dusk (native slot order); first occurrence of a given bgm id keeps its label.
+    // Silence (BGM 1 = BGM_Null) and empty (0) slots are dropped - they contribute no audible track.
+    private List<(uint bgmId, string label)> GetSituationSlots(uint situationId)
+    {
+        var outp = new List<(uint, string)>();
+        var seen = new HashSet<uint>();
+        try
+        {
+            var s = dataManager.GetExcelSheet<BGMSituation>();
+            if (s == null || !s.HasRow(situationId)) return outp;
+            var r = s.GetRow(situationId);
+            void Add(uint id, string label)
+            {
+                if (id == 0 || id == SilenceTrackBgm) return;
+                if (seen.Add(id)) outp.Add((id, label));
+            }
+            Add(r.DaytimeID.RowId, "Day");
+            Add(r.NightID.RowId, "Night");
+            Add(r.BattleID.RowId, "Battle");
+            Add(r.DaybreakID.RowId, "Dawn");
+            Add(r.TwilightID.RowId, "Dusk");
+        }
+        catch { /* leave what we have */ }
+        return outp;
+    }
+
+    // b242: kick the sheet-name catalog build ONCE, on a BACKGROUND thread. Previously this ran synchronously on whatever
+    // thread first touched a BGM name - and the render thread hit it when the HMS window reopened on the Map Control tab
+    // at login, or when the music DTR named the current track - so the ~thousands-of-rows sheet build (plus the old
+    // 20k-row raid scan) stuttered the client on game launch. Now NOTHING BGM-related does heavy work on the main thread:
+    // the build runs off-thread and publishes by reference swap; until it lands, readers null-guard bgmZoneName (BgmName
+    // falls back to the .scd-derived name, the picker shows a category "Loading…" hint). Idempotent via the started guard.
+    private int bgmNamesStarted;
+    private void EnsureBgmNames()
+    {
+        if (bgmZoneName != null) return;                                                      // already published
+        if (System.Threading.Interlocked.Exchange(ref bgmNamesStarted, 1) != 0) return;       // build already running
+        var t = new System.Threading.Thread(BuildBgmNames)
+        { IsBackground = true, Priority = System.Threading.ThreadPriority.BelowNormal, Name = "HavenNative-BgmNames" };
+        t.Start();
+    }
+
+    // b242: the actual sheet-name catalog build, OFF the main thread. Builds into locals and publishes bgmHideFromList
+    // then bgmZoneName by reference swap - bgmZoneName LAST, since it's the readiness signal every reader gates on.
+    private void BuildBgmNames()
+    {
+        var zone = new Dictionary<uint, string>();
+        var hide = new HashSet<uint>();
+        try
+        {
+            var terr = dataManager.GetExcelSheet<TerritoryType>();
+            if (terr == null) { bgmZoneName = zone; return; }
+
+            // Pass 1: open-world/zone tracks - FIRST place name per distinct bgm id (skip 0 + silence placeholder).
+            var rawByBgm = new Dictionary<uint, string>();
+            foreach (var row in terr)
+            {
+                uint bgmId = row.BGM.RowId;
+                if (bgmId == 0 || bgmId == SilencePlaceholderBgm) continue;
+                if (rawByBgm.ContainsKey(bgmId)) continue;
+                var place = row.PlaceName.ValueNullable?.Name.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(place)) continue;
+                rawByBgm[bgmId] = NormalizeName(place);
+            }
+
+            // Pass 1b: INSTANCED content tracks - enumerate ContentFinderCondition → InstanceContent.BGM, keyed by the
+            // duty name. Only add a bgm id not already named by a territory (territory place names win for open zones).
+            // This recovers dungeon/raid/trial music that the territory BGM field hides behind the silence placeholder.
+            var cfcSheet = dataManager.GetExcelSheet<ContentFinderCondition>();
+            if (cfcSheet != null)
+            {
+                foreach (var cfc in cfcSheet)
+                {
+                    var ic = cfc.Content.GetValueOrDefault<InstanceContent>();
+                    if (ic == null) continue;
+                    uint bgmId = ic.Value.BGM.RowId;
+                    if (bgmId == 0 || bgmId == SilencePlaceholderBgm) continue;
+                    if (rawByBgm.ContainsKey(bgmId)) continue;   // already named by a territory/earlier duty
+                    var dutyName = cfc.Name.ToString();
+                    if (string.IsNullOrWhiteSpace(dutyName)) continue;
+                    rawByBgm[bgmId] = NormalizeName(dutyName);
+                }
+            }
+
+            // Pass 2: names shared by >1 distinct bgm id → "#N" suffixes (stable, bgm-id order → deterministic #1,#2,…).
+            var countByPlace = new Dictionary<string, int>();
+            foreach (var name in rawByBgm.Values)
+                countByPlace[name] = countByPlace.GetValueOrDefault(name) + 1;
+
+            var seqByPlace = new Dictionary<string, int>();
+            foreach (var kv in rawByBgm.OrderBy(k => k.Key))
+            {
+                string name = kv.Value;
+                if (countByPlace[name] > 1)
+                {
+                    int n = seqByPlace.GetValueOrDefault(name) + 1;
+                    seqByPlace[name] = n;
+                    zone[kv.Key] = name + " #" + n;
+                }
+                else
+                {
+                    zone[kv.Key] = name;
+                }
+            }
+
+            // Pass 3 (b231): SITUATION SLOT EXPANSION. A named entry whose id is a BGMSituation is an INDIRECTION - the
+            // director resolves it to a concrete slot track by time-of-day/battle. We surface those concrete tracks so
+            // (a) the Music row names what's actually audible (was "Track 783" - the resolved id had no name), and
+            // (b) multi-track instances (the NieR alliance raids etc.) list each of their tracks. The situation id stays
+            // NAMED (for "Zone default (...)" + playback) but is HIDDEN from the browse list in favour of its slots.
+            // Runs AFTER Pass 2 so a situation and its slots (same location) aren't mistaken for rival names and #N'd apart.
+            foreach (var sid in zone.Keys.Where(IsBgmSituation).ToList())
+            {
+                var slots = GetSituationSlots(sid);
+                if (slots.Count == 0) continue;                  // silent situation (e.g. Tower - LGB-only music): keep as-is
+                string baseName = zone[sid];
+                bool multi = slots.Count > 1;
+                foreach (var (bgmId, label) in slots)
+                {
+                    if (zone.ContainsKey(bgmId)) continue;       // a real zone/duty already names this track: it wins
+                    zone[bgmId] = multi ? baseName + " - " + label : baseName;
+                }
+                hide.Add(sid);                                   // list the slots, not the indirection
+            }
+
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] BuildBgmNames failed: " + ex.Message);
+        }
+        bgmHideFromList = hide;   // publish (before the readiness signal)
+        bgmZoneName = zone;       // publish the readiness signal - readers gate on this being non-null
+        // b242: fold in the alliance-raid series packs (bounded id ranges, NOT a full-sheet scan) AFTER publish, so
+        // AddRaidSeriesPacks' "sheet wins" skip reads the now-published bgmZoneName; merged via the locked MergeIntoLearned
+        // so it can't race a chip parse's own merge.
+        try
+        {
+            var raid = new Dictionary<uint, string>();
+            var taken = new HashSet<string>(zone.Values, StringComparer.OrdinalIgnoreCase);
+            AddRaidSeriesPacks(raid, taken);
+            MergeIntoLearned(raid);
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] raid-pack fold failed: " + ex.Message); }
+    }
+
+    /// <summary>
+    /// BGM display name. 0 → "None". The name of the ZONE that plays this BGM ("Terncliff" / "Central Shroud #2"),
+    /// else "Track {id}" for a BGM no territory references (rare event/cutscene stingers, or the silence placeholder).
+    /// </summary>
+    // Normalize a display name: capitalize the leading letter so articled duty names ("the Clyteum", "the Praetorium")
+    // read consistently with place names ("Central Shroud"). CFC gives lowercase-articled names; place names are
+    // already title-case - this makes them uniform.
+    private static string NormalizeName(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return s;
+        if (char.IsUpper(s[0])) return s;
+        return char.ToUpperInvariant(s[0]) + s.Substring(1);
+    }
+
+    // ── ORCHESTRION ROLLS ─────────────────────────────────────────────────────────────────────────────────────────
+    // A second, separate music source for the picker: the player's orchestrion rolls (dungeon/quest/event soundtracks).
+    // They do NOT resolve to BGM ids - their .scd lives under music/ffxiv/Orchestrion/ and plays through the raw sound
+    // path (see PlayOrchestrion), so we never touch OrchestrionManager (which is unlock/packet-gated). Titles come from
+    // the Orchestrion sheet (Name); the .scd path from OrchestrionPath (File); grouping from OrchestrionUiparam
+    // (Category + Order), matching the in-game orchestrion list. No unlock filter - HMS plays any roll for everyone.
+    private List<(uint sel, string title, string category, int catOrder, int order)>? orchChoices;
+    private Dictionary<uint, (string title, string path)>? orchByRoll;   // rollId → (title, scd path)
+
+    private void EnsureOrchestrion()
+    {
+        if (orchChoices != null) return;
+        orchChoices = new List<(uint, string, string, int, int)>();
+        orchByRoll = new Dictionary<uint, (string, string)>();
+        try
+        {
+            var orch = dataManager.GetExcelSheet<Orchestrion>();
+            var pathSheet = dataManager.GetExcelSheet<OrchestrionPath>();
+            var ui = dataManager.GetExcelSheet<OrchestrionUiparam>();
+            if (orch == null) return;
+            foreach (var row in orch)
+            {
+                uint rollId = row.RowId;
+                if (rollId == 0) continue;
+                var title = row.Name.ToString();
+                if (string.IsNullOrWhiteSpace(title)) continue;
+                string path = pathSheet != null && pathSheet.HasRow(rollId) ? pathSheet.GetRow(rollId).File.ToString() : "";
+                if (string.IsNullOrWhiteSpace(path)) continue;               // no .scd → not playable, skip
+                int order = 0, catOrder = 0; string catName = "";
+                if (ui != null && ui.HasRow(rollId))
+                {
+                    var up = ui.GetRow(rollId);
+                    order = up.Order;
+                    var c = up.OrchestrionCategory.ValueNullable;
+                    if (c != null) { catName = c.Value.Name.ToString(); catOrder = c.Value.Order; }
+                }
+                orchByRoll[rollId] = (title, path);
+                orchChoices.Add((OrchestrionIdBase + rollId, title, catName, catOrder, order));
+            }
+            // Group by category (the game's own genre order), alphabetical within - "Expansion & alphabetical" intent.
+            orchChoices.Sort((a, b) =>
+            {
+                int c = a.catOrder.CompareTo(b.catOrder);
+                if (c != 0) return c;
+                return string.Compare(a.title, b.title, StringComparison.OrdinalIgnoreCase);
+            });
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] EnsureOrchestrion failed: " + ex.Message); }
+    }
+
+    // The orchestrion section of the catalog: (selectionId, title, category, categoryOrder, order), pre-sorted by
+    // category then title. selectionId is already namespaced (OrchestrionIdBase + rollId) for storage/wire/playback.
+    public List<(uint sel, string title, string category, int catOrder, int order)> GetOrchestrionChoices()
+    {
+        EnsureOrchestrion();
+        return orchChoices ?? new List<(uint, string, string, int, int)>();
+    }
+
+    // Resolve a namespaced orchestrion selection back to its .scd path for raw playback. Returns false if unknown.
+    internal bool TryGetOrchestrionPath(uint selection, out string path)
+    {
+        path = "";
+        if (selection < OrchestrionIdBase) return false;
+        EnsureOrchestrion();
+        if (orchByRoll != null && orchByRoll.TryGetValue(selection - OrchestrionIdBase, out var e)
+            && !string.IsNullOrEmpty(e.path)) { path = e.path; return true; }
+        return false;
+    }
+
+    // LGB-DERIVED TRACK NAMES (b234/b235). Many zones bind MORE music than TerritoryType.BGM exposes: the native director
+    // reads MapRange trigger boxes in the zone's LGB, each pointing at a BGMSwitch / BGMSituation / concrete track (e.g.
+    // Garlemald's LGB carries switches 50051/50052 → situations 1320/1323/1338 → five distinct field/battle tracks, none
+    // of which TerritoryType.BGM reaches). The picker is a GLOBAL catalog - you pick ANY zone's track from ANYWHERE - so
+    // b234's lazy "scan only the zone you're standing in" was the wrong shape: Garlemald read "1 entry" from Ul'dah, and
+    // reaching a zone's extra music meant physically entering it. b235 instead sweeps EVERY territory's LGB ONCE, on a
+    // background thread, and publishes the whole track→name map with a single ATOMIC REFERENCE SWAP. GetBgmChoices lists
+    // all of it regardless of current zone; DrawBgmBrowsePopup rebuilds every frame, so tracks appear the instant the
+    // sweep lands - no zone change, no entry required.
+    //   Populated from the LGB, NOT from live playback: b232's runtime-observation NoteLiveTrack was REMOVED because it
+    //   named a track by where the player physically STOOD (mislabelled a previewed raid theme "Company Workshop -
+    //   Empyreum 2"). The LGB is the true territory→track link and Lumina reads it from sqpack off-thread, so it works
+    //   from anywhere without entering the zone. Zones with NO MapRange BGM (the NieR raids, whose music is resolved by
+    //   the instanced content director) add nothing here - that remains a separate problem.
+    // b238: the flat merged track→name map, used by BgmName + the "All" catalog. Grows as category chips are parsed: each
+    // parse rebuilds a NEW dict and swaps the reference in (never mutated in place), so UI-thread readers need no lock.
+    private Dictionary<uint, string> learnedTrackName = new();
+    // b238: per-category track buckets (chip key → id→name), parsed LAZILY when a chip is first opened. Concurrent because
+    // the parse runs on a background thread while the UI reads; a whole bucket is published at once (no torn reads).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Dictionary<uint, string>> categoryTracks = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> categoryParseStarted = new();
+
+    // b236 FPS fix: DrawBgmBrowsePopup calls GetBgmChoices EVERY FRAME while the popup is open, and that method rebuilt +
+    // sorted the whole global catalog each time. Cache the built list and only rebuild when the inputs actually change:
+    // the sweep publishing a new learnedTrackName (detected by reference identity) or a different zone default. bgmZoneName
+    // is built once and never mutated, so it needn't be part of the key.
+    private List<(uint id, string name)>? bgmChoicesCache;
+    private Dictionary<uint, string>? bgmChoicesCacheLearnedRef;
+    private uint bgmChoicesCacheDefault = uint.MaxValue;
+
+    // b237: DISK CACHE for the swept track→name map. The all-zones LGB indexing costs ~seconds; without a cache it ran on
+    // EVERY launch and froze the client the first time the BGM page opened. Now the sweep result is written to disk and
+    // reloaded instantly on subsequent launches - the indexing happens ONCE per build, not once per session. Keyed on the
+    // build stamp (assembly version + InternalBuild): a new build (naming logic may have changed) or a prod release
+    // invalidates the cache; a game patch is covered too, since it forces a rebuild. Path injected post-construction via
+    // InitBgmCache (mirrors InitWeatherSweep). Format: line 1 = build key, then "<id>\t<name>" per line.
+    private string? bgmCachePath;
+    private static readonly string BgmCacheBuildKey =
+        (typeof(MapSettingsService).Assembly.GetName().Version?.ToString() ?? "0")
+        + "-b" + (typeof(MapSettingsService).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
+            .OfType<System.Reflection.AssemblyMetadataAttribute>()
+            .FirstOrDefault(a => a.Key == "InternalBuild")?.Value ?? "0");
+
+    // b237: hand the sweep its disk-cache path (called once at startup, like InitWeatherSweep). Null path = no caching.
+    public void InitBgmCache(string path) { bgmCachePath = path; }
+
+
+    // b238: LAZY, PER-CATEGORY LGB parse. The b235-b237 eager all-zones sweep froze the client on the first BGM-page open
+    // (~700 zones × 6 GetFile back-to-back). Instead, when the picker's chip for a category is first opened, we parse ONLY
+    // that category's territories' LGBs - a small batch that finishes fast and is cached per category to disk. Most chips
+    // (Raid/Dungeon/Trial) barely touch the LGB (their music is sheet/pack-derived), so they're near-instant; only the
+    // World/City field zones do real scanning, and even then only their own slice. Idempotent per category key.
+    //   `cat` is the chip key (also the disk-cache section + the categoryTracks bucket key). `ttIds` are the territories the
+    //   UI classified into that chip (from its Zones clusters). Runs on a BelowNormal background thread with a per-dir yield.
+    public void EnsureCategoryParsed(string cat, IReadOnlyList<uint> ttIds)
+    {
+        if (string.IsNullOrEmpty(cat)) return;
+        if (!categoryParseStarted.TryAdd(cat, 1)) return;   // already parsing / parsed this session
+        var idsCopy = ttIds.ToArray();                       // snapshot: the UI list may change; the thread owns this copy
+        var t = new System.Threading.Thread(() =>
+        {
+            try
+            {
+                // b242: the sheet-name catalog now builds on its own background thread; wait briefly for it so a fresh
+                // parse names sheet-known tracks by their real place/duty name (and caches THAT), not a zone-derived fallback.
+                EnsureBgmNames();
+                for (int spins = 0; bgmZoneName == null && spins < 500; spins++) System.Threading.Thread.Sleep(10);
+                var cached = LoadCategoryCache(cat);
+                var bucket = cached ?? ParseTerritoryTracks(idsCopy);
+                // b238: the alliance-raid series packs have empty LGBs + placeholder primaries, so ParseTerritoryTracks can't
+                // reach them - fold them into the Raid chip explicitly (they're already in the flat "All" catalog too).
+                if (cached == null && string.Equals(cat, "Raid", StringComparison.Ordinal))
+                {
+                    var taken = new HashSet<string>(bucket.Values, StringComparer.OrdinalIgnoreCase);
+                    AddRaidSeriesPacks(bucket, taken);
+                }
+                categoryTracks[cat] = bucket;                // publish the whole bucket at once
+                MergeIntoLearned(bucket);                    // so BgmName + "All" see these ids too
+                if (cached == null) SaveCategoryCache(cat, bucket);
+                log.Information("[HavenNative] BGM category '" + cat + "': " + bucket.Count + " tracks "
+                    + (cached != null ? "from cache." : "parsed from " + idsCopy.Length + " territories."));
+            }
+            catch (Exception ex)
+            {
+                categoryParseStarted.TryRemove(cat, out _);   // allow a retry after a failure
+                log.Warning("[HavenNative] BGM category parse '" + cat + "' failed: " + ex.Message);
+            }
+        })
+        {
+            IsBackground = true,
+            Priority = System.Threading.ThreadPriority.BelowNormal,
+            Name = "HavenNative-BgmCat",
+        };
+        t.Start();
+    }
+
+    // b238: the parsed tracks for a chip (empty until its background parse lands; the UI rebuilds each frame so they fill in).
+    private static readonly Dictionary<uint, string> EmptyTracks = new();
+    public IReadOnlyDictionary<uint, string> GetCategoryTracks(string cat)
+        => categoryTracks.TryGetValue(cat, out var m) ? m : EmptyTracks;
+
+    // b238: has a chip's parse landed yet? (UI shows a "loading…" hint until then.)
+    public bool IsCategoryReady(string cat) => categoryTracks.ContainsKey(cat);
+
+    // b238: merge a freshly-parsed bucket into the flat learnedTrackName via a NEW dict + reference swap (UI-thread safe).
+    private readonly object learnedMergeLock = new();
+    private void MergeIntoLearned(Dictionary<uint, string> bucket)
+    {
+        if (bucket.Count == 0) return;
+        lock (learnedMergeLock)
+        {
+            var merged = new Dictionary<uint, string>(learnedTrackName);
+            foreach (var kv in bucket) merged[kv.Key] = kv.Value;
+            learnedTrackName = merged;   // atomic reference swap
+        }
+    }
+
+    // b238: parse a SPECIFIC set of territories' tracks - each territory's primary/instanced BGM (resolved through
+    // switch/situation) PLUS its LGB MapRange extras - so a chip lists the COMPLETE track set for its category (sheet-named
+    // primaries keep their sheet name; LGB-only extras are named "<Zone> - <condition>"). This is the per-category slice of
+    // what the old all-zones sweep did. Dedups scans by LGB directory and yields the sqpack lock after each dir.
+    private Dictionary<uint, string> ParseTerritoryTracks(IReadOnlyList<uint> ttIds)
+    {
+        var map = new Dictionary<uint, string>();
+        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (bgmZoneName != null) foreach (var v in bgmZoneName.Values) taken.Add(v);   // sheet display names are reserved
+        var scannedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var terr = dataManager.GetExcelSheet<TerritoryType>();
+        if (terr == null) return map;
+        foreach (var tt in ttIds)
+        {
+            if (tt == 0 || !terr.HasRow(tt)) continue;
+            string zone = GetZoneName(tt);
+            if (string.IsNullOrEmpty(zone)) continue;
+            var row = terr.GetRow(tt);
+            var seen = new HashSet<uint>();
+
+            // (a) primary / instanced BGM, expanded through switch/situation to concrete slots.
+            uint raw = GetDefaultBgm(tt);
+            foreach (var (trackId, label) in ResolveMapRangeTracks(raw, 0))
+                ClaimTrack(map, taken, seen, trackId, zone, label);
+
+            // (b) LGB MapRange extras (the positional field/battle variants). Dedup by dir + yield the lock after each.
+            var bg = row.Bg.ToString();
+            if (string.IsNullOrEmpty(bg)) continue;
+            var lastSlash = bg.LastIndexOf('/');
+            var levelPath = lastSlash >= 0 ? bg[..lastSlash] : bg;
+            if (!scannedDirs.Add(levelPath)) continue;
+            List<(uint bgm, byte enabled, uint weather, byte inOnly, string layer)> triggers;
+            // b244: adaptive duty-cycle throttle (ratio 3 ⇒ parser holds the lock ≤~25% of wall time) so even a big
+            // World/City LGB read doesn't crash FPS; the parse crawls but the render thread always wins the lock.
+            try { triggers = ScanZoneMapRangeBgm(tt, 3); } catch { triggers = new(); }
+            System.Threading.Thread.Sleep(1);   // extra breather between directories
+            foreach (var (bgm, _, _, _, _) in triggers)
+                foreach (var (trackId, label) in ResolveMapRangeTracks(bgm, 0))
+                    ClaimTrack(map, taken, seen, trackId, zone, label);
+        }
+        return map;
+    }
+
+    // b238: add one resolved track to a category bucket. Skips silence/placeholder + already-claimed ids. A track a sheet
+    // names keeps the SHEET name (so the chip lists it under its real place/duty name); an LGB-only extra is named
+    // "<Zone>" / "<Zone> - <label>" with a " #N" collision suffix.
+    private void ClaimTrack(Dictionary<uint, string> map, HashSet<string> taken, HashSet<uint> seen, uint trackId, string zone, string label)
+    {
+        if (trackId == 0 || trackId == SilenceTrackBgm || trackId == SilencePlaceholderBgm) return;
+        if (!seen.Add(trackId)) return;
+        if (map.ContainsKey(trackId)) return;
+        if (bgmHideFromList != null && bgmHideFromList.Contains(trackId)) return;   // a situation indirection: its slots are listed instead
+        string name;
+        if (bgmZoneName != null && bgmZoneName.TryGetValue(trackId, out var sheetName) && !string.IsNullOrWhiteSpace(sheetName))
+        {
+            name = sheetName;   // sheet wins the NAME, but the track is still listed under this category
+        }
+        else
+        {
+            string baseName = string.IsNullOrEmpty(label) ? zone : zone + " - " + label;
+            name = baseName;
+            for (int n = 2; taken.Contains(name); n++) name = baseName + " #" + n;
+        }
+        taken.Add(name);
+        map[trackId] = name;
+    }
+
+    // b238: per-category disk cache. One file (bgmCachePath), format: line 0 = build key, then "<cat>\t<id>\t<name>" per
+    // line. A parsed-but-empty category writes a sentinel "<cat>\t0\t" so it isn't re-parsed. A stale build key discards
+    // the whole file. All access is serialised on bgmCacheFileLock (categories parse on separate threads).
+    private readonly object bgmCacheFileLock = new();
+    private Dictionary<uint, string>? LoadCategoryCache(string cat)
+    {
+        lock (bgmCacheFileLock)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(bgmCachePath) || !System.IO.File.Exists(bgmCachePath)) return null;
+                var lines = System.IO.File.ReadAllLines(bgmCachePath);
+                if (lines.Length == 0 || lines[0] != BgmCacheBuildKey) { try { System.IO.File.Delete(bgmCachePath); } catch { } return null; }
+                var map = new Dictionary<uint, string>();
+                bool found = false;
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    var parts = lines[i].Split('\t');
+                    if (parts.Length < 3 || !string.Equals(parts[0], cat, StringComparison.Ordinal)) continue;
+                    found = true;
+                    if (uint.TryParse(parts[1], out var id) && id != 0) map[id] = parts[2];
+                }
+                return found ? map : null;   // not cached yet → caller parses
+            }
+            catch (Exception ex) { log.Warning("[HavenNative] BGM category cache load failed: " + ex.Message); return null; }
+        }
+    }
+    private void SaveCategoryCache(string cat, Dictionary<uint, string> bucket)
+    {
+        lock (bgmCacheFileLock)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(bgmCachePath)) return;
+                var keep = new System.Text.StringBuilder();
+                if (System.IO.File.Exists(bgmCachePath))
+                {
+                    var lines = System.IO.File.ReadAllLines(bgmCachePath);
+                    if (lines.Length > 0 && lines[0] == BgmCacheBuildKey)
+                        for (int i = 1; i < lines.Length; i++)
+                        {
+                            if (string.IsNullOrEmpty(lines[i])) continue;
+                            var parts = lines[i].Split('\t');
+                            if (parts.Length >= 1 && !string.Equals(parts[0], cat, StringComparison.Ordinal))
+                                keep.Append(lines[i]).Append('\n');   // preserve other categories' lines
+                        }
+                }
+                var sb = new System.Text.StringBuilder();
+                sb.Append(BgmCacheBuildKey).Append('\n').Append(keep);
+                if (bucket.Count == 0) sb.Append(cat).Append("\t0\t\n");   // parsed-but-empty sentinel
+                else foreach (var kv in bucket) sb.Append(cat).Append('\t').Append(kv.Key).Append('\t').Append(kv.Value).Append('\n');
+                System.IO.File.WriteAllText(bgmCachePath, sb.ToString());
+            }
+            catch (Exception ex) { log.Warning("[HavenNative] BGM category cache save failed: " + ex.Message); }
+        }
+    }
+
+    // b237: expose the alliance-raid music packs that have NO static territory→track link. Their LGBs carry no MapRange BGM
+    // trigger (proved for the 3 NieR raids in b233) - the instanced content director resolves their music at runtime - so
+    // the all-zones sweep above never reaches them and they showed a single entry each. The game stores each expansion's
+    // alliance-raid music as ONE undifferentiated numbered series in the BGM sheet's File column (NieR = ex3 Ytc_NN, Myths
+    // of the Realm = ex4 Raid_NN) with NO per-raid attribution, so the best available (user-sanctioned "suboptimal but
+    // better than missing music") is to list the whole series numbered under a series label. The NN is taken from the .scd
+    // filename for a stable number. Ids a sheet/LGB already named are left alone.
+    //   Each pack is a KNOWN, CONTIGUOUS BGM-id band (the whole NieR / Myths series lives in one run of ids), so we scan
+    //   only that ~100-id band and confirm each row's .scd path against the series prefix - NOT the whole ~20k-row BGM
+    //   sheet (b242: that full-sheet "harvest" was needless work; the bands are fixed data we can just serve).
+    private static readonly (string prefix, string series, uint lo, uint hi)[] RaidSeriesPacks =
+    {
+        ("music/ex3/BGM_EX3_Ytc_",  "YoRHa: Dark Apocalypse", 732, 827),
+        ("music/ex4/BGM_EX4_Raid_", "Myths of the Realm",     884, 978),
+    };
+    private void AddRaidSeriesPacks(Dictionary<uint, string> map, HashSet<string> taken)
+    {
+        try
+        {
+            var b = dataManager.GetExcelSheet<BGM>();
+            if (b == null) return;
+            foreach (var (prefix, series, lo, hi) in RaidSeriesPacks)
+            {
+                for (uint id = lo; id <= hi; id++)
+                {
+                    if (id == SilenceTrackBgm || map.ContainsKey(id)) continue;
+                    if (bgmZoneName != null && bgmZoneName.ContainsKey(id)) continue;
+                    if (!b.HasRow(id)) continue;
+                    var path = b.GetRow(id).File.ToString();
+                    if (string.IsNullOrEmpty(path) || !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                    var tail = path.Substring(prefix.Length);   // "06.scd"
+                    var dot = tail.IndexOf('.');
+                    var num = dot > 0 ? tail.Substring(0, dot) : tail;
+                    string baseName = series + " " + num;
+                    string name = baseName;
+                    for (int n = 2; taken.Contains(name); n++) name = baseName + " #" + n;
+                    taken.Add(name);
+                    map[id] = name;
+                }
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] AddRaidSeriesPacks failed: " + ex.Message); }
+    }
+
+    // Resolve a (polymorphic) MapRange BGM value to its concrete tracks, each tagged with a condition label. Concrete →
+    // (id, ""); BGMSituation → its Day/Night/Battle/Dawn/Dusk slots (silence dropped); BGMSwitch → recurse each candidate
+    // (a switch candidate is itself concrete or a situation). Depth-guarded (switch→situation is the deepest real chain).
+    private IEnumerable<(uint id, string label)> ResolveMapRangeTracks(uint bgm, int depth)
+    {
+        if (bgm == 0 || bgm == SilenceTrackBgm || depth > 3) yield break;
+        if (bgm >= 50000)                                   // BGMSwitch: union its candidates
+        {
+            foreach (var cand in ExpandBgmSwitch(bgm))
+                foreach (var t in ResolveMapRangeTracks(cand, depth + 1))
+                    yield return t;
+            yield break;
+        }
+        if (IsBgmSituation(bgm))                             // BGMSituation: its time-of-day slots
+        {
+            foreach (var slot in GetSituationSlots(bgm))
+                yield return (slot.bgmId, slot.label);
+            yield break;
+        }
+        yield return (bgm, "");                              // concrete track
+    }
+
+    public string BgmName(uint id)
+    {
+        if (id == 0) return "None";
+        if (id == SilenceTrackBgm) return "Silence";   // BGM 1 = BGM_Null.scd (our explicit Stop target)
+        if (id >= OrchestrionIdBase)                    // namespaced orchestrion roll
+        {
+            EnsureOrchestrion();
+            if (orchByRoll != null && orchByRoll.TryGetValue(id - OrchestrionIdBase, out var oe)
+                && !string.IsNullOrWhiteSpace(oe.title)) return oe.title;
+            return "Orchestrion " + (id - OrchestrionIdBase);
+        }
+        EnsureBgmNames();
+        if (bgmZoneName != null && bgmZoneName.TryGetValue(id, out var place) && !string.IsNullOrWhiteSpace(place))
+            return place;
+        if (learnedTrackName.TryGetValue(id, out var learned)) return learned;   // b234: LGB-derived positional track
+        var fileName = BgmFileDerivedName(id);                                    // b236: name from the track's own .scd file
+        if (!string.IsNullOrEmpty(fileName)) return fileName;
+        return "Track " + id;
+    }
+
+    /// <summary>
+    /// The full list of selectable BGMs for the picker: (defaultId, "Zone default (...)"), then (0, "None"), then every
+    /// named track sorted by name - the sheet-named zone/duty tracks PLUS every LGB-derived positional track from the
+    /// b235 all-zones background sweep (Garlemald's day/night/battle variants etc.). The catalog is GLOBAL and complete
+    /// regardless of which zone the player is in. `territoryId` is retained only for signature stability (the per-zone
+    /// default arrives separately as `territoryDefaultBgm`); population no longer depends on it. EnsureBgmNames kicks the
+    /// sweep, so the LGB tracks land a moment after the UI first opens and surface on the next frame's rebuild.
+    /// </summary>
+    public List<(uint id, string name)> GetBgmChoices(uint territoryId, uint territoryDefaultBgm)
+    {
+        _ = territoryId;   // b235: population is global (background sweep) - no longer keyed to the current zone
+        // b236 FPS: serve the cached list if neither the sweep result nor the zone default has changed since it was built.
+        // ReferenceEquals on learnedTrackName catches the sweep's atomic swap; equal default catches a zone change.
+        if (bgmChoicesCache != null && ReferenceEquals(bgmChoicesCacheLearnedRef, learnedTrackName)
+            && bgmChoicesCacheDefault == territoryDefaultBgm)
+            return bgmChoicesCache;
+        var result = new List<(uint, string)>();
+        result.Add((territoryDefaultBgm, "Zone default (" + BgmName(territoryDefaultBgm) + ")"));
+        result.Add((0, "None"));
+        EnsureBgmNames();
+        var named = new List<(uint id, string name)>();
+        if (bgmZoneName != null)
+        {
+            foreach (var kv in bgmZoneName)
+            {
+                if (kv.Key == territoryDefaultBgm) continue; // already the default entry
+                if (bgmHideFromList != null && bgmHideFromList.Contains(kv.Key)) continue; // situation indirection - its slots are listed instead
+                named.Add((kv.Key, kv.Value));
+            }
+        }
+        // b234: LGB-derived positional tracks (Garlemald's field/battle variants etc.) the sheets can't name - listed so
+        // multi-track zones expose every track. Skip any id a sheet already names / the default already covers.
+        foreach (var kv in learnedTrackName)
+        {
+            if (kv.Key == territoryDefaultBgm) continue;
+            if (bgmZoneName != null && bgmZoneName.ContainsKey(kv.Key)) continue;
+            named.Add((kv.Key, kv.Value));
+        }
+        foreach (var e in named.OrderBy(k => k.name, StringComparer.OrdinalIgnoreCase))
+            result.Add(e);
+        // b236 FPS: publish to the per-frame cache keyed on the current sweep result + zone default.
+        bgmChoicesCache = result;
+        bgmChoicesCacheLearnedRef = learnedTrackName;
+        bgmChoicesCacheDefault = territoryDefaultBgm;
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // WRITES - apply the host-set state to the live client
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Apply weather to the live client. EnvManager holds the active weather byte; setting it re-skins sky/effects.
+    /// Weather 0 = atmospheric/undefined (no defined weather; Hyperborea's trick). Safe: null-gated on EnvManager.
+    /// Returns true if written.
+    /// </summary>
+    public bool ApplyWeather(byte weatherId)
+    {
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) return false;
+            // CRASH GUARD (2026-08-16, refined b109): writing ActiveWeather to an off-bank id makes the native
+            // weather-change path resolve that weather's avfx via ResourceGraph.FindResourceHandle; if that .avfx path
+            // does NOT resolve on this zone the loader dereferences a bad handle → C0000005 (UNCATCHABLE). So we refuse
+            // an off-bank native apply BY DEFAULT — foreign weathers render via the EnvState-restamp path
+            // (wxpreset/WeatherCramService), which triggers no resource load. EXCEPTION: ids on the AvfxSafeWeatherIds
+            // allow-list (proven to native-apply off-bank without faulting — e.g. 150 Apocalypse's meteors on TT128)
+            // are permitted, so their doodads spawn; the sky is then crammed OVER the (off-bank/black) native EnvState
+            // by SetWeatherUnified's additive path. (0 always passes — the safe default.)
+            if (weatherId != 0 && !IsWeatherInLoadedBank(weatherId) && !AvfxSafeWeatherIds.Contains(weatherId))
+            {
+                log.Warning("[HavenNative] ApplyWeather(" + weatherId + " " + WeatherName(weatherId)
+                    + ") REFUSED — not in this zone's loaded env bank and not avfx-safe; a native apply would risk "
+                    + "faulting the resource loader. Render foreign weathers via a baked preset (wxpreset) instead.");
+                return false;
+            }
+            env->ActiveWeather = weatherId;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] ApplyWeather(" + weatherId + ") failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    // b111 DIAGNOSTIC — drive the game's REAL weather-change pipeline (WeatherManager, not the raw EnvManager byte).
+    // WHY: ApplyWeather writes EnvManager+0x27 (ActiveWeather), which only feeds the per-frame sky RECOMPUTE — it does
+    // NOT run the weather-VFX-spawn path, so foreign weathers get a sky (via cram) but no doodads (150's meteors never
+    // appear). WeatherManager.WeatherInterface.SetNextWeather(id, fade, disablesOverride) is the proper transition the
+    // game itself uses: resolve weather → load its env resources (incl. avfx) → spawn. This is the suspected lever the
+    // earlier "meteors on Limsa" build used. Isolated as the `wxtrans <id> [fade]` dev lever so we can PROVE it spawns the VFX
+    // before wiring it into the chip path — it is NOT crash-free (the avfx resolve can still fault), so it stays a
+    // manual test on the avfx-safe class only. Drives the slot at WeatherIndex (fallback slot 0).
+    public string TrySetNextWeather(byte id, float fade)
+    {
+        try
+        {
+            var wm = WeatherManager.Instance();
+            if (wm == null) return "[HavenNative] wxtrans: WeatherManager null — in a zone?";
+            var ptrs = wm->WeatherPtrs;                          // Span<Pointer<ServerWeather>> (3 slots)
+            int idx = wm->WeatherIndex;
+            if (idx < 0 || idx >= ptrs.Length) idx = 0;
+            var sw = ptrs[idx].Value;
+            if (sw == null) sw = ptrs[0].Value;
+            if (sw == null) return "[HavenNative] wxtrans: no active weather slot (all null).";
+            byte before = wm->WeatherId;
+            sw->SetNextWeather(id, fade, true);
+            log.Information("[HavenNative] wxtrans: SetNextWeather(" + id + " " + WeatherName(id) + ", fade=" + fade
+                + ", disablesOverride=true) on slot " + idx + "; WeatherManager.WeatherId was " + before + ".");
+            return "[HavenNative] wxtrans: transitioning to " + id + " (" + WeatherName(id) + ") via WeatherManager (fade "
+                + fade + "s, slot " + idx + "). Watch for its native VFX/doodads — this runs the resource-loading path.";
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] wxtrans(" + id + ") failed: " + ex.Message);
+            return "[HavenNative] wxtrans failed: " + ex.Message;
+        }
+    }
+
+    // b113 DIAGNOSTIC — PURE native weather write: `env->ActiveWeather = id` with NO bank guard and NO cram. This is the
+    // EXACT pre-guard b99 apply (the build that showed 150's meteors + red sky on Limsa TT128). Isolation lever to settle
+    // the retrace: the current additive path does native-write + cram, and shows NO meteors; b99 did native-write ALONE
+    // and DID. If `wxnative 150` on 128 reproduces meteors, the CRAM restamp — not the write — is what suppresses the
+    // doodads (it overwrites the EnvState the particle emitter reads each frame), and the avfx-safe path should be
+    // native-ONLY. Disarms any active cram first so the native env is uncontested. UNGUARDED by design: a weather whose
+    // avfx can't resolve on this zone WILL CTD (that is precisely what the production guard exists to prevent) — only
+    // hand-test an avfx-safe id on a zone you've already proven safe.
+    public string RawNativeWeather(byte id)
+    {
+        try
+        {
+            if (weatherCram.ReplayActive) weatherCram.SetReplay(false);   // uncontested native env for the test
+            var env = EnvManager.Instance();
+            if (env == null) return "[HavenNative] wxnative: EnvManager null — in a zone?";
+            byte before = env->ActiveWeather;
+            env->ActiveWeather = id;
+            log.Information("[HavenNative] wxnative: ActiveWeather " + before + " → " + id + " (" + WeatherName(id)
+                + "), NO guard, NO cram (exact pre-guard b99 raw-native apply).");
+            return "[HavenNative] wxnative: wrote ActiveWeather=" + id + " (" + WeatherName(id) + ") raw — no guard, no cram. "
+                + "Watch for its native sky + doodads. (This IS the b99 apply; an unresolvable avfx here WILL crash.)";
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] wxnative(" + id + ") failed: " + ex.Message);
+            return "[HavenNative] wxnative failed: " + ex.Message;
+        }
+    }
+
+    // SESSION-END SANITISE (b113): clear every weather override HMS can leave behind so nothing bleeds past logout /
+    // unload (user report: a forced sky left the apartment "immersed in gloom"). Two overrides can persist: (a) the cram
+    // restamp (per-frame EnvState override) and (b) a native ActiveWeather write (setweather / wxnative / a wxtrans
+    // SetNextWeather transition) — the existing zone-change poll only drops (a), never (b). So: disarm cram, then rewrite
+    // ActiveWeather to a NATURAL weather for the current zone (the first id in the loaded bank, always resolvable → no
+    // crash) so any forced native id is replaced by a legit one. All null-guarded; safe to call while the client is
+    // tearing down at logout. Called on the logged-in→out transition and from Dispose.
+    public void SanitiseWeather()
+    {
+        try
+        {
+            if (weatherCram.ReplayActive) weatherCram.SetReplay(false);
+            var env = EnvManager.Instance();
+            if (env == null) return;
+            var scene = env->EnvScene;
+            if (scene == null) return;
+            byte* idTable = (byte*)((nint)scene + 0x30);
+            byte natural = idTable[0];                 // first bank id = a weather this zone can always back
+            if (natural != 0 && env->ActiveWeather != natural)
+            {
+                env->ActiveWeather = natural;
+                log.Information("[HavenNative] weather sanitise: reset ActiveWeather → " + natural + " (" + WeatherName(natural) + ").");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] weather sanitise failed: " + ex.Message);
+        }
+    }
+
+    // Runtime ground-truth: is `id` present in the CURRENT zone's loaded env bank (EnvScene.WeatherIds[32] @scene+0x30,
+    // the same table DumpEnvbProbe reads)? This is the "will the engine load this weather's resources safely" test —
+    // an id NOT in this set faults the resource loader when written to ActiveWeather (see ApplyWeather's crash guard).
+    // Fail-OPEN: null EnvManager/EnvScene (mid-load) returns true so legitimate applies are never spuriously blocked.
+    public bool IsWeatherInLoadedBank(byte id)
+    {
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) return true;
+            var scene = env->EnvScene;
+            if (scene == null) return true;
+            byte* idTable = (byte*)((nint)scene + 0x30);
+            for (int i = 0; i < 32; i++)
+                if (idTable[i] == id) return true;
+            return false;
+        }
+        catch { return true; }
+    }
+
+    // S328ac: the map's native weather is resolved by GetDefaultWeather (defined below, sheet+live). The host uses it
+    // to broadcast a concrete weather instead of 0, so peers mirror the real sky.
+
+    // S326u/v: read the weather the engine is currently SHOWING so the dropdown mirrors the sky. There are two adjacent
+    // bytes: EnvManager+0x26 is the DISPLAYED/current weather (what Weatherman reads as "true weather"), +0x27 is
+    // ActiveWeather (the target, which can read 0 mid-transition or before the map settles). We prefer the displayed
+    // byte and fall back to the target, so the dropdown shows the real sky rather than a transient 0 = "None".
+    public byte GetActiveWeather()
+    {
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) return 0;
+            byte displayed = *((byte*)((nint)env + 0x26));   // current/displayed weather
+            if (displayed != 0) return displayed;
+            return env->ActiveWeather;                        // fall back to the target (0x27)
+        }
+        catch { return 0; }
+    }
+
+    // b226: the LAST weather id an explicit user apply pushed (SetWeatherUnified / SetWeatherOrGraft(×2) /
+    // SetWeatherNativeOnly all funnel through here). It exists because a keyframe GRAFT or a foreign-cram RESTAMP
+    // drives the sky by rewriting EnvState per frame and NEVER calls ApplyWeather — so the engine's displayed-weather
+    // byte (EnvManager+0x26, what GetActiveWeather reads) stays pinned at the zone's NATIVE weather (e.g. Clear Skies)
+    // even though the user picked "Blizzards". Native/in-bank picks DO move that byte, so this is only consulted while
+    // a graft/cram is actually live (see GetDisplayWeather). 0 = nothing applied this session.
+    private byte lastAppliedWeather;
+
+    // b226: the weather the SCENE is effectively presenting, for a readout that must match the user's pick (the DTR
+    // bar). While HMS is actively grafting/cramming the sky the engine byte lies (see lastAppliedWeather), so prefer
+    // the applied id; otherwise the engine byte is the truth (real sky / native pick / after a reset or zone change,
+    // where KfActive+ReplayActive are both false). Named distinctly from GetActiveWeather so the picker's "displayed"
+    // combo (which wants the raw engine sky) is unaffected.
+    public byte GetDisplayWeather()
+    {
+        if (lastAppliedWeather != 0 && (weatherCram.KfActive || weatherCram.ReplayActive))
+            return lastAppliedWeather;
+        return GetActiveWeather();
+    }
+
+    // ── WEATHER-CRAM (Fable weather-cram-755): read-only probe of the LIVE env pipeline ──────────────
+    // The runtime counterpart to Fable's STATIC ENVB crack. Fable's binary hunt found NO static ENVB string
+    // refs in the exe (magics reached via computed offsets) - but CS exposes the whole thing at RUNTIME:
+    //   EnvManager->EnvScene->WeatherIds[32]  = the PARSED per-set weather-id table the resolver walks
+    //   EnvScene->EnvSpaces[8].EnvSetResourceHandle = the loaded .envb resource (the donor-injection target)
+    // This dumps both so we can (a) see which weather ids the CURRENT zone's bank actually carries, (b) tell
+    // whether ActiveWeather is PRESENT in that set - the "miss" condition foreign-weather injection must solve -
+    // and (c) validate Fable's cracked ENVB header (nSets @0x1C, rows @0x20) against the live resource bytes.
+    // Pure read - mutates nothing (internal env-b probe; logs [ENVB-PROBE] to /xllog). This is step-1 of the
+    // resolver hunt: it confirms the data path and the format before any resolver hook is designed.
+    public void DumpEnvbProbe()
+    {
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) { log.Information("[HavenNative] [ENVB-PROBE] EnvManager null."); return; }
+            byte active = env->ActiveWeather;
+            byte displayed = *((byte*)((nint)env + 0x26));
+            var scene = env->EnvScene;
+            log.Information("[HavenNative] [ENVB-PROBE] ActiveWeather=" + active + " (" + WeatherName(active) + ")  displayed="
+                + displayed + " (" + WeatherName(displayed) + ")  EnvScene=0x" + ((nint)scene).ToString("X"));
+            if (scene == null) return;
+
+            // The parsed per-set weather-id table (FixedSizeArray32<byte> @0x30). Read via raw offset so this
+            // doesn't depend on a generated accessor name - it's a diagnostic, robustness first.
+            byte* idTable = (byte*)((nint)scene + 0x30);
+            var sb = new System.Text.StringBuilder();
+            bool activePresent = false;
+            for (int i = 0; i < 32; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append(idTable[i]);
+                if (idTable[i] == active) activePresent = true;
+            }
+            log.Information("[HavenNative] [ENVB-PROBE] EnvScene.WeatherIds[32] = [" + sb + "]");
+            log.Information("[HavenNative] [ENVB-PROBE] ActiveWeather " + active + " present in runtime set? " + activePresent
+                + (activePresent ? "" : "  ← MISS (a foreign weather forced here renders blank without donor injection)"));
+
+            uint locCount = *((uint*)((nint)scene + 0x888));   // EnvScene.LocationCount
+            log.Information("[HavenNative] [ENVB-PROBE] LocationCount=" + locCount);
+
+            // EnvSpaces: FixedSizeArray8<EnvSpace> @0xF0, stride = sizeof(EnvSpace) = 0xF0; the loaded .envb
+            // resource handle sits at EnvSpace+0x90. Walk all 8 slots; report each non-null resource + parse it.
+            for (int s = 0; s < 8; s++)
+            {
+                nint spaceBase = (nint)scene + 0xF0 + s * 0xF0;
+                var handle = *((FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.ResourceHandle**)(spaceBase + 0x90));
+                if (handle == null) continue;
+                string name = handle->FileName.ToString();
+                uint fileSize = handle->FileSize;
+                log.Information("[HavenNative] [ENVB-PROBE]   EnvSpace[" + s + "] envb='" + name + "' fileSize=" + fileSize);
+                var data = handle->GetDataSpan();
+                if (data.Length >= 0x20 && data[0] == (byte)'E' && data[1] == (byte)'N' && data[2] == (byte)'V' && data[3] == (byte)'B')
+                    ParseEnvbHeader(data, s);
+                else
+                    log.Information("[HavenNative] [ENVB-PROBE]   EnvSpace[" + s + "] no raw ENVB blob retained (len=" + data.Length
+                        + ") - the runtime WeatherIds table above is the source of truth.");
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [ENVB-PROBE] failed: " + ex.Message); }
+    }
+
+    // Parse the ENVB header per Fable's cracked format (weather-cram-755): 'ENVS' tag @0x0C, capacity @0x14,
+    // nSets @0x1C, then nSets 16-byte rows @0x20 (endOffset, startOffset, nBlocks, weatherId). We only surface
+    // the per-set weatherId list here - enough to cross-check the runtime WeatherIds table and confirm the count
+    // is read from 0x1C (Fable's pitfall: 0x14 is a CONSTANT capacity of 6, not the count).
+    private void ParseEnvbHeader(ReadOnlySpan<byte> d, int spaceIdx)
+    {
+        try
+        {
+            if (!(d[0x0C] == (byte)'E' && d[0x0D] == (byte)'N' && d[0x0E] == (byte)'V' && d[0x0F] == (byte)'S'))
+            { log.Information("[HavenNative] [ENVB-PROBE]   [" + spaceIdx + "] ENVS tag missing at 0x0C - unexpected layout."); return; }
+            uint capacity = BitConverter.ToUInt32(d.Slice(0x14, 4));   // constant 6
+            uint nSets = BitConverter.ToUInt32(d.Slice(0x1C, 4));      // TRUE set count
+            var sb = new System.Text.StringBuilder();
+            int cap = (int)Math.Min(nSets, 64u);   // bound the loop against a bad parse
+            for (int i = 0; i < cap && (0x20 + i * 16 + 16) <= d.Length; i++)
+            {
+                uint weatherId = BitConverter.ToUInt32(d.Slice(0x20 + i * 16 + 12, 4));
+                if (i > 0) sb.Append(',');
+                sb.Append(weatherId);
+            }
+            log.Information("[HavenNative] [ENVB-PROBE]   [" + spaceIdx + "] parsed ENVB: capacity=" + capacity
+                + " nSets=" + nSets + " weatherIds=[" + sb + "]");
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [ENVB-PROBE]   [" + spaceIdx + "] parse failed: " + ex.Message); }
+    }
+
+    // WEATHER-CRAM step-3: hunt the PARSED per-set param storage (the injection target for foreign-weather cram).
+    // The .envb blob is freed after parse, so the render's source params live in an undocumented runtime struct
+    // reached from EnvSpace. CS gives us two anchors: EnvManager.EnvState @0x58 (size 0x2F8) = the LIVE blended
+    // render params (only Rain@0x12C is mapped), and EnvSpace.EnvSetResourceHandle @0x90 whose OWN tail (past the
+    // 0xB0 base ResourceHandle → slots 0xB0/0xB8/0xC0) should point at the parsed env-set table. This dumps both:
+    //   (a) EnvState as a filtered float window, so a second call under a DIFFERENT weather reveals (by diff) which
+    //       offsets are which params - the change-scan the injection write will target;
+    //   (b) each EnvSpace's ResourceHandle tail pointers, following any plausible heap pointer one hop and dumping
+    //       a window as hex+float - to locate the parsed per-set param block and read its stride.
+    // PURE READ, every deref plausibility-guarded (internal env-set dump; logs [ENVSET] to /xllog).
+    public void DumpEnvSet()
+    {
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) { log.Information("[HavenNative] [ENVSET] EnvManager null."); return; }
+            byte active = env->ActiveWeather;
+            var scene = env->EnvScene;
+            int slot = -1;
+            if (scene != null)
+            {
+                byte* idTable = (byte*)((nint)scene + 0x30);
+                for (int i = 0; i < 32; i++) if (idTable[i] == active) { slot = i; break; }
+            }
+            log.Information("[HavenNative] [ENVSET] ActiveWeather=" + active + " (" + WeatherName(active) + ")  resolvedSlot="
+                + (slot >= 0 ? slot.ToString() : "MISS") + "  EnvMgr=0x" + ((nint)env).ToString("X"));
+
+            // (a) EnvState live blended params — filtered float window. Diff two weathers to map param offsets.
+            nint esBase = (nint)env + 0x58;
+            log.Information("[HavenNative] [ENVSET] EnvState @0x" + esBase.ToString("X") + " (offset 0x58, size 0x2F8) — plausible floats:");
+            DumpFloatsFiltered(esBase, 0x2F8, "EnvState");
+
+            if (scene == null) { log.Information("[HavenNative] [ENVSET] EnvScene null — no EnvSpace walk."); return; }
+            // (b) Follow each EnvSpace's EnvSetResourceHandle tail to the parsed param block.
+            for (int s = 0; s < 8; s++)
+            {
+                nint spaceBase = (nint)scene + 0xF0 + s * 0xF0;
+                var handle = *((nint*)(spaceBase + 0x90));
+                if (!PlausiblePtr(handle)) continue;
+                // The env-set container hangs off the handle's own tail (past the 0xB0 base ResourceHandle). +0xC0
+                // was the live one: a vtable'd object with count@+0x20, resolvedSlot@+0x22, and two heap pointers
+                // (+0x10, +0x18) to the parsed per-set storage. Follow it (hop-2) to map the source param array.
+                nint container = *((nint*)(handle + 0xC0));
+                if (!PlausiblePtr(container)) { log.Information("[HavenNative] [ENVSET] EnvSpace[" + s + "] handle=0x" + handle.ToString("X") + " +0xC0 not a ptr (0x" + container.ToString("X") + ")"); continue; }
+
+                ushort count = *((ushort*)(container + 0x20));
+                ushort curSlot = *((ushort*)(container + 0x22));
+                nint p10 = *((nint*)(container + 0x10));
+                nint p18 = *((nint*)(container + 0x18));
+                log.Information("[HavenNative] [ENVSET] EnvSpace[" + s + "] handle=0x" + handle.ToString("X")
+                    + " container=0x" + container.ToString("X") + " count=" + count + " resolvedSlot=" + curSlot
+                    + " p10=0x" + p10.ToString("X") + " p18=0x" + p18.ToString("X"));
+
+                // p10 window — long enough to span >1 param set so a repeating layout reveals the stride by eye.
+                // Compare the repeating "+0x20 sky-color"-like field against the live EnvState signature below.
+                if (PlausiblePtr(p10))
+                {
+                    long rl = ReadableLen(p10);
+                    log.Information("[HavenNative] [ENVSET]   p10 readable=0x" + rl.ToString("X") + "  hex: " + HexBytes(p10, (int)Math.Min(rl, 64)));
+                    log.Information("[HavenNative] [ENVSET]   p10 floats (filtered, first 0x640):");
+                    DumpFloatsFiltered(p10, (int)Math.Min(rl, 0x640), "p10");
+                    int found = ScanForWeatherIds(p10, (int)Math.Min(rl, 0x800));
+                    if (found >= 0) log.Information("[HavenNative] [ENVSET]   p10: WeatherIds byte-run found at +0x" + found.ToString("X"));
+                }
+                // p18 window — the other pointer; likely the weather-id table or a parallel array. Scan for the run.
+                if (PlausiblePtr(p18))
+                {
+                    long rl = ReadableLen(p18);
+                    log.Information("[HavenNative] [ENVSET]   p18 readable=0x" + rl.ToString("X") + "  hex: " + HexBytes(p18, (int)Math.Min(rl, 64)));
+                    int found = ScanForWeatherIds(p18, (int)Math.Min(rl, 0x800));
+                    if (found >= 0) log.Information("[HavenNative] [ENVSET]   p18: WeatherIds byte-run found at +0x" + found.ToString("X"));
+                }
+            }
+            // Live EnvState signature for cross-matching the source sets above (sky/fog color block @+0x20..+0x34).
+            float* sig = (float*)((nint)env + 0x58);
+            log.Information("[HavenNative] [ENVSET] EnvState signature @+0x20: "
+                + sig[0x20 / 4].ToString("0.####") + " " + sig[0x24 / 4].ToString("0.####") + " "
+                + sig[0x28 / 4].ToString("0.####") + " " + sig[0x2C / 4].ToString("0.####")
+                + "  (find the source set whose +0x20 matches — that's slot " + active + "'s params)");
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [ENVSET] failed: " + ex.Message); }
+    }
+
+    private static bool PlausiblePtr(nint p) => p > 0x10000 && p < 0x7FFFFFFFFFFF;
+
+    // Scan a region for 958's WeatherIds byte run (1,2,3,4,7 - a distinctive prefix of the zone's parsed set) so
+    // whichever source pointer holds the per-set id table is auto-located. Returns the offset or -1.
+    private int ScanForWeatherIds(nint addr, int len)
+    {
+        try
+        {
+            byte[] needle = { 1, 2, 3, 4, 7 };
+            byte* p = (byte*)addr;
+            for (int i = 0; i + needle.Length <= len; i++)
+            {
+                bool hit = true;
+                for (int j = 0; j < needle.Length; j++) if (p[i + j] != needle[j]) { hit = false; break; }
+                if (hit) return i;
+            }
+        }
+        catch { }
+        return -1;
+    }
+
+    // Bytes readable from addr within its committed, non-guard, non-noaccess page region (0 if unmapped). Prevents
+    // an AccessViolation (uncatchable in .NET) when a followed pointer lands in a smaller allocation than we dump.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORY_BASIC_INFORMATION
+    {
+        public nint BaseAddress; public nint AllocationBase; public uint AllocationProtect; public uint __a1;
+        public nint RegionSize; public uint State; public uint Protect; public uint Type; public uint __a2;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern nuint VirtualQuery(nint lpAddress, out MEMORY_BASIC_INFORMATION mbi, nuint dwLength);
+
+    private static long ReadableLen(nint addr)
+    {
+        try
+        {
+            if (VirtualQuery(addr, out var mbi, (nuint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()) == 0) return 0;
+            const uint MEM_COMMIT = 0x1000, PAGE_NOACCESS = 0x01, PAGE_GUARD = 0x100;
+            if (mbi.State != MEM_COMMIT) return 0;
+            if ((mbi.Protect & PAGE_NOACCESS) != 0 || (mbi.Protect & PAGE_GUARD) != 0) return 0;
+            long end = (long)mbi.BaseAddress + (long)mbi.RegionSize;
+            long avail = end - (long)addr;
+            return avail > 0 ? avail : 0;
+        }
+        catch { return 0; }
+    }
+
+    // Dump a struct region as floats, logging only offsets whose value is finite, nonzero, and |v| < 1e6 - the
+    // "alive" filter from the change-gated float-scan technique. Grouped a few per line to keep /xllog readable.
+    private void DumpFloatsFiltered(nint baseAddr, int sizeBytes, string tag)
+    {
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            int perLine = 0;
+            for (int off = 0; off + 4 <= sizeBytes; off += 4)
+            {
+                float v = *((float*)(baseAddr + off));
+                if (float.IsNaN(v) || float.IsInfinity(v) || v == 0f || Math.Abs(v) >= 1e6f) continue;
+                if (perLine > 0) sb.Append("  ");
+                sb.Append("+0x").Append(off.ToString("X")).Append('=').Append(v.ToString("0.####"));
+                if (++perLine == 6) { log.Information("[HavenNative] [ENVSET]   " + tag + ": " + sb); sb.Clear(); perLine = 0; }
+            }
+            if (perLine > 0) log.Information("[HavenNative] [ENVSET]   " + tag + ": " + sb);
+        }
+        catch { log.Information("[HavenNative] [ENVSET]   " + tag + ": <fault>"); }
+    }
+
+    private static string HexBytes(nint addr, int count)
+    {
+        var sb = new System.Text.StringBuilder();
+        try { byte* p = (byte*)addr; for (int i = 0; i < count; i++) { if (i > 0) sb.Append(' '); sb.Append(p[i].ToString("X2")); } }
+        catch { sb.Append("<fault>"); }
+        return sb.ToString();
+    }
+
+    private static string FloatsInline(nint addr, int count)
+    {
+        var sb = new System.Text.StringBuilder();
+        try { float* p = (float*)addr; for (int i = 0; i < count; i++) { if (i > 0) sb.Append(' '); sb.Append(p[i].ToString("0.###")); } }
+        catch { sb.Append("<fault>"); }
+        return sb.ToString();
+    }
+
+    // WEATHER-CRAM step-4 (b96): "render a weather the zone doesn't carry" now goes through WeatherCramService, which
+    // HOOKS the game's UpdateEnvironment recompute and restamps a captured EnvState AFTER Original — the correct lever.
+    // b94/b95 proved a per-frame write from Framework.Update is clobbered by that recompute every tick (our write held
+    // within the frame but was wiped before the render sampled it: pure ordering loss). Same story as TimeFreezeService.
+    // These delegators keep the command surface (wxcapture / wxreplay) unchanged.
+    public bool WxReplayActive => weatherCram.ReplayActive;
+    public string CaptureEnvState() => weatherCram.Capture();
+    public string ToggleWxReplay(bool? on = null) => weatherCram.SetReplay(on);
+
+    // b174 CITY-DIFF TOUR: raw 0x2F8 EnvState snapshot for the cross-city spine-weather diff instrument (wxdifftour).
+    // Delegates to the same primitive the preset bake uses (CaptureRaw), but the caller is responsible for turning
+    // replay OFF first (so this reads the TRUE native block, never a crammed one) — the tour does that via
+    // ToggleWxReplay(false) before it starts capturing. Returns null if EnvManager is unavailable (not in a zone).
+    public byte[]? CaptureEnvRaw(out byte active) => weatherCram.CaptureRaw(out active);
+
+    // b160: KEYFRAME sky-graft (day-night cycling). Capture a set of donor EnvState keyframes across the Eorzean day
+    // (wxkfcap on the donor, e.g. Kugane, at several times), travel to a fixed-time target, then wxkfreplay on — the
+    // graft lerps the bracketing keyframes by the live tod so the stolen sky cycles (moving sun + gradient + stars).
+    public bool WxKfActive => weatherCram.KfActive;
+    public string AddWeatherKeyframe() => weatherCram.AddKeyframe();
+    public string ToggleWxKfReplay(bool? on = null) => weatherCram.SetKfReplay(on);
+    public string ClearWeatherKeyframes() => weatherCram.ClearKeyframes();
+    // b166 fidelity probe: replay the dense captured set at a reduced keyframe count N (or `full`) to find the storage/quality sweet spot.
+    public string DecimateWeatherKeyframes(string arg) => weatherCram.DecimateForReplay(arg);
+
+    // b162: zone-change teardown — drop the graft but keep the captured set (the set must survive the donor→target hop).
+    // Mirrors the ReplayActive/CycleActive auto-clears in HavenNativePlugin's zone-change poll. Returns true if it was on.
+    public bool StopKfGraftForZoneChange() => weatherCram.StopKfGraft();
+
+    // b183: stop any running day-night graft in place (no zone change) — used when a static weather pick must evict a
+    // still-running city-variant graft so the two don't fight over the sky floats. Same underlying teardown.
+    public bool StopKfGraft() => weatherCram.StopKfGraft();
+
+    // b162: session-end reset — the graft was persisting across logout/login because nothing in the logout sanitise
+    // touched it (SanitiseWeather only reverts ActiveWeather + cram, not the keyframe path). Cancel any in-flight sweep,
+    // then clear the whole set + graft so a fresh session starts clean.
+    public void ResetKeyframeGraftForSession()
+    {
+        if (kfSweepActive) CancelKeyframeSweep();
+        weatherCram.ClearKeyframes();
+    }
+
+    // PATH I b163: durable keyframe-set library. The swept set is memory-only and wiped on teardown (b162), so a ~15s
+    // sweep was lost every session and couldn't be validated across zones/sessions. Save bakes the current in-memory set
+    // to the config-dir library keyed by its donor weather; Load restores it into memory (turn the graft on afterward).
+    public string SaveKeyframeSet(string? name)
+    {
+        if (!weatherCram.ExportKeyframes(out var weather, out var kfs))
+            return "[HavenNative] wxkfsave: no graftable set in memory (need >=2 keyframes — sweep or capture first).";
+        return keyframeSets.Save(weather, name, kfs);
+    }
+
+    public string LoadKeyframeSet(byte weather)
+    {
+        if (!keyframeSets.TryGet(weather, out var kfs))
+            return "[HavenNative] wxkfload: no saved set for weather " + weather + ". `wxkflist` to see what's stored.";
+        // stop any live sweep/graft before swapping the set out from under it
+        if (kfSweepActive) CancelKeyframeSweep();
+        weatherCram.StopKfGraft();
+        return weatherCram.ImportKeyframes(weather, kfs);
+    }
+
+    // b175: DONOR-SPECIFIC load — pick one city's day-set for a weather (the picker's "Clear Skies · Limsa" path). donor 0
+    // routes to the legacy byte lookup (untagged, else first available donor). The graft state is donor-agnostic once
+    // imported (WeatherCramService just interpolates the loaded set), so only the SELECTION carries the donor here.
+    public string LoadKeyframeSet(byte weather, uint donor)
+    {
+        if (donor == 0) return LoadKeyframeSet(weather);
+        if (!keyframeSets.TryGet(weather, donor, out var kfs))
+            return "[HavenNative] wxkfload: no saved set for weather " + weather + " donor " + donor + ".";
+        if (kfSweepActive) CancelKeyframeSweep();
+        weatherCram.StopKfGraft();
+        return weatherCram.ImportKeyframes(weather, kfs);
+    }
+
+    public string ListKeyframeSets()
+    {
+        var ids = keyframeSets.AvailableIds;
+        if (ids.Count == 0) return "[HavenNative] wxkflist: no saved keyframe sets. Sweep one (`wxkfsweep`) then `wxkfsave <weatherId> [name]`.";
+        var sb = new System.Text.StringBuilder("[HavenNative] wxkflist: " + ids.Count + " saved set(s):");
+        foreach (var id in ids)
+            sb.Append("\n  weather ").Append(id).Append(" — ").Append(keyframeSets.Name(id) ?? "?")
+              .Append(" (").Append(keyframeSets.Count(id)).Append(" samples)");
+        return sb.ToString();
+    }
+
+    // WEATHER-CRAM Tier-1 preset pipeline. The library (WeatherPresetStore) holds baked EnvState blobs keyed by weather
+    // id; these three verbs are the seam the command surface AND the sync path drive:
+    //   BakeCurrent  — capture the live EnvState (must be standing under the DONOR weather) into the local library.
+    //   ApplyPreset  — look the id up in the library and start replaying its blob (the render-a-foreign-sky action).
+    //   ClearPreset  — stop replaying (drops back to the zone's native sky).
+    // Peer sync ships only a weather id; the receiver calls ApplyPreset(id) against its OWN embedded library, so the
+    // sky reproduces without shipping ~760 bytes per map-state. Gating on shipped-only presets keeps that deterministic.
+
+    // Capture the live EnvState and stage it as preset `id` in the config-dir local library. id defaults to the current
+    // ActiveWeather (the natural bake: stand under the weather you want, run the verb). Returns a user-facing status.
+    public string BakeCurrentPreset(byte? id = null, string? name = null)
+    {
+        var blob = weatherCram.CaptureRaw(out var active);
+        if (blob == null) return "[HavenNative] wxbake: could not read EnvState — in a zone with weather?";
+        byte target = id ?? active;
+        string label = name ?? WeatherName(target);
+        // b120 Tier-2: bake the avfx doodad descriptors alongside the EnvState blob, so a persisted/synced apply
+        // re-establishes them (full effects, not sky-only). CaptureRaw just snapshotted them (ProbeResourceWords).
+        var doodads = weatherCram.GetCapturedDoodads();
+        return weatherPresets.Bake(target, label, blob, doodads);
+    }
+
+    // Apply a baked preset by weather id: render that foreign sky (+ its baked doodads, if any) on the current zone.
+    public string ApplyPreset(byte id)
+    {
+        if (!weatherPresets.TryGet(id, out var blob))
+            return "[HavenNative] wxpreset: no baked preset for weather " + id + " (" + WeatherName(id) + "). Bake one with `wxbake` on a donor zone.";
+        // b123: candidate-A doodad re-establishment (AllocHGlobal-copy the baked descriptor + repoint) is only crash-safe
+        // for PROVEN ids (SafeDoodadIds; see the note there — 207 CTD proved the faithful copy dangles inner pointers).
+        // Unproven ids render SKY-ONLY here (pass null doodads) — deterministic and crash-free — until candidate B lands.
+        var doodads = DoodadsAllowedFor(id) ? weatherPresets.GetDoodads(id) : null;   // b120→b123 gate; b124 `wxdoodall` can widen
+        // b131: strip-list ids (e.g. 208 Floracane) re-establish with inner ptrs zeroed to sever the second-order dangler.
+        return weatherCram.ApplyBlob(blob, id, doodads, strip: StripDoodadIds.Contains(id));
+    }
+
+    public string ClearPreset() => weatherCram.SetReplay(false);
+
+    // b119 Tier-2 experiment (candidate A): re-establish the captured weather's avfx doodads from self-allocated
+    // descriptors and re-point the EnvState words at them, then `wxreplay on` to test whether the game spawns doodads
+    // from a descriptor WE own (necessary for persisted/synced doodads). See WeatherCramService.ColdReplayTest.
+    public string ColdReplayDoodads(bool strip) => weatherCram.ColdReplayTest(strip);
+    // TRAVELING-SUN field map: toggle the read-only wxtimescan diagnostic (discovers the time-driven EnvState float
+    // offsets to preserve for a live-sun cram). See WeatherCramService.ToggleTimeScan.
+    public string ToggleWeatherTimeScan() => weatherCram.ToggleTimeScan();
+
+    // b128: doodads are ON BY DEFAULT for every preset except the two known crashers (CrashDoodadIds). `wxdoodall` is now
+    // an OPT-OUT kill switch, not a widen toggle — `on` (re)enables the extras, `off` suppresses ALL doodads (sky-only).
+    // `on`/`off`/null=flip. Since the field is DoodadsDisabled, "enabled" means !DoodadsDisabled.
+    public string ToggleAllDoodads(bool? on = null)
+    {
+        bool enable = on ?? DoodadsDisabled;   // null = flip current state
+        DoodadsDisabled = !enable;
+        return enable
+            ? "[HavenNative] wxdoodall: ON — doodad extras enabled (default). Every preset except the two known crashers "
+              + "(207 Auroral Flares, 208 Floracane) re-establishes its full avfx. This is the shipped default."
+            : "[HavenNative] wxdoodall: OFF — doodad extras suppressed; presets render sky-only (crammed sky, no avfx). "
+              + "Escape hatch only; `wxdoodall on` restores the default.";
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // b126: WXSWEEP — crash-resumable auto-sweep of every doodad-bearing weather (research tool, NOT a shippable gate).
+    //
+    // WHY: candidate-A re-establish CTDs on dense-graph weathers whose baked descriptor carries dangling donor-session
+    // inner pointers (207 Auroral Flares proved it). The crash is a C0000005 on the GAME's own framework thread during
+    // its env tick (sub_1402FE240) — UNCATCHABLE from .NET. So we can't try/catch our way through the list; the only way
+    // to survive a crash is to have ALREADY written our progress to disk before applying, so a relaunch can attribute the
+    // fault and resume. That is exactly what this does: journal "testing id N" (flushed) → apply → dwell → mark OK →
+    // advance. On relaunch, InitWeatherSweep sees a dangling "testing" entry that never reached OK ⇒ that id crashed the
+    // game ⇒ mark CRASHED, skip it, resume from N+1. The operator just stands on the sweep map and relaunches after a CTD.
+    //
+    // GUARDED mode (default): before applying id, InnerPointerReadability(doods) is checked; if ANY inner pointer is
+    // currently unmapped the id is SKIP(guard)'d without applying (crash-REDUCER — 207's faulting pointer was unmapped).
+    // Known-safe ids (SafeDoodadIds) are always applied. This is imperfect (readable-but-garbage can still fault) but cuts
+    // the number of relaunches. Unguarded mode applies every id (maximal crash exposure, fastest to find every landmine).
+    //
+    // The results are RESEARCH DATA ONLY — surviving ids are sync-unsafe (a peer with a different heap layout can still
+    // CTD on the same dangling deref), so they are NOT promoted to SafeDoodadIds by the sweep. Harvest is manual.
+    private const int SweepDwellMs = 3000;         // hold each id long enough that a delayed env-tick crash is still attributed to it
+    private string? sweepJournalPath;
+    private bool sweepActive;
+    private bool sweepGuarded = true;
+    private uint sweepMap;
+    private readonly List<byte> sweepIds = new();
+    private int sweepCursor;
+    private byte? sweepTesting;                     // id currently under test (journaled BEFORE apply; a CTD leaves it set)
+    private long sweepDwellUntilMs;
+    private readonly Dictionary<byte, string> sweepResults = new();   // id -> "OK" / "CRASHED" / "SKIP(guard)"
+
+    // DTO mirrored to the on-disk journal (System.Text.Json). Dict keys are strings (JSON requirement).
+    private sealed class SweepJournal
+    {
+        public bool Active { get; set; }
+        public bool Guarded { get; set; }
+        public uint Map { get; set; }
+        public List<byte> Ids { get; set; } = new();
+        public int Cursor { get; set; }
+        public byte? Testing { get; set; }
+        public Dictionary<string, string> Results { get; set; } = new();
+    }
+
+    private void SaveSweepJournal()
+    {
+        if (sweepJournalPath == null) return;
+        try
+        {
+            var dto = new SweepJournal
+            {
+                Active = sweepActive,
+                Guarded = sweepGuarded,
+                Map = sweepMap,
+                Ids = new List<byte>(sweepIds),
+                Cursor = sweepCursor,
+                Testing = sweepTesting,
+                Results = sweepResults.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
+            };
+            var json = System.Text.Json.JsonSerializer.Serialize(dto);
+            // Flush hard: this file is our ONLY crash-survivable record — a lost write means a mis-attributed relaunch.
+            File.WriteAllText(sweepJournalPath, json);
+        }
+        catch (Exception ex) { log.Error(ex, "[HavenNative] wxsweep: journal save failed"); }
+    }
+
+    // Called once at startup (after mapSettings construction). Loads any journal; if a sweep was mid-flight, attribute a
+    // dangling "testing" id to a CRASH (it never reached OK ⇒ the game died applying it) and resume from the next id.
+    public void InitWeatherSweep(string path)
+    {
+        sweepJournalPath = path;
+        try
+        {
+            if (!File.Exists(path)) return;
+            var dto = System.Text.Json.JsonSerializer.Deserialize<SweepJournal>(File.ReadAllText(path));
+            if (dto == null || !dto.Active) return;   // no in-flight sweep to resume
+
+            sweepGuarded = dto.Guarded;
+            sweepMap = dto.Map;
+            sweepIds.Clear();
+            sweepIds.AddRange(dto.Ids);
+            sweepCursor = dto.Cursor;
+            sweepResults.Clear();
+            foreach (var kv in dto.Results)
+                if (byte.TryParse(kv.Key, out var b)) sweepResults[b] = kv.Value;
+
+            if (dto.Testing is byte crashed)
+            {
+                // The plugin was mid-apply on `crashed` when the game died (or was force-closed). Attribute the CTD.
+                sweepResults[crashed] = "CRASHED";
+                log.Warning($"[HavenNative] wxsweep: RESUME — weather {crashed} ({WeatherName(crashed)}) was mid-apply at last "
+                          + "exit ⇒ marked CRASHED. Advancing past it.");
+                // advance cursor past the crashed id so we don't re-test it
+                int idx = sweepIds.IndexOf(crashed);
+                if (idx >= 0) sweepCursor = idx + 1;
+            }
+            sweepTesting = null;
+            sweepActive = true;
+            DoodadsDisabled = false;   // ensure doodads are enabled so the sweep exercises candidate-A (default-on anyway)
+            sweepDwellUntilMs = 0;
+            log.Information($"[HavenNative] wxsweep: resumed on map {sweepMap}, cursor {sweepCursor}/{sweepIds.Count} "
+                          + $"({sweepResults.Count} results so far). Guarded={sweepGuarded}.");
+            SaveSweepJournal();   // persist the crash attribution immediately
+        }
+        catch (Exception ex) { log.Error(ex, "[HavenNative] wxsweep: journal load failed"); }
+    }
+
+    public string StartWeatherSweep(uint territory, bool guarded)
+    {
+        if (sweepActive)
+            return "[HavenNative] wxsweep: already running — " + WeatherSweepStatus() + " (`wxsweep stop` to abort).";
+        if (territory == 0)
+            return "[HavenNative] wxsweep: no territory loaded. Zone into the sweep map (e.g. Lapis Manalis) first.";
+
+        sweepIds.Clear();
+        sweepIds.AddRange(weatherPresets.AvailableIds.Where(id => weatherPresets.HasDoodads(id)));
+        if (sweepIds.Count == 0)
+            return "[HavenNative] wxsweep: no doodad-bearing presets available to sweep.";
+
+        sweepMap = territory;
+        sweepGuarded = guarded;
+        sweepCursor = 0;
+        sweepTesting = null;
+        sweepDwellUntilMs = 0;
+        sweepResults.Clear();
+        sweepActive = true;
+        DoodadsDisabled = false;   // doodads are default-on; make sure they aren't killed while the sweep runs
+        SaveSweepJournal();
+        log.Information($"[HavenNative] wxsweep: START on map {territory}, {sweepIds.Count} doodad weathers, "
+                      + $"guarded={guarded}, dwell {SweepDwellMs}ms.");
+        return $"[HavenNative] wxsweep: started — {sweepIds.Count} doodad weathers on map {territory}, "
+             + $"guarded={guarded}. Applies one every ~{SweepDwellMs}ms; a CTD is journaled and resumed on relaunch. "
+             + "`wxsweep status` for progress, `wxsweep stop` to abort. Do NOT leave the map while it runs.";
+    }
+
+    public string StopWeatherSweep()
+    {
+        if (!sweepActive) return "[HavenNative] wxsweep: not running.";
+        sweepActive = false;
+        sweepTesting = null;
+        // (doodads stay default-on after a sweep — they're the shipped default now, not a sweep-scoped widen)
+        SaveSweepJournal();
+        log.Information("[HavenNative] wxsweep: STOPPED by operator. " + WeatherSweepStatus());
+        return "[HavenNative] wxsweep: stopped. " + WeatherSweepStatus();
+    }
+
+    public string WeatherSweepStatus()
+    {
+        int ok = sweepResults.Count(kv => kv.Value == "OK");
+        int crashed = sweepResults.Count(kv => kv.Value == "CRASHED");
+        int skipped = sweepResults.Count(kv => kv.Value.StartsWith("SKIP"));
+        var sb = new System.Text.StringBuilder();
+        sb.Append(sweepActive ? "RUNNING" : (sweepResults.Count > 0 ? "IDLE (last sweep)" : "IDLE"));
+        sb.Append($" — {sweepCursor}/{sweepIds.Count} done · OK={ok} CRASHED={crashed} SKIP={skipped}");
+        if (sweepActive && sweepTesting is byte t) sb.Append($" · testing {t} ({WeatherName(t)})");
+        if (crashed > 0)
+        {
+            var ids = sweepResults.Where(kv => kv.Value == "CRASHED").Select(kv => kv.Key).OrderBy(x => x);
+            sb.Append(" · crashers: " + string.Join(",", ids));
+        }
+        return sb.ToString();
+    }
+
+    // Per-frame pump. Cheap when idle. Runs the state machine: dwell → mark OK → advance → (guard-skip | journal+apply).
+    public void TickWeatherSweep(uint currentTerritory)
+    {
+        if (!sweepActive) return;
+        // Only advance while the operator is standing on the sweep map — cramming an off-map weather would corrupt results
+        // and could fault the wrong zone. If they zoned away, pause silently until they return.
+        if (currentTerritory != sweepMap) return;
+
+        long now = Environment.TickCount64;
+
+        // 1) If an id is under test, wait out its dwell, then record it as a SURVIVOR (no CTD occurred during the hold).
+        if (sweepTesting is byte testing)
+        {
+            if (now < sweepDwellUntilMs) return;   // still holding — a delayed env-tick crash would still be attributed to `testing`
+            sweepResults[testing] = "OK";
+            log.Information($"[HavenNative] wxsweep: {testing} ({WeatherName(testing)}) survived {SweepDwellMs}ms ⇒ OK.");
+            sweepTesting = null;
+            sweepCursor++;
+            SaveSweepJournal();
+            return;   // apply the next id on the following tick (keeps one action per frame)
+        }
+
+        // 2) Sweep complete?
+        if (sweepCursor >= sweepIds.Count)
+        {
+            log.Information("[HavenNative] wxsweep: COMPLETE. " + WeatherSweepStatus());
+            sweepActive = false;
+            // (doodads remain default-on; the sweep no longer toggles the gate)
+            SaveSweepJournal();
+            return;
+        }
+
+        byte id = sweepIds[sweepCursor];
+
+        // 3) Guarded pre-filter: skip ids whose baked descriptor has any currently-unmapped inner pointer (dangling ⇒
+        //    likely faults). Known-safe ids bypass the guard. One skip per tick.
+        if (sweepGuarded && !SafeDoodadIds.Contains(id))
+        {
+            var doods = weatherPresets.GetDoodads(id);
+            var (total, unmapped) = weatherCram.InnerPointerReadability(doods);
+            if (unmapped > 0)
+            {
+                sweepResults[id] = $"SKIP(guard {unmapped}/{total} unmapped)";
+                log.Information($"[HavenNative] wxsweep: {id} ({WeatherName(id)}) SKIP — {unmapped}/{total} inner pointers "
+                              + "unmapped (dangling, likely CTD).");
+                sweepCursor++;
+                SaveSweepJournal();
+                return;
+            }
+        }
+
+        // 4) Apply. Journal the "testing" marker and FLUSH before touching the game — if the apply CTDs, the relaunch
+        //    reads this and attributes the crash to `id`.
+        sweepTesting = id;
+        SaveSweepJournal();   // crash-survivable record written BEFORE the (possibly fatal) apply
+        try
+        {
+            string r = SetWeatherUnified(id);
+            log.Information($"[HavenNative] wxsweep: applying {id} ({WeatherName(id)}) [{sweepCursor + 1}/{sweepIds.Count}] — {r}");
+        }
+        catch (Exception ex)
+        {
+            // A managed exception (NOT the uncatchable native CTD) — record and move on without a relaunch.
+            sweepResults[id] = "ERROR: " + ex.Message;
+            log.Error(ex, $"[HavenNative] wxsweep: managed error applying {id}");
+            sweepTesting = null;
+            sweepCursor++;
+            SaveSweepJournal();
+            return;
+        }
+        sweepDwellUntilMs = now + SweepDwellMs;
+    }
+
+    // UNIFIED WEATHER LEVER (Ask 2, 2026-08-16): the single seam the `setweather` command AND the debug weather chips
+    // drive. The caller passes a weather id and does NOT care whether it's native to this zone or a foreign cram —
+    // this method routes it:
+    //   • id == 0 OR id in this zone's loaded env bank → NATIVE apply (ApplyWeather writes ActiveWeather). Any active
+    //     restamp is cleared first so the native sky isn't fought by a stale foreign block.
+    //   • foreign id on the AVFX-SAFE allow-list (b109, e.g. 150) → native apply for the DOODADS + sky-only cram OVER
+    //     it if a preset exists (additive; the native particles play under the crammed sky). See AvfxSafeWeatherIds.
+    //   • foreign id WITH a baked preset in the library → restamp path (ApplyPreset → WeatherCramService), the only
+    //     crash-free route for a weather this zone can't back natively.
+    //   • foreign id WITHOUT a preset → refuse with a redirect (bake one on a donor zone first).
+    // Returns a user-facing status string. This is the "same lever" the user asked for: tap any chip / type any id and
+    // it just works if it possibly can.
+    public string SetWeatherUnified(byte id)
+    {
+        lastAppliedWeather = id;   // b226: record the user's pick for GetDisplayWeather (the DTR readout)
+        // b172: ALWAYS drop a running day-night graft before applying ANY explicit weather pick. b170 only stopped the
+        // graft on the native branch below, so tapping a non-time-marching FOREIGN chip (which routes through the foreign
+        // preset branches further down) armed the static cram but left kfActive running — and the Detour runs the graft's
+        // interpolated restamp AFTER the static one, so the graft kept winning the sky floats and the new weather never
+        // rendered. That is the reported "after a time-flow chip, other chips don't change the weather until I pick a legal
+        // one from the dropdown" bug (the dropdown = a native pick = the one path that DID stop the graft). Hoisting the
+        // stop here covers every route (native + all foreign-preset branches). NOT touching ReplayActive here — the foreign
+        // branches deliberately USE the static cram; only the native branch clears it (it fights a native sky). No-op when
+        // no graft is active, so this is free on the common path.
+        weatherCram.StopKfGraft();
+        pendingVerifyFrames = 0;   // b173: a fresh explicit pick supersedes any in-flight native black-verify
+        if (id == 0 || IsWeatherInLoadedBank(id))
+        {
+            if (weatherCram.ReplayActive) weatherCram.SetReplay(false);
+            bool ok = ApplyWeather(id);
+            if (ok) ArmNativeSkyVerify(id);   // b173: verify the resolved sky; rescue if this in-bank id renders black here
+            return ok
+                ? "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") applied natively."
+                : "[HavenNative] setweather: native apply of " + id + " (" + WeatherName(id) + ") failed (see log).";
+        }
+        // b120 Tier-2 (candidate A, PRIMARY PATH): a foreign weather whose baked preset carries avfx DOODAD descriptors
+        // renders FULL effects (sky + meteors/particles) purely through cram — ApplyBlob re-establishes live descriptors
+        // from the baked bytes and goes wholesale. No native ActiveWeather write needed (that gave off-bank black sky and
+        // is what forced the fragile b109 additive dance). This is the "tap the chip, it just works from the persisted
+        // preset" path, and it GENERALIZES: any weather with baked doodads works, so the allow-list widens by DATA (bake
+        // the doodads → the chip lights up) instead of a hardcoded id set.
+        // b123: gate on SafeDoodadIds too — HasDoodads(id) is true for all 98 baked-doodad weathers, but candidate-A
+        // faithful-copy only survives on proven ids (207 CTD'd the file thread). Unproven doodad weathers fall through
+        // to the sky-only cram below (ApplyPreset now nulls doodads for them) — full effects light up per-id as proven.
+        if (weatherPresets.HasDoodads(id) && DoodadsAllowedFor(id))
+            return ApplyPreset(id) + " — full effects (crammed sky + re-established doodads).";
+
+        // Foreign & AVFX-SAFE (b109, allow-listed — e.g. 150 Apocalypse) WITHOUT baked doodads: native-apply for the
+        // DOODADS (spawns the weather's avfx), then, if a baked preset exists, arm the sky-only cram restamp OVER it.
+        // Native is ADDITIVE here — never instead of the cram sky (that was the b107 regression). Cram writes EnvState
+        // only and never ActiveWeather, so native particles keep playing while the baked sky renders. This is the legacy
+        // same-session path, kept as a fallback for ids not yet re-baked with descriptors.
+        if (AvfxSafeWeatherIds.Contains(id))
+        {
+            bool native = ApplyWeather(id);   // spawn the doodads (meteors)
+            if (weatherPresets.Has(id))
+            {
+                ApplyPreset(id);              // sky-only restamp over the (off-bank/black) native EnvState
+                return native
+                    ? "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") — native doodads + crammed sky."
+                    : "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") — crammed sky only (native doodad apply failed, see log).";
+            }
+            return native
+                ? "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") — native doodads applied (no baked sky preset; "
+                    + "`wxbake " + id + "` on a donor for a correct sky under them)."
+                : "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") — native doodad apply failed and no baked preset (see log).";
+        }
+        if (weatherPresets.Has(id))
+            return ApplyPreset(id);
+        return "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") is not in this zone's env bank and has no "
+            + "baked preset. Stand under it on a donor zone and `wxbake " + id + "`, then it renders here.";
+    }
+
+    // b170: the picker chip's DAY-NIGHT-AWARE lever. The "* travels the sun" marker promised a moving sky, but tapping a
+    // chip only ever armed the STATIC single-snapshot cram (SetWeatherUnified → weatherPresets); the keyframe graft was
+    // reachable ONLY via the `wxkfload`+`wxkfreplay` commands — so every asterisked chip was "a lie" on tap, not just the
+    // flat ones. This closes that: a weather whose keyframe set genuinely CYCLES (IsTimeMarching) engages the graft — load
+    // its swept day-set + turn on the per-frame interpolated restamp — so the sky actually travels the sun with the Eorzea
+    // clock. Anything else drops any running graft and falls through to the normal static route. (b182: the keyframe
+    // library now ships EMBEDDED so every client has it; the graft itself still applies client-side and isn't broadcast.)
+    public string SetWeatherOrGraft(byte id)
+    {
+        lastAppliedWeather = id;   // b226: record the user's pick for GetDisplayWeather (grafts don't move the engine byte)
+        pendingVerifyFrames = 0;   // b173: a chip tap supersedes any in-flight native black-verify (don't let it clobber the graft)
+        if (id != 0 && keyframeSets.IsTimeMarching(id))
+        {
+            if (weatherCram.ReplayActive) weatherCram.SetReplay(false);   // graft owns the sky floats — don't let the static cram fight it
+            string load = LoadKeyframeSet(id);                            // ImportKeyframes: pins the donor weather + skip-mask
+            string on = weatherCram.SetKfReplay(true);                    // start the per-frame day-night graft
+            return load + " " + on;
+        }
+        weatherCram.StopKfGraft();   // a non-cycling pick must not leave a stale graft running over it
+        return SetWeatherUnified(id);
+    }
+
+    // b175: DONOR-AWARE graft engage — the picker's per-city sub-selection ("Clear Skies · Limsa") taps this with the city
+    // tt. Same shape as SetWeatherOrGraft(byte) but pins the specific donor's swept day-set instead of the "any donor"
+    // default. Only engages if THAT donor's set genuinely cycles; otherwise falls back to the static/native unified route
+    // (a flat city set shouldn't pretend to travel the sun). b182: the keyframe library ships embedded so every client has
+    // it; the graft still applies client-side and isn't broadcast (mirrors SetWeatherOrGraft(byte)).
+    public string SetWeatherOrGraft(byte id, uint donor)
+    {
+        if (donor == 0) return SetWeatherOrGraft(id);
+        lastAppliedWeather = id;   // b226: record the user's pick for GetDisplayWeather (city grafts don't move the engine byte)
+        pendingVerifyFrames = 0;   // a chip tap supersedes any in-flight native black-verify
+        if (id != 0 && keyframeSets.IsTimeMarching(id, donor))
+        {
+            if (weatherCram.ReplayActive) weatherCram.SetReplay(false);   // graft owns the sky floats — don't let static cram fight it
+            string load = LoadKeyframeSet(id, donor);                     // ImportKeyframes: pins the donor's day-set + skip-mask
+            string on = weatherCram.SetKfReplay(true);                    // start the per-frame day-night graft
+            return load + " " + on;
+        }
+        weatherCram.StopKfGraft();
+        return SetWeatherUnified(id);
+    }
+
+    // NATIVE-ONLY lever for the picker's "This map's states" promotions (b105, 2026-08-17). These entries come from the
+    // live env-bank read (GetLoadedBankWeatherIds) and render NATIVELY — they must NEVER touch the cram path. The
+    // dark-map/weather-unresponsive bug came from routing them through SetWeatherUnified: if the combo was opened during
+    // a load transition the promoted list could carry an id that is no longer in the CURRENT bank, and if that id
+    // happened to have a baked preset, SetWeatherUnified's foreign branch armed a FOREIGN restamp — a donor blob that
+    // sticks every frame (map goes dark, native picks stop responding, survives only a session restart). So this path:
+    // always drops any active restamp first, then native-applies; if the id isn't in the live bank anymore, it refuses
+    // QUIETLY (no cram fallback) rather than arming a stuck override.
+    public string SetWeatherNativeOnly(byte id)
+    {
+        lastAppliedWeather = id;   // b226: record the user's pick for GetDisplayWeather (native picks also move the engine byte, but keep it consistent)
+        if (weatherCram.ReplayActive) weatherCram.SetReplay(false);   // never let a promoted state ride on a restamp
+        weatherCram.StopKfGraft();   // b170: and never let it ride under a running day-night graft either
+        pendingVerifyFrames = 0;     // b173: supersede any in-flight native black-verify from a prior pick
+        if (id != 0 && !IsWeatherInLoadedBank(id))
+            return "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") is no longer in this zone's env bank — skipped (no cram).";
+        bool ok = ApplyWeather(id);
+        if (ok) ArmNativeSkyVerify(id);   // b173: catch the in-bank-but-black case and rescue it with a good sky
+        return ok
+            ? "[HavenNative] setweather: " + id + " (" + WeatherName(id) + ") applied natively."
+            : "[HavenNative] setweather: native apply of " + id + " (" + WeatherName(id) + ") failed (see log).";
+    }
+
+    // b173: arm the deferred black-sky verify for a NATIVE apply. Cleared by any subsequent explicit pick (so a chip tapped
+    // during the window is never clobbered). Armed for every non-zero native id — even ones with no rescue sky — so the
+    // /xllog [WXBLACK] line always reports the resolved-EnvState profile (the ground-truth instrument for the black case);
+    // the rescue itself only fires when a good sky exists. Weather 0 (deliberate blank) is never armed.
+    private void ArmNativeSkyVerify(byte id)
+    {
+        if (id == 0) { pendingVerifyFrames = 0; return; }
+        pendingVerifyId = id;
+        pendingVerifyFrames = 15;   // ~1/4s at 60fps: enough for the native UpdateEnvironment recompute to resolve the pick
+    }
+
+    // NB-43: cancel any armed native-sky black-verify. Used by the PEER's host-authoritative map-state apply so the peer
+    // MIRRORS the host's sky VERBATIM and never runs the solo black-rescue re-route. That rescue independently re-resolves
+    // the id — the single-authority anti-pattern the rest of map-state avoids — and MISFIRES on the sync path: a fixed-time
+    // DUNGEON's own "Fair Skies" (a legitimately dark sky, and/or sampled mid-env-stream-in before the zone's EnvState has
+    // resolved) scores under the "black" heuristic (liveLanes<6 || maxAbs<0.02) and gets rescued into a day-night CITY
+    // keyframe graft → the peer shows a bright, time-marching city sky while the host shows the fixed dungeon one (1010
+    // Magna Glacies). The host never rescues on its native load (Reassert → ApplyWeather arms no verify), so neither must
+    // the peer. Solo/explicit picks KEEP the rescue — it's a single-client safety net for a user-chosen off-bank sky, not
+    // a sync path. Idempotent; safe to call when nothing is armed (the graft/foreign-cram branches arm no verify anyway).
+    public void CancelNativeSkyVerify() => pendingVerifyFrames = 0;
+
+    // b173: per-frame tick (driven by the plugin's framework Update). When the arm window elapses, sample the freshly
+    // resolved EnvState (EnvManager+0x58, 0x2F8 bytes) and score its degeneracy: over the SANE float lanes (finite,
+    // |v|<1e4 — the same pointer/garbage filter KeyframeSetStore uses), count how many carry a non-trivial value and the
+    // largest magnitude. A black/uninitialised block reads as almost-all-zero (few live lanes, tiny maxAbs); ANY real
+    // rendered sky — day OR night — populates dozens of lanes (fog, ambient, cloud, star params are never all zero). If it
+    // reads black and we hold a good sky for the id, upgrade: graft when the set travels the sun, else the static cram.
+    public void TickNativeSkyVerify()
+    {
+        if (pendingVerifyFrames <= 0) return;
+        if (--pendingVerifyFrames > 0) return;
+        byte id = pendingVerifyId;
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) return;
+            nint es = (nint)env + 0x58;
+            int lanes = 0x2F8 / 4;
+            int live = 0; float maxAbs = 0f;
+            var head = new System.Text.StringBuilder();
+            for (int i = 0; i < lanes; i++)
+            {
+                float v = *(float*)(es + i * 4);
+                if (!float.IsFinite(v) || Math.Abs(v) >= 1.0e4f) continue;   // pointer/garbage lane — not a sky float
+                float a = Math.Abs(v);
+                if (a > 0.001f) live++;
+                if (a > maxAbs) maxAbs = a;
+                if (i < 16) head.Append(v.ToString("0.###")).Append(' ');
+            }
+            bool black = live < 6 || maxAbs < 0.02f;
+            bool marching = keyframeSets.IsTimeMarching(id);
+            bool haveRescue = marching || weatherPresets.Has(id);
+            log.Information("[HavenNative] [WXBLACK] native weather " + id + " (" + WeatherName(id) + ") resolved: liveLanes="
+                + live + " maxAbs=" + maxAbs.ToString("0.###") + " black=" + black + " rescueAvail=" + haveRescue
+                + " head=[" + head.ToString().TrimEnd() + "]");
+            if (black && haveRescue)
+            {
+                pendingVerifyFrames = 0;   // belt-and-braces: rescue must not re-arm itself
+                string r = marching ? SetWeatherOrGraft(id) : ApplyPreset(id);
+                log.Information("[HavenNative] [WXBLACK] weather " + id + " rendered black → rescued via "
+                    + (marching ? "day-night graft" : "static cram") + ". " + r);
+            }
+            else if (black)
+            {
+                log.Information("[HavenNative] [WXBLACK] weather " + id + " (" + WeatherName(id) + ") rendered black and no baked "
+                    + "preset/graft to rescue it — bake one on a donor (`wxbake " + id + "`).");
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] TickNativeSkyVerify failed: " + ex.Message); }
+    }
+
+    // ── preset-library queries (picker/sync) ──
+    public bool HasPreset(byte id) => weatherPresets.Has(id);
+    public bool HasShippedPreset(byte id) => weatherPresets.HasShipped(id);   // sync-deterministic subset
+    public bool HasKeyframeSet(byte id) => keyframeSets.Has(id);              // b168: city keyframe-tour skip check
+    public bool HasTimeMarchingSet(byte id) => keyframeSets.IsTimeMarching(id); // b170: only sets that actually cycle earn the UI "*"
+    // b175: per-city donor variants for the picker sub-selection. TimeMarchingDonorsFor = only the city sets that actually
+    // cycle (a flat city set earns no sub-chip). DonorSetName is the stored label (city · weather) for the tooltip.
+    public IReadOnlyList<uint> TimeMarchingDonorsForWeather(byte id) => keyframeSets.TimeMarchingDonorsFor(id);
+    public bool HasTimeMarchingSet(byte id, uint donor) => keyframeSets.IsTimeMarching(id, donor);
+    public bool HasKeyframeSet(byte id, uint donor) => keyframeSets.Has(id, donor);   // b175: per-donor presence (wxkfcities skip)
+    public string? DonorSetName(byte id, uint donor) => keyframeSets.Name(id, donor);
+    public IReadOnlyList<byte> WeathersWithDonorVariants => keyframeSets.WeathersWithDonors; // b175: picker "City sky variants" list
+    public IReadOnlyList<byte> AvailablePresetIds => weatherPresets.AvailableIds;
+    public string PresetName(byte id) => weatherPresets.Name(id) ?? WeatherName(id);
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // BATCH BAKE (wxbakeall) — capture every weather THIS zone natively carries, one at a time, unattended.
+    // A weather is only safely captureable where it's IN the zone's loaded env bank (renders natively — setweather is
+    // safe, no resource-loader fault). So the operator hops to a donor zone (e.g. 958 for Apocalypse/CutScene) and runs
+    // this ONCE per zone: it walks the bank's ids, applies each natively, waits for the sky to blend, snapshots the live
+    // EnvState into the local preset library, and restores the original weather when done. Frame-driven state machine —
+    // TickBatchBake() is called every frame from OnFrameworkUpdate.
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    private bool batchActive;
+    private List<byte>? batchIds;
+    private int batchIndex;
+    private int batchSettle;               // frames remaining before the hard-cap timeout for the current weather
+    private byte batchOriginalWeather;     // restored when the run finishes
+    private int batchBaked;
+    private const int BatchSettleMax = 360;   // ~6s hard cap per weather (blend never exceeds this)
+    private const int BatchMinFrames = 120;   // ~2s minimum blend before we trust the EnvState is fully the target
+
+    public bool BatchBakeActive => batchActive;
+
+    // Read the CURRENT zone's loaded env-bank weather ids (EnvScene.WeatherIds[32] @scene+0x30) — the set that renders
+    // natively here and is therefore safe to setweather + capture. Deduped, zero-skipped, order preserved.
+    public List<byte> GetLoadedBankWeatherIds()
+    {
+        var result = new List<byte>();
+        try
+        {
+            var env = EnvManager.Instance();
+            if (env == null) return result;
+            var scene = env->EnvScene;
+            if (scene == null) return result;
+            byte* idTable = (byte*)((nint)scene + 0x30);
+            var seen = new HashSet<byte>();
+            for (int i = 0; i < 32; i++)
+            {
+                byte id = idTable[i];
+                if (id == 0 || !seen.Add(id)) continue;
+                result.Add(id);
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] GetLoadedBankWeatherIds failed: " + ex.Message); }
+        return result;
+    }
+
+    // Kick off a batch bake of this zone's bank weathers. force=true re-bakes ids already in the library (default skips
+    // them — "capture the REMAINING extras"). Returns a user-facing status.
+    public string StartBatchBake(bool force = false)
+    {
+        if (batchActive) return "[HavenNative] wxbakeall: already running (" + (batchIndex + 1) + "/" + (batchIds?.Count ?? 0) + "). `wxbakeall stop` to cancel.";
+        var ids = GetLoadedBankWeatherIds();
+        if (ids.Count == 0) return "[HavenNative] wxbakeall: no loaded env bank — in a zone with weather?";
+        weatherCram.SetReplay(false);                 // captures must read the true native block, not a crammed one
+        batchOriginalWeather = GetActiveWeather();
+        var todo = new List<byte>();
+        foreach (var id in ids)
+            if (id != 0 && (force || !weatherPresets.Has(id))) todo.Add(id);
+        int skipped = ids.Count - todo.Count;
+        if (todo.Count == 0)
+            return "[HavenNative] wxbakeall: all " + ids.Count + " of this zone's weathers are already baked — `wxbakeall force` to re-bake.";
+        batchIds = todo; batchIndex = 0; batchBaked = 0; batchActive = true;
+        batchSettle = BatchSettleMax;
+        ApplyWeather(todo[0]);                         // apply the first; TickBatchBake settles+captures+advances
+        log.Information("[HavenNative] [WXBAKEALL] start: " + todo.Count + " to bake"
+            + (skipped > 0 ? " (" + skipped + " already baked, skipped)" : "")
+            + " on zone bank [" + string.Join(",", ids) + "]. Restore target=" + batchOriginalWeather + ".");
+        return "[HavenNative] wxbakeall: baking " + todo.Count + " weather(s) here (~" + (todo.Count * 6) + "s, unattended)"
+            + (skipped > 0 ? "; " + skipped + " already baked" : "") + ". Progress in /xllog [WXBAKEALL].";
+    }
+
+    public string CancelBatchBake()
+    {
+        if (!batchActive) return "[HavenNative] wxbakeall: not running.";
+        batchActive = false;
+        ApplyWeather(batchOriginalWeather);
+        log.Information("[HavenNative] [WXBAKEALL] cancelled after " + batchBaked + " baked.");
+        return "[HavenNative] wxbakeall: cancelled (" + batchBaked + " baked, original weather restored).";
+    }
+
+    // Per-frame driver. No-op unless a batch is running.
+    public void TickBatchBake()
+    {
+        if (!batchActive || batchIds == null) return;
+        try
+        {
+            byte target = batchIds[batchIndex];
+            byte shown = GetActiveWeather();
+            batchSettle--;
+            int elapsed = BatchSettleMax - batchSettle;
+            bool ready = elapsed >= BatchMinFrames && shown == target;   // blended enough AND the displayed sky is the target
+            bool timedout = batchSettle <= 0;
+            if (!ready && !timedout) return;
+
+            var blob = weatherCram.CaptureRaw(out var active);
+            if (blob != null && active == target)
+            {
+                // b121 FIX: CaptureRaw just snapshotted this weather's avfx doodad descriptors (ProbeResourceWords →
+                // capturedDoodads). Pass them into Bake exactly as BakeCurrentPreset does, so the batch/tour path
+                // PERSISTS the descriptor bytes. Without this the whole-suite tour baked every preset with doodads:null
+                // (sky-only, dead cross-session) — the b120 candidate-A proof only held for the manually-baked 150.
+                var batchDoodads = weatherCram.GetCapturedDoodads();
+                weatherPresets.Bake(target, WeatherName(target), blob, batchDoodads);
+                batchBaked++;
+                log.Information("[HavenNative] [WXBAKEALL] baked " + target + " (" + WeatherName(target) + ") "
+                    + (batchIndex + 1) + "/" + batchIds.Count
+                    + ", " + batchDoodads.Count + " doodad(s)"
+                    + (timedout && shown != target ? " [timeout — sky may not have fully settled]" : ""));
+            }
+            else
+            {
+                log.Warning("[HavenNative] [WXBAKEALL] SKIP " + target + " (" + WeatherName(target) + "): live ActiveWeather was "
+                    + active + ", not " + target + " — not captured.");
+            }
+
+            batchIndex++;
+            if (batchIndex >= batchIds.Count)
+            {
+                batchActive = false;
+                ApplyWeather(batchOriginalWeather);
+                log.Information("[HavenNative] [WXBAKEALL] DONE — baked " + batchBaked + " weather(s), restored " + batchOriginalWeather + " (" + WeatherName(batchOriginalWeather) + ").");
+                return;
+            }
+            batchSettle = BatchSettleMax;
+            ApplyWeather(batchIds[batchIndex]);
+        }
+        catch (Exception ex)
+        {
+            batchActive = false;
+            log.Error("[HavenNative] [WXBAKEALL] aborted: " + ex.Message);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // b161: KEYFRAME SWEEP (wxkfsweep) — capture the ENTIRE day-night gradient, unattended.
+    // b160's hand-shot keyframes cycle but BAND between the few samples. The game already computes the full gradient
+    // (it interpolates the donor weather's envb curves by tod EVERY frame — that's why the sky tracks the slider live).
+    // So don't hand-pick keyframes or parse the envb format: DRIVE the donor's clock across the whole day (via the same
+    // TimeFreezeService the slider uses) and SAMPLE the game's own resolved EnvState at a fine step. The result IS the
+    // native gradient, captured — dense enough that the b160 lerp between samples is imperceptible. Frame-driven state
+    // machine (TickKeyframeSweep, pumped each frame from OnFrameworkUpdate), same shape as wxbakeall. Reuses the proven
+    // b160 keyframe path verbatim (AddKeyframe tags each sample with the frozen tod; the graft replays the set).
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    private bool kfSweepActive;
+    private int kfSweepStepMin;            // Eorzea-minute step between samples
+    private int kfSweepTodMin;             // current tod being sampled, in Eorzea minutes (0..1440)
+    private int kfSweepSettle;             // frames left for EnvState to resolve to the new tod before we capture
+    private int kfSweepCaptured;
+    private bool kfSweepWasFrozen;         // restore the operator's freeze state on completion/cancel
+    private (int h, int m) kfSweepPrevTime;
+    private const int KfSweepSettleFrames = 8;   // a tod change evaluates ~live (no weather-blend ease); small settle is ample slack
+
+    public bool KeyframeSweepActive => kfSweepActive;
+
+    // Kick off an unattended full-day sweep of the CURRENT (donor) zone under its active weather. stepMinutes = Eorzea
+    // minutes between samples (default 15 ≈ 96 keyframes; smaller = smoother + larger). Stay in the donor zone until done.
+    public string StartKeyframeSweep(int stepMinutes)
+    {
+        if (kfSweepActive)
+            return "[HavenNative] wxkfsweep: already running (" + (kfSweepTodMin / 60) + "h). `wxkfsweep stop` to cancel.";
+        var env = EnvManager.Instance();
+        if (env == null) return "[HavenNative] wxkfsweep: EnvManager null — in the DONOR zone under the target weather?";
+        if (stepMinutes < 1) stepMinutes = 15;
+        if (stepMinutes > 120) stepMinutes = 120;
+        weatherCram.SetReplay(false);      // sample the TRUE native block, not a crammed one
+        weatherCram.ClearKeyframes();      // fresh set
+        kfSweepWasFrozen = timeFreeze.IsFrozen;
+        kfSweepPrevTime = timeFreeze.GetTimeOfDay();
+        kfSweepStepMin = stepMinutes;
+        kfSweepTodMin = 0;
+        kfSweepSettle = KfSweepSettleFrames;
+        kfSweepCaptured = 0;
+        kfSweepActive = true;
+        timeFreeze.FreezeAt(0, 0);         // park at midnight; the tick settles → captures → advances
+        int n = (1440 + stepMinutes - 1) / stepMinutes;
+        log.Information("[HavenNative] [WXKFSWEEP] start: step=" + stepMinutes + "min, ~" + n + " samples, donor weather "
+            + GetActiveWeather() + ".");
+        return "[HavenNative] wxkfsweep: sweeping the full day at " + stepMinutes + "-min steps (~" + n
+            + " keyframes, unattended). Stay in the donor zone; progress in /xllog [WXKFSWEEP]. Then travel + `wxkfreplay on`.";
+    }
+
+    public string CancelKeyframeSweep()
+    {
+        if (!kfSweepActive) return "[HavenNative] wxkfsweep: not running.";
+        kfSweepActive = false;
+        RestoreKfSweepFreeze();
+        return "[HavenNative] wxkfsweep: cancelled (" + kfSweepCaptured + " captured; freeze restored).";
+    }
+
+    private void RestoreKfSweepFreeze()
+    {
+        if (kfSweepWasFrozen) timeFreeze.FreezeAt(kfSweepPrevTime.h, kfSweepPrevTime.m);
+        else timeFreeze.Unfreeze();
+    }
+
+    // Per-frame driver. No-op unless a sweep is running. Settle a few frames after each tod jump so the game's
+    // UpdateEnvironment re-resolves EnvState to the new time, then capture that resolved block as a keyframe.
+    public void TickKeyframeSweep()
+    {
+        if (!kfSweepActive) return;
+        try
+        {
+            kfSweepSettle--;
+            if (kfSweepSettle > 0) return;
+            weatherCram.AddKeyframe();                  // EnvState has resolved to kfSweepTodMin; tag = the frozen tod
+            kfSweepCaptured++;
+            kfSweepTodMin += kfSweepStepMin;
+            if (kfSweepTodMin >= 1440)                  // wrapped the full day (midnight is covered by the graft's wrap-lerp)
+            {
+                kfSweepActive = false;
+                RestoreKfSweepFreeze();
+                log.Information("[HavenNative] [WXKFSWEEP] DONE — " + kfSweepCaptured
+                    + " keyframes across the day. Travel to the target + `wxkfreplay on`.");
+                return;
+            }
+            timeFreeze.FreezeAt(kfSweepTodMin / 60, kfSweepTodMin % 60);
+            kfSweepSettle = KfSweepSettleFrames;
+        }
+        catch (Exception ex)
+        {
+            kfSweepActive = false;
+            log.Error("[HavenNative] [WXKFSWEEP] aborted: " + ex.Message);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    // b166 KEYFRAME TOUR (wxkftour) — the whole-city day-night capture in one unattended command. It is the CROSS
+    // PRODUCT of the two existing state machines: OUTER loop walks the donor city's bank weathers (like wxbakeall),
+    // INNER loop is a full-day keyframe sweep per weather (wxkfsweep) captured DIRECTLY at the validated knot density
+    // (N=30 ⇒ 48-Eorzea-min steps — a uniform 48-min sweep reproduces the same 30-knot set decimation gave, without
+    // holding 1440 samples). For each weather: apply it natively → wait for the weather blend to fully settle → sweep
+    // the day → save the ~N-sample set to the keyframe-set library keyed by that weather. Skips weathers already saved
+    // (resumable; `force` re-does all). Frame-driven: TickKeyframeTour() is pumped from OnFrameworkUpdate alongside
+    // TickKeyframeSweep (the inner sweep it starts). Result = keyframe-sets.local.json holding one day-set per city
+    // weather — the substrate to fold into an embedded resource (the "bake into the plugin" ship step) afterward.
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+    private bool kfTourActive;
+    private List<byte>? kfTourWeathers;
+    private int kfTourIndex;
+    private int kfTourStepMin;             // sweep step in Eorzea minutes (48 → ~30 knots/day)
+    private int kfTourN;                   // target knots/day (for the status line)
+    private byte kfTourOriginalWeather;
+    private int kfTourSaved;
+    private int kfTourBlendSettle;         // frames left in the weather-blend wait before the sweep starts
+    private bool kfTourInBlend;            // true = waiting for the weather to blend; false = sweeping (or between)
+    private uint kfTourDonor;              // b175: donor tt to tag saved sets with (0 = untagged/legacy). The CITY we're in.
+    private string? kfTourDonorName;       // b175: donor city display name folded into each saved set's label
+    private const int KfTourBlendFrames = 300;   // ~5s: let the applied weather fully ease in before freezing tod to sweep
+
+    public bool KeyframeTourActive => kfTourActive;
+
+    // Kick off the unattended whole-city tour on the CURRENT (donor city) zone. nTarget = knots/day per weather (default
+    // 30, the validated density). force=true re-captures weathers already in the library (default skips them — "grab the
+    // remaining"). Stay in the donor until [WXKFTOUR] DONE. Then travel to the target + `wxkfload <id>` + `wxkfreplay on`.
+    public string StartKeyframeTour(int nTarget, bool force) => StartKeyframeTour(nTarget, force, 0, null, null);
+
+    // b175: donor-tagged, optionally weather-restricted tour. donorTt tags every saved set with the CITY we're standing in
+    // (so Limsa's Clear and Kugane's Clear coexist instead of overwriting); restrictWeathers limits the capture to a
+    // specific set (the spine 1/2/3/4/7/15 for the all-cities graft tour) intersected with what this city's bank carries.
+    // The skip check is donor-specific — re-touring a city skips only ITS OWN already-captured sets, not another city's.
+    public string StartKeyframeTour(int nTarget, bool force, uint donorTt, string? donorName, IReadOnlyList<byte>? restrictWeathers)
+    {
+        if (kfTourActive)
+            return "[HavenNative] wxkftour: already running (" + (kfTourIndex + 1) + "/" + (kfTourWeathers?.Count ?? 0)
+                + "). `wxkftour stop` to cancel.";
+        if (kfSweepActive) return "[HavenNative] wxkftour: a manual sweep is running — `wxkfsweep stop` first.";
+        var ids = GetLoadedBankWeatherIds();
+        if (ids.Count == 0) return "[HavenNative] wxkftour: no loaded env bank — stand in the DONOR city zone.";
+        if (nTarget < 2) nTarget = 30;
+        if (nTarget > 1440) nTarget = 1440;
+        int step = Math.Max(1, (int)Math.Round(1440.0 / nTarget));
+        if (step > 120) step = 120;                    // StartKeyframeSweep's own clamp; keep the estimate honest
+        var todo = new List<byte>();
+        foreach (var id in ids)
+        {
+            if (id == 0) continue;
+            if (restrictWeathers != null && !restrictWeathers.Contains(id)) continue;   // spine-only, when restricted
+            if (force || !keyframeSets.Has(id, donorTt)) todo.Add(id);                   // donor-specific skip
+        }
+        int skipped = ids.Count - todo.Count;
+        if (todo.Count == 0)
+            return "[HavenNative] wxkftour: all of this city's" + (restrictWeathers != null ? " spine" : "")
+                + " weathers already have saved sets for this donor — `wxkftour force` to re-capture.";
+        weatherCram.SetReplay(false);                  // capture the TRUE native block, never a crammed one
+        weatherCram.StopKfGraft();
+        kfTourOriginalWeather = GetActiveWeather();
+        kfTourDonor = donorTt; kfTourDonorName = donorName;
+        kfTourWeathers = todo; kfTourIndex = 0; kfTourSaved = 0;
+        kfTourStepMin = step; kfTourN = nTarget; kfTourActive = true;
+        ApplyWeather(todo[0]);                          // arm the first weather; the tick blends → sweeps → saves → advances
+        kfTourInBlend = true; kfTourBlendSettle = KfTourBlendFrames;
+        int perW = (KfTourBlendFrames + nTarget * KfSweepSettleFrames) / 60 + 1;
+        log.Information("[HavenNative] [WXKFTOUR] start: " + todo.Count + " weather(s) @ " + nTarget + " knots ("
+            + step + "-min steps)" + (skipped > 0 ? ", " + skipped + " already saved" : "")
+            + " on bank [" + string.Join(",", ids) + "]. Restore=" + kfTourOriginalWeather + ".");
+        return "[HavenNative] wxkftour: capturing " + todo.Count + " weather(s) at ~" + nTarget + " knots/day (~"
+            + (todo.Count * perW) + "s, unattended). Stay in the donor; progress in /xllog [WXKFTOUR].";
+    }
+
+    public string CancelKeyframeTour()
+    {
+        if (!kfTourActive) return "[HavenNative] wxkftour: not running.";
+        kfTourActive = false;
+        if (kfSweepActive) CancelKeyframeSweep();
+        ApplyWeather(kfTourOriginalWeather);
+        return "[HavenNative] wxkftour: cancelled (" + kfTourSaved + " saved; original weather restored).";
+    }
+
+    // Per-frame driver. No-op unless a tour is running. Two phases per weather: BLEND (wait for the applied weather to
+    // ease in) then SWEEP (delegate to the kfSweep machine; wait for it to finish, then save the set and advance).
+    public void TickKeyframeTour()
+    {
+        if (!kfTourActive || kfTourWeathers == null) return;
+        try
+        {
+            byte target = kfTourWeathers[kfTourIndex];
+            if (kfTourInBlend)
+            {
+                kfTourBlendSettle--;
+                // ActiveWeather flips instantly; the wait is for the visual EnvState blend. Require the target shown AND
+                // a floor of frames so the sweep's tod-0 capture is fully the target weather, not a mid-blend of the last.
+                bool ready = GetActiveWeather() == target && (KfTourBlendFrames - kfTourBlendSettle) >= 120;
+                if (!ready && kfTourBlendSettle > 0) return;
+                kfTourInBlend = false;
+                StartKeyframeSweep(kfTourStepMin);      // clears keyframes+master, freezes tod=0, begins the full-day sweep
+                return;
+            }
+            if (kfSweepActive) return;                  // inner sweep still running (TickKeyframeSweep pumps it)
+
+            // sweep finished — the ~N-sample day-set for `target` is in memory (kfWeather pinned to it). Persist it.
+            if (weatherCram.ExportKeyframes(out var w, out var kfs) && w == target && kfs.Count >= 2)
+            {
+                // b175: tag with the donor city so per-city variants coexist. Label = the CITY name when donor-tagged (the
+                // picker sub-chip wants "Limsa Lominsa"; the weather is already the key); WeatherName for the untagged path.
+                string label = (kfTourDonor != 0 && kfTourDonorName != null) ? kfTourDonorName : WeatherName(target);
+                keyframeSets.Save(target, kfTourDonor, label, kfs);
+                kfTourSaved++;
+                log.Information("[HavenNative] [WXKFTOUR] saved weather " + target + " (" + WeatherName(target) + ")"
+                    + (kfTourDonor != 0 ? " donor " + kfTourDonor : "") + " — "
+                    + kfs.Count + " knots, " + (kfTourIndex + 1) + "/" + kfTourWeathers.Count);
+            }
+            else
+                log.Warning("[HavenNative] [WXKFTOUR] SKIP weather " + target + " (" + WeatherName(target)
+                    + "): swept set was weather " + w + " / " + kfs.Count + " kf — not saved.");
+
+            kfTourIndex++;
+            if (kfTourIndex >= kfTourWeathers.Count)
+            {
+                kfTourActive = false;
+                ApplyWeather(kfTourOriginalWeather);
+                log.Information("[HavenNative] [WXKFTOUR] DONE — saved " + kfTourSaved + " day-set(s), restored "
+                    + kfTourOriginalWeather + " (" + WeatherName(kfTourOriginalWeather)
+                    + "). Travel to the target + `wxkfload <id>` + `wxkfreplay on`.");
+                return;
+            }
+            ApplyWeather(kfTourWeathers[kfTourIndex]);
+            kfTourInBlend = true; kfTourBlendSettle = KfTourBlendFrames;
+        }
+        catch (Exception ex)
+        {
+            kfTourActive = false;
+            log.Error("[HavenNative] [WXKFTOUR] aborted: " + ex.Message);
+        }
+    }
+
+    // S327f: TIME FREEZE now goes through TimeFreezeService, which HOOKS the game's UpdateEorzeaTime recompute and
+    // no-ops it while frozen, then writes ClientTime.EorzeaTime (the field the renderer reads) - Brio's mechanism. The
+    // old EorzeaTimeOverride (0x30) approach was a confirmed dead end (the recompute ignores it and clobbers EorzeaTime
+    // every frame - proven by the [TIME-MIRROR] "was" value marching while overridden=True). These methods keep their
+    // names so the sync architecture (epoch-gated MapState apply) is unchanged.
+    public bool ApplyTime(ushort hour, byte minute)
+    {
+        timeFreeze.FreezeAt(hour, minute);
+        return true;
+    }
+
+    // Freeze at the CURRENT live time (tap Freeze without dragging → pin "now", not a stale stored value).
+    public void FreezeAtCurrent() => timeFreeze.FreezeAtCurrent();
+
+    // Release the freeze - the recompute resumes and real time flows again.
+    public void DisableTimeOverride() => timeFreeze.Unfreeze();
+
+    // Is time currently held?
+    public bool IsTimeOverridden() => timeFreeze.IsFrozen;
+
+    /// <summary>
+    /// ALL weathers for the dropdown, each flagged legal (native to this territory) or not. Order: legal ones first
+    /// (in WeatherRate order), then every other weather by id. The UI renders legal in white, extras in faint ivory,
+    /// so the host can force any of the game's ~216 weathers while seeing which are native. Weather 0 is NOT included
+    /// here (it's the explicit "None - Atmospheric" entry the UI prepends). Returns just legals if the sheet fails.
+    /// </summary>
+    // S326t: the set of weather ids that are used by AT LEAST ONE map (i.e. appear in any WeatherRate row's slots).
+    // Of 216 Weather rows, only ~74 are ever referenced by a rate table; the rest are dead duplicates/unused. The
+    // experimental "show more" list is filtered to this set so it's ~74 meaningful choices, not 216 with dupes. Cached.
+    private HashSet<byte>? usedWeatherIds;
+    private HashSet<byte> GetUsedWeatherIds()
+    {
+        if (usedWeatherIds != null) return usedWeatherIds;
+        var set = new HashSet<byte>();
+        try
+        {
+            var rateSheet = dataManager.GetExcelSheet<WeatherRate>();
+            if (rateSheet != null)
+                foreach (var rate in rateSheet)
+                    foreach (var wRef in rate.Weather)
+                    {
+                        var wid = (byte)wRef.RowId;
+                        if (wid != 0) set.Add(wid);
+                    }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] GetUsedWeatherIds failed: " + ex.Message); }
+        usedWeatherIds = set;
+        return set;
+    }
+
+    public List<(byte id, string name, bool legal)> GetAllWeatherFlagged(uint territoryId)
+    {
+        var result = new List<(byte, string, bool)>();
+        try
+        {
+            // The territory's legal set (ids), preserving order.
+            var legalIds = new List<byte>();
+            var legalSet = new HashSet<byte>();
+            foreach (var (wid, _) in GetLegalWeather(territoryId))
+            {
+                if (wid == 0 || legalSet.Contains(wid)) continue;
+                legalIds.Add(wid); legalSet.Add(wid);
+            }
+
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            if (weatherSheet == null) return result;
+
+            // Legal first.
+            foreach (var wid in legalIds)
+            {
+                var name = weatherSheet.GetRow(wid).Name.ToString();
+                if (string.IsNullOrWhiteSpace(name)) name = "Weather " + wid;
+                result.Add((wid, name, true));
+            }
+            // Then all OTHER weathers that are used by SOME map (deduped to the ~74 real ones - skip the rest).
+            var used = GetUsedWeatherIds();
+            foreach (var id in used)
+            {
+                if (id == 0 || legalSet.Contains(id)) continue;
+                if (!weatherSheet.HasRow(id)) continue;
+                var name = weatherSheet.GetRow(id).Name.ToString();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                result.Add((id, name, false));
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] GetAllWeatherFlagged(" + territoryId + ") failed: " + ex.Message);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The zone's ACTUAL weather set, read from its <c>.lvb</c> weather table (up to 32 slots) - includes cinematic
+    /// weathers (e.g. CutScene) that never appear in the WeatherRate sheet. Each entry is flagged legal via the
+    /// WeatherRate set. Cached per territory. Empty if the zone has no LVB / the parse fails (caller falls back).
+    /// </summary>
+    public List<(byte id, string name, bool legal)> GetLvbWeathers(uint territoryId)
+    {
+        if (lvbWeatherCache.TryGetValue(territoryId, out var cached)) return cached;
+        var result = new List<(byte, string, bool)>();
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            if (terrSheet == null || !terrSheet.HasRow(territoryId)) { lvbWeatherCache[territoryId] = result; return result; }
+            var bg = terrSheet.GetRow(territoryId).Bg.ToString();
+            if (string.IsNullOrWhiteSpace(bg)) { lvbWeatherCache[territoryId] = result; return result; }
+
+            var lvb = dataManager.GetFile<LvbFile>("bg/" + bg + ".lvb");
+            if (lvb?.WeatherIds == null || lvb.WeatherIds.Length == 0) { lvbWeatherCache[territoryId] = result; return result; }
+
+            var legalSet = new HashSet<byte>();
+            foreach (var (wid, _) in GetLegalWeather(territoryId)) if (wid != 0) legalSet.Add(wid);
+
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            var seen = new HashSet<byte>();
+            foreach (var raw in lvb.WeatherIds)
+            {
+                if (raw == 0 || raw >= 255) continue;
+                var id = (byte)raw;
+                if (!seen.Add(id)) continue;
+                if (weatherSheet == null || !weatherSheet.HasRow(id)) continue;
+                var name = weatherSheet.GetRow(id).Name.ToString();
+                if (string.IsNullOrWhiteSpace(name)) name = "Weather " + id;
+                result.Add((id, name, legalSet.Contains(id)));
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] GetLvbWeathers(" + territoryId + ") failed: " + ex.Message);
+        }
+        lvbWeatherCache[territoryId] = result;
+        return result;
+    }
+
+    /// <summary>
+    /// The zone's weather set for the picker: prefer the LVB table (zone-accurate, includes cinematic weathers like
+    /// CutScene); fall back to the WeatherRate-derived list if the zone has no readable LVB. When <paramref name="includeAll"/>
+    /// is set (debug mode), the ENTIRE game weather set is appended after the zone set - for hunting anomalous
+    /// weathers that aren't in a zone's LVB but still produce an effect (rare, not normally applicable).
+    /// </summary>
+    public List<(byte id, string name, bool legal)> GetZoneWeathers(uint territoryId, bool includeAll)
+    {
+        var lvb = GetLvbWeathers(territoryId);
+        var baseList = lvb.Count > 0 ? lvb : GetAllWeatherFlagged(territoryId);
+        if (!includeAll) return baseList;
+
+        // DEBUG grid (Ask 3, 2026-08-16): enumerate the ENTIRE Weather sheet, not just the WeatherRate-USED subset.
+        // The old path appended only GetAllWeatherFlagged (ids referenced by some WeatherRate), which SILENTLY DROPPED
+        // cinematic-only ids that no zone's rate table carries — that's exactly why 958's Apocalypse (150) and CutScene
+        // didn't appear as chips and had to be found via Weatherman. In debug mode we want every named weather tappable
+        // so any exotic can be crammed on any zone. Legal flag preserved from the zone's base set.
+        var have = new HashSet<byte>();
+        var legalSet = new HashSet<byte>();
+        foreach (var (id, _, legal) in baseList) { have.Add(id); if (legal) legalSet.Add(id); }
+        var result = new List<(byte, string, bool)>(baseList);
+        try
+        {
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            if (weatherSheet != null)
+                foreach (var row in weatherSheet)
+                {
+                    if (row.RowId == 0 || row.RowId > byte.MaxValue) continue;
+                    var id = (byte)row.RowId;
+                    if (have.Contains(id)) continue;
+                    var name = row.Name.ToString();
+                    if (string.IsNullOrWhiteSpace(name)) continue;   // unnamed sheet padding — skip
+                    have.Add(id);
+                    result.Add((id, name, legalSet.Contains(id)));
+                }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] GetZoneWeathers(all) sheet-enum failed: " + ex.Message); }
+        return result;
+    }
+
+    // b105: every NAMED Weather-sheet id (0<id<=255, non-empty name) — the exact set the debug chip grid shows. Used by
+    // the coverage report to separate "capturable but unbaked" from "no env bank anywhere" (sheet rows like Clear Skies
+    // 91 / Core Radiation 37-39 / Eternal Bliss 83 that no territory carries → uncapturable via the native-bake path).
+    public List<byte> AllNamedWeatherIds()
+    {
+        var ids = new List<byte>();
+        try
+        {
+            var weatherSheet = dataManager.GetExcelSheet<Weather>();
+            if (weatherSheet != null)
+                foreach (var row in weatherSheet)
+                {
+                    if (row.RowId == 0 || row.RowId > byte.MaxValue) continue;
+                    if (string.IsNullOrWhiteSpace(row.Name.ToString())) continue;
+                    ids.Add((byte)row.RowId);
+                }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] AllNamedWeatherIds failed: " + ex.Message); }
+        return ids;
+    }
+
+    // b106: BANK-LESS weathers — named Weather-sheet rows that NO territory's env bank (EnvbWeathers) carries, so they
+    // are uncapturable via the native-bake path (load a donor → drive the weather → snapshot EnvState). Confirmed by an
+    // offline xivtool survey across all 1126 territories' EnvbWeathers (weather-atlas.csv): none of these six appears in
+    // any bank; id 36 sits in TT196's WeatherRate POOL but not its envb, so even that map can't render it. They are
+    // cutscene-hardcoded skies with no weather-keyed bank entry. We exclude them from the guessable "extra presets" grid
+    // so they stop showing as permanently-grey chips a user can never satisfy — they were never capturable, not merely
+    // unbaked. If a future cutscene-EnvState-snapshot path ever backs one, drop it from this set to re-expose it.
+    //   91 Clear Skies · 36/37/38/39 Core Radiation · 83 Eternal Bliss
+    public static readonly HashSet<byte> BankLessWeatherIds = new() { 91, 36, 37, 38, 39, 83 };
+
+    // AVFX-SAFE allow-list (b109, 2026-08-17). Weathers whose native avfx (particle "doodads") RESOLVE broadly enough
+    // to native-apply OFF-BANK without faulting the resource loader — so we can spawn their doodads (meteors, etc.)
+    // instead of only cramming a static sky. A native ActiveWeather write kicks off TWO independent subsystems: (1) the
+    // sky/EnvState blend, keyed by THIS zone's env bank — an off-bank id misses → black sky (non-fatal); and (2) the
+    // avfx spawn via ResourceGraph.FindResourceHandle, a GLOBAL resource lookup — if that weather's .avfx path resolves,
+    // the particles spawn; if not, the loader dereferences a bad handle → C0000005 CTD (UNCATCHABLE in .NET). So avfx
+    // safety is PER-WEATHER, not a property of being off-bank. 150 (Apocalypse) was CONFIRMED to render its full meteors
+    // on Limsa TT128 (bank {1,2,3,4,7,15}, no 150) with NO crash — its meteor avfx is broadly resolvable. This list is
+    // the OPPOSITE of a suffocating guard: it opens native apply ONLY for ids we've PROVEN safe, leaving every other
+    // foreign weather on the reliable cram-only (sky restamp) path. SetWeatherUnified pairs a native apply here with a
+    // sky-only cram OVER it (WeatherCramService writes EnvState only, never ActiveWeather, and preserves the zone's avfx
+    // handles) so you get native doodads + a correct crammed sky at once. CAVEAT: avfx resolvability can be per-zone (an
+    // old note claimed 150 once faulted on Limsa Upper Decks) — 150 is proven on 128, not guaranteed everywhere; if it
+    // ever CTDs on a zone, that zone's resource graph can't resolve the meteor avfx. Grow this ONLY after in-game proof
+    // (or at runtime via the `wxdood <id>` dev lever, session-scoped — resets to this seed on relaunch).
+    //   150 Apocalypse (meteors)
+    public static readonly HashSet<byte> AvfxSafeWeatherIds = new() { 150 };
+
+    // CANDIDATE-A DOODAD-SAFE allow-list (b123, 2026-08-17). Distinct from AvfxSafeWeatherIds (that gates the NATIVE
+    // avfx-spawn path). This gates the b120 candidate-A RE-ESTABLISH path: applying a persisted preset's baked doodad
+    // descriptor by AllocHGlobal-copying its bytes and repointing the EnvState word at our buffer. b122 shipped all 204
+    // presets' descriptors, but candidate-A faithful-copy proved UNSAFE IN GENERAL: weather 207 (Auroral Flares) CTD'd
+    // the file thread (C0000005 read @0x20, Penumbra ReadSqPack → game loader) while flicking presets on TT958. The
+    // 0x2C0/0x2C8 target is NOT a clean "path + transform" blob — it's a LIVE avfx emitter OBJECT-GRAPH with 35–39 real
+    // heap pointers into the DONOR session. A verbatim copy leaves those inner pointers DANGLING; the game's file thread
+    // walks one, hits a field that resolved to null, and reads null+0x20 → uncatchable fault. 150 has only ~2 shallow
+    // inner pointers and survives (and is relaunch-proven); dense-graph weathers (149/196/201 rendered by LUCK — their
+    // dangling pointers happened to land on still-committed memory) are landmines. So candidate A re-establish is opened
+    // ONLY for ids PROVEN stable; every other doodad weather renders sky-only (crash-safe, still deterministic) until the
+    // robust general mechanism (candidate B: game-INSTANTIATED avfx by path, so the object-graph is valid, no dangling
+    // pointers) lands. Grow this set ONLY after cross-session in-game proof. The 204 baked descriptors stay embedded —
+    // they cost nothing dormant and light up the moment an id is proven or candidate B replaces the copy.
+    //   150 Apocalypse (meteors) — relaunch-proven cross-session, ~2 inner pointers
+    public static readonly HashSet<byte> SafeDoodadIds = new() { 150 };
+
+    // b128 DOODAD KILL SWITCH (was b124 `PermitAllDoodads`, inverted). Doodads are now ON BY DEFAULT (see the b128 policy
+    // note on CrashDoodadIds below), so this is no longer a "widen" gate — it's an OPT-OUT kill switch. `wxdoodall off`
+    // sets it true to suppress ALL doodad re-establish (extras render sky-only), `wxdoodall on` clears it. Default false =
+    // doodads enabled. Session-scoped (resets on plugin reload). Kept mainly as an escape hatch if a future patch shifts
+    // the EnvState layout and doodads start misbehaving before the blocklist can be updated.
+    public static bool DoodadsDisabled;
+
+    // b127→b128 KNOWN-CRASHER BLOCKLIST + DEFAULT-ON POLICY (2026-08-17). The empirical manual sweep across all 98 doodad
+    // weathers on TT999 found EXACTLY TWO hard crashers — 207 (Auroral Flares) and 208 (Floracane), both C0000005 in the
+    // env routine (sub_1402FE240). Every OTHER id re-established its doodads and rendered cleanly (many spectacularly:
+    // 194/195 real meteor showers, 102/103/104, 137/22/143/68/20). This DEMOLISHED the b126 readability guard's premise
+    // (it flagged 96/98 as "likely CTD" on unmapped inner pointers, but 94 render fine — the env routine only walks a FEW
+    // descriptor offsets, so a weather crashes iff a WALKED offset is bad, not because it has any dangling word). So the
+    // ground truth is this tiny blocklist, not a per-id allow-list. POLICY (user decision, b128): doodads are ALWAYS ON by
+    // default for EVERY preset except these two — the full "bells and whistles" load for all extras, no per-id proving and
+    // no manual toggle. The two crashers (207/208) are ALWAYS refused → sky-only SELECTIVE restamp (preserves the DEST
+    // zone's own pointer words), deterministic and crash-free. (SafeDoodadIds/AvfxSafeWeatherIds above are now largely
+    // historical — the gate no longer consults SafeDoodadIds; kept for the AvfxSafeWeatherIds native-doodad branch.)
+    //
+    // b133 ROOT CAUSE (corrects the b130 "second-order deref" verdict — that was WRONG): the crash is a FIRST-order deref
+    // of a STALE, un-re-established EnvState pointer. The env routine sub_1402FE240 walks the EnvState doodad words at
+    // 0x2C0 AND 0x2C8. The SHIPPED preset for 207/208 bakes ONLY the 0x2C0 descriptor — 0x2C8 was never captured. So
+    // ReestablishDoodads re-points/strips 0x2C0 but leaves 0x2C8 holding the baked EnvState blob's STALE donor pointer,
+    // which the WHOLESALE restamp (skipWord=null) then stamps into live memory → the routine follows it → CTD. PROOF: the
+    // b130 fault addr for 207 (0x1F834914FB0) == the embedded 207 EnvState word at 0x2C8 EXACTLY; ditto 208 (…F60). Only
+    // 207/208 are affected because they're the ONLY doodad-weathers whose EnvState 0x2C8 is an UNCOVERED pointer — every
+    // other id either baked a 0x2C8 descriptor (re-pointed to a valid buffer) or has 0x2C8==0 (harmless). (0x2D0 is
+    // uncovered/stale in 37 weathers but never CTDs → the routine does NOT walk 0x2D0.) `wxcoldtest strip` "worked" only
+    // because the LIVE capture included BOTH descriptors (the WXPROBE showed 2), so it re-pointed+stripped 0x2C8 too.
+    // FIX-TO-SHIP: re-bake 207/208 with BOTH descriptors (the 0x2C8 one is 208's ce_hina petals / 207's ce_auro01n), then
+    // they can move to StripDoodadIds and ship. Until re-baked they stay here (sky-only).
+    public static readonly HashSet<byte> CrashDoodadIds = new() { 207, 208 };
+
+    // STRIP-LIST (the "sever the inner danglers" ship path, kept as infrastructure). An id here re-establishes its doodads
+    // with the descriptor's inner heap-pointer words ZEROED (ReestablishDoodads strip=true) so the game re-resolves from
+    // the inline .avfx path instead of a stale pointer. Proven viable via `wxcoldtest strip` on LIVE captures (b131 208
+    // petals, b132 207 auroras) — but shipping it requires the EMBEDDED preset to carry EVERY EnvState-referenced
+    // descriptor (0x2C0 AND 0x2C8), else the un-baked slot wholesale-stamps a stale pointer and CTDs (see CrashDoodadIds
+    // b133 note). EMPTY until 207/208 are re-baked with both descriptors; then add them here and remove from CrashDoodadIds.
+    public static readonly HashSet<byte> StripDoodadIds = new() { };
+
+    // True if this id's baked doodads are allowed to re-establish: ON for everything except the crashers, unless the
+    // operator killed doodads (`wxdoodall off`). b130 DIAG BYPASS retained: while `wxdooddiag` is armed we let the crashers
+    // re-establish so the VEH can catch the fault (the forensic path for a re-bake→strip verification cycle).
+    public bool DoodadsAllowedFor(byte id)
+        => !DoodadsDisabled && (!CrashDoodadIds.Contains(id) || weatherCram.FaultDiagArmed);
+
+    /// <summary>
+    /// The territory's native weather id. S328ac: prefer the LIVE WeatherManager (GetWeatherForDaytime(territory, 0)) -
+    /// the weather the game would actually show right now, respecting a territory's individual/special weather - so the
+    /// host broadcasts the REAL sky instead of 0 (which peers render as "None / atmospheric"). Falls back to the
+    /// WeatherRate sheet's first non-zero entry (the dominant/native weather) if the live manager is unavailable, and
+    /// to 0 if neither resolves. Also used to label the "Default - {name}" choice and the prepopulated value on a
+    /// fresh territory.
+    /// </summary>
+    public byte GetDefaultWeather(uint territoryId)
+    {
+        if (territoryId == 0) return 0;
+        // Live path: what the game would actually show now (special/individual weather aware).
+        try
+        {
+            if (territoryId <= ushort.MaxValue)
+            {
+                var wm = FFXIVClientStructs.FFXIV.Client.Game.WeatherManager.Instance();
+                if (wm != null)
+                {
+                    byte live = wm->GetWeatherForDaytime((ushort)territoryId, 0);   // 0 = now
+                    if (live != 0) return live;
+                }
+            }
+        }
+        catch { /* fall through to the sheet */ }
+        // Sheet fallback: the WeatherRate table's first non-zero entry (the dominant/native weather).
+        try
+        {
+            var terrSheet = dataManager.GetExcelSheet<TerritoryType>();
+            var rateSheet = dataManager.GetExcelSheet<WeatherRate>();
+            if (terrSheet == null || rateSheet == null || !terrSheet.HasRow(territoryId)) return 0;
+            var rateId = terrSheet.GetRow(territoryId).WeatherRate.RowId;
+            if (!rateSheet.HasRow(rateId)) return 0;
+            foreach (var wRef in rateSheet.GetRow(rateId).Weather)
+            {
+                var wid = (byte)wRef.RowId;
+                if (wid != 0) return wid;   // first non-zero = the dominant/native weather
+            }
+        }
+        catch { /* fall through */ }
+        return 0;
+    }
+
+    /// <summary>
+    /// NB-39: a CUTSCENE STAGE's authored default weather, read from the stage bg's own <c>.lvb</c> weather table —
+    /// independent of the donor territory the swap-load borrows. Returns the first non-zero weather in the table (the
+    /// authored/primary weather, incl. cinematic ones like CutScene that never appear in WeatherRate), or 0 if the
+    /// stage has no readable .lvb / no weather (caller then falls back to the donor). Cached per bg path.
+    /// </summary>
+    public byte GetStageDefaultWeather(string? stageBg)
+    {
+        if (string.IsNullOrWhiteSpace(stageBg)) return 0;
+        if (stageWeatherCache.TryGetValue(stageBg, out var cached)) return cached;
+        byte result = 0;
+        try
+        {
+            var lvb = dataManager.GetFile<LvbFile>("bg/" + stageBg + ".lvb");
+            if (lvb?.WeatherIds != null)
+            {
+                foreach (var raw in lvb.WeatherIds)
+                {
+                    if (raw != 0 && raw <= byte.MaxValue) { result = (byte)raw; break; }   // first non-zero = authored primary
+                }
+            }
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] GetStageDefaultWeather(" + stageBg + ") failed: " + ex.Message); }
+        stageWeatherCache[stageBg] = result;
+        return result;
+    }
+
+    private readonly HousingMusicStream orchestrion;
+    private readonly Haven.Core.BgmSceneLease bgmLease = new();
+    private uint currentOrchestrionSel;
+    private bool havenMusicOwned;
+    public bool HousingMusicOwned => havenMusicOwned;
+    private const uint SilenceTrackBgm = 1; // BGM_Null.scd
+
+    public Haven.Core.MusicStreamState HousingMusicState => orchestrion.State;
+    public bool HousingMusicLoading => orchestrion.Loading;
+    public bool PlayHousingRoll(uint rollId)
+    {
+        havenMusicOwned = true;
+        if (!PlayOrchestrion(OrchestrionIdBase + rollId)) { ReleaseHousingMusic(); return false; }
+        // Listener volume belongs to the game's audio settings, never the host.
+        orchestrion.SetVolume(1);
+        return true;
+    }
+    public void SilenceHousingMusic() { havenMusicOwned = true; StopBgm(); }
+    public void ReleaseHousingMusic() => RestoreBgm();
+
+    // Scene 0 is the event override. Let the BGM director update its playback
+    // state; writing PlayingBgmId/PreviousBgmId hid still-playing zone streams.
+    private bool OverrideBgm(ushort id)
+    {
+        var bgm = BGMSystem.Instance();
+        if (bgm == null || bgm->Scenes.LongCount == 0) return false;
+        bgmLease.Engage(bgm->Scenes.First->BgmId, id);
+        BGMSystem.SetBGM(id, 0);
+        return true;
+    }
+
+    public bool PlayBgm(uint bgmId)
+    {
+        try
+        {
+            if (bgmId >= OrchestrionIdBase) return PlayOrchestrion(bgmId);
+            StopOrchestrionStream();
+            if (bgmId == 0) { RestoreBgm(); return true; }
+            return bgmId <= ushort.MaxValue && OverrideBgm((ushort)bgmId);
+        }
+        catch (Exception ex)
+        {
+            RestoreBgm();
+            log.Warning("[HavenNative] PlayBgm(" + bgmId + ") failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    // Haven: a custom song's SCD, served by Penumbra at a path of its own (CustomMusic.GamePath).
+    public bool PlayHousingFile(string path)
+    {
+        havenMusicOwned = true;
+        if (!orchestrion.Available || !PlayOrchestrionFile(path, 0)) { ReleaseHousingMusic(); return false; }
+        orchestrion.SetVolume(1);
+        return true;
+    }
+
+    private bool PlayOrchestrion(uint selection)
+    {
+        if (!orchestrion.Available || !TryGetOrchestrionPath(selection, out var path)) return false;
+        return PlayOrchestrionFile(path, selection);
+    }
+
+    private bool PlayOrchestrionFile(string path, uint selection)
+    {
+        StopOrchestrionStream();
+        if (!OverrideBgm((ushort)SilenceTrackBgm)) return false;
+        var player = FFXIVClientStructs.FFXIV.Client.Game.Control.Control.GetLocalPlayer();
+        if (!orchestrion.Play(path, player == null ? 0 : player->Position.X,
+                player == null ? 0 : player->Position.Y, player == null ? 0 : player->Position.Z))
+        { RestoreBgm(); return false; }
+        currentOrchestrionSel = selection;
+        return true;
+    }
+
+    private void StopOrchestrionStream() { currentOrchestrionSel = 0; orchestrion.Stop(); }
+    public bool StopBgm() => PlayBgm(SilenceTrackBgm);
+
+    public void RestoreBgm()
+    {
+        havenMusicOwned = false;
+        StopOrchestrionStream();
+        try
+        {
+            var bgm = BGMSystem.Instance();
+            var previous = bgmLease.Release(bgm == null || bgm->Scenes.LongCount == 0 ? null : bgm->Scenes.First->BgmId);
+            if (bgm == null || previous == null) return;
+            if (previous.Value == 0) bgm->ResetBGM(0);
+            else BGMSystem.SetBGM(previous.Value, 0);
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] RestoreBgm failed: " + ex.Message); }
+    }
+    /// <summary>
+    /// Re-assert the currently-held state to the live client. Called AFTER a map load settles (the load can clobber
+    /// weather/time/BGM) and on a mid-session change. Idempotent.
+    /// </summary>
+    // loadedZoneId MUST be the real synthetic-loaded zone (zoneLoad.CurrentLoadedZone), NOT GameMain's
+    // CurrentTerritoryTypeId - under the packet filter GameMain still reports the apartment/previous zone, which caused
+    // weather-legality and BGM-default to resolve against the WRONG map ("plays the last map's track").
+    // NB-25: returns the concrete weather id it ENGAGED, so the caller broadcasts that exact value verbatim (see the
+    // host reassert tick in HavenNativePlugin) instead of reading GetActiveWeather()'s lagging displayed byte - reading the
+    // live byte right after a load is the map-load "weather not uniform on peers" settle-race. Apply behaviour below is
+    // unchanged; only the resolved value is now also handed back (0 = None/atmospheric is a legitimate return).
+    public byte Reassert(uint loadedZoneId)
+    {
+        // Held HOST STATE (weather/time/explicit BGM pick) is only re-asserted if the host actually set something this
+        // session - that's what HasState gates. But it does NOT gate the BGM BASELINE below.
+        if (HasState)
+        {
+            // Weather is per-scene: only re-assert a held weather if it's still LEGAL for the map we're now on.
+            if (WeatherId != 0 && loadedZoneId != 0 && GetLegalWeather(loadedZoneId).Exists(x => x.id == WeatherId))
+            {
+                // b183: if a day/night sky-graft donor is held (late-join peer, or host synthetic re-load), re-engage the
+                // graft rather than a flat native write — otherwise the reasserted sky stops marching the sun. Donor 0 or a
+                // non-marching set falls straight back to ApplyWeather via SetWeatherOrGraft's own guard.
+                if (WeatherDonor != 0) SetWeatherOrGraft(WeatherId, WeatherDonor);
+                else ApplyWeather(WeatherId);
+            }
+            if (TimeForced) ApplyTime(EorzeaHour, EorzeaMinute);
+        }
+
+        // WEATHER ENGAGE (S328ac) - like the BGM baseline below, runs on EVERY load. The host's own weather write on a
+        // synthetic load can otherwise land as a stale/generic sky (fair skies) rather than the map's real weather. If
+        // no explicit host weather is held (or it's illegal here), assert the zone's NATIVE weather so the host shows
+        // the true sky and broadcasts a concrete id. Explicit legal pick already applied above; this is the baseline.
+        byte resolvedWeather = 0;   // NB-25: what we engaged and hand back for verbatim broadcast
+        bool heldWeatherApplied = HasState && WeatherId != 0 && loadedZoneId != 0 && GetLegalWeather(loadedZoneId).Exists(x => x.id == WeatherId);
+        if (heldWeatherApplied)
+        {
+            resolvedWeather = WeatherId;   // the held, still-legal pick
+        }
+        else if (loadedZoneId != 0 || ActiveStageBgForWeather != null)
+        {
+            // NB-39: a cutscene stage resolves its own AUTHORED weather from its .lvb first (the donor territory is a
+            // borrowed real zone — an interior donor gives weather 0 = None, so every cutscene popped atmospheric). Fall
+            // back to the donor's native weather only when the stage has no authored weather.
+            byte stageWeather = ActiveStageBgForWeather != null ? GetStageDefaultWeather(ActiveStageBgForWeather) : (byte)0;
+            byte nativeWeather = stageWeather != 0 ? stageWeather : (loadedZoneId != 0 ? GetDefaultWeather(loadedZoneId) : (byte)0);
+            if (ActiveStageBgForWeather != null)
+                log.Debug("[HavenNative] [WX-STAGE] " + ActiveStageBgForWeather + ": authored=" + stageWeather   // cutscene-only load-time diag
+                    + " donor(" + loadedZoneId + ")=" + (loadedZoneId != 0 ? GetDefaultWeather(loadedZoneId) : 0)
+                    + " → engaging " + nativeWeather + " (" + WeatherName(nativeWeather) + ")");
+            // NB-42: SCRIPTED / BATTLE-INSTANCE WEATHER. GetDefaultWeather resolves the WeatherRate table
+            // (GetWeatherForDaytime), but scripted/instance zones render a weather the RATE TABLE CANNOT COMPUTE — the
+            // sky is baked into the level env / set by the content director, not rolled from WeatherRate. e.g. 1010
+            // (btl/m5b1): WeatherRate row 0 → weather 2 (the bright standard "Fair Skies"), yet the engine renders a
+            // DIFFERENT same-named variant (a gloomy "Fair Skies" — the sheet has many: 2/30-34/52/63/65…). So the host
+            // broadcast byte 2 while itself showing the gloomy one → peers desync to bright ("definitely diff fair
+            // skies"). The re-apply nudge couldn't fix it because it re-shipped the same wrong byte: a RESOLUTION
+            // divergence, not a delivery failure. FIX: past the settle gate (this runs only from the 150-frame +
+            // IsZoneLoaded host reassert — see HavenNativePlugin), the byte the engine is DISPLAYING is authoritative and no
+            // longer the load-lag value NB-25 warned about, so prefer it over the rate default when they disagree.
+            // Read BEFORE the ApplyWeather below (which would clobber the displayed byte toward the rate value the
+            // director then re-overrides). Only in the plain zone-load baseline: a real cutscene STAGE keeps its authored
+            // .lvb weather (our own cram intent, not something to read back), and a held explicit pick / day-night graft
+            // never reaches here (handled above / not the baseline) so this can't ship the native byte over a graft (b184).
+            if (stageWeather == 0 && loadedZoneId != 0)
+            {
+                byte rendered = GetActiveWeather();   // EnvManager+0x26 = the sky the host is actually showing (settled)
+                if (rendered != 0 && rendered != nativeWeather)
+                {
+                    log.Information("[HavenNative] [WX-SCRIPTED] zone " + loadedZoneId + " renders " + rendered + " ("
+                        + WeatherName(rendered) + ") but WeatherRate default is " + nativeWeather + " ("
+                        + WeatherName(nativeWeather) + ") — broadcasting the RENDERED sky so peers match the host.");
+                    nativeWeather = rendered;
+                }
+            }
+            if (nativeWeather != 0) ApplyWeather(nativeWeather);
+            resolvedWeather = nativeWeather;   // stage-authored for cutscenes, else the zone's deterministic native
+        }
+
+        // BGM ENGAGE - runs on EVERY load, HasState or not. Playing the zone's own default music is the BASELINE, not
+        // "host state", so it must not be gated behind the host having configured something. (This was the bug: on a
+        // fresh load with nothing set, HasState was false and the old early-return `if(!HasState) return;` skipped BGM
+        // entirely → "plays none until you press Refresh". Refresh worked only because it routed through DoMapBgm, which
+        // bypasses Reassert.) Explicit host pick if set, else the loaded zone's resolved default (incl.
+        // CFC→InstanceContent for instanced zones like 1345 → BGM 20264).
+        uint toEngage = BgmId != 0 ? BgmId : (loadedZoneId != 0 ? GetDefaultBgm(loadedZoneId) : 0);
+        if (!havenMusicOwned && toEngage != 0) PlayBgm(toEngage);
+
+        return resolvedWeather;   // NB-25: caller broadcasts this verbatim (not the lagging live displayed byte)
+    }
+}
+

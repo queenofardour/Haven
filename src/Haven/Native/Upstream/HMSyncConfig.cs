@@ -1,0 +1,501 @@
+// Derived from Enceladeum/HMapSync at 8140dbb04cfbfa59da9ff0c3f4e787978d368303. AGPL-3.0-or-later. See THIRD_PARTY_NOTICES.md.
+using System.Collections.Generic;
+using Dalamud.Configuration;
+using Dalamud.Plugin;
+
+namespace HavenNative;
+
+public class HavenNativeConfig : IPluginConfiguration
+{
+    public int Version { get; set; } = 1;
+    public string RelayUrl { get; set; } = Haven.Core.RelayConnectionFailure.HostedEndpoint;
+    public string HousingHostCode { get; set; } = System.Security.Cryptography.RandomNumberGenerator.GetHexString(16).ToLowerInvariant();
+    public string HousingGuestCode { get; set; } = "";
+    // Each listener chooses whether passive furnishing effects/sounds play locally; nothing is shared.
+    public bool HousingAmbientEffects { get; set; } = true;
+    public bool HousingAmbientSounds { get; set; } = true;
+    // Room chat: the " [Haven]" sender marker, emote log lines, and typing bubbles (shared / shown).
+    public bool RoomChatTag { get; set; } = true;
+    public bool RoomEmoteMessages { get; set; } = true;
+    public bool TypingShareOwn { get; set; } = true;
+    public bool TypingShowOthers { get; set; } = true;
+    // Real-world chat the player turned off inside a home (Haven.Core.WorldChannels flags); everything else is let
+    // through, so a channel added later starts on.
+    public int WorldChatOff { get; set; }
+    // Custom furniture: warn before importing a minion prop (experimental), until turned off in the warning or Settings.
+    public bool WarnMinionProps { get; set; } = true;
+    // Furnishing: warn when a chair or bed is tilted (it can't be sat on then), until turned off in the warning or Settings.
+    public bool WarnTiltedSeats { get; set; } = true;
+    // Haven: how loud the weather heard outside a home plays on this PC (0-1, of the game's music volume).
+    public float OutsideVolume { get; set; } = 0.6f;
+    // Pose balls: custom animations play their own sounds; a player whose animated body would sink is raised onto the surface.
+    public bool PoseSounds { get; set; } = true;
+    public bool PoseRestOnSurface { get; set; } = true;
+    // Whether partners on the same pose set may move, turn and size this player (PoseAdjust).
+    public bool PoseLetPartnersAdjust { get; set; } = true;
+    // Whether the player has used cinematic mode (its toolbar button glows until then).
+    public bool CinematicSeen { get; set; }
+    // The Haven version whose "What's new" notes were last shown (empty before the first run).
+    public string ChangelogSeen { get; set; } = "";
+    // Whether the player dismissed cinematic mode's Chat 2 hint.
+    public bool CinematicChatTwoHintSeen { get; set; }
+
+    // S328am: Mare-style relay-service picker. A list of named services (presets + user-added); the selected one's
+    // URL is what Connect uses (mirrored into RelayUrl for back-compat with existing connect calls). Modeled on the
+    // Mare/Snowcloak/Lightless service menu: pick from a dropdown, or add your own URL+name.
+    public List<RelayService> RelayServices { get; set; } = new();
+    public int SelectedRelayService { get; set; } = 0;
+
+    // Seed fresh installs, preserving a relay saved before the service list existed.
+    // Called from the plugin ctor after config load. Idempotent.
+    public void EnsureRelayServicesSeeded()
+    {
+        if (RelayServices.Count > 0) return;
+        RelayServices.Add(new RelayService { Name = "Haven relay", Url = string.IsNullOrWhiteSpace(RelayUrl)
+            ? Haven.Core.RelayConnectionFailure.HostedEndpoint : RelayUrl, BuiltIn = false });
+        SelectedRelayService = 0;
+        SyncSelectedRelayUrl();
+    }
+
+    // v0.7.338: keep normal (non-debug) users OFF the localhost dev endpoint. The localhost service is only meaningful
+    // with a local relay running (dev only) and is only switchable via the debug-mode picker - so a non-debug user
+    // sitting on it (fresh seed pre-0.7.338, or a stale config) is stuck showing "offline" with no recourse. If we're
+    // not in debug mode and the selected service is the localhost built-in, move them to Enceladeum. Called from the
+    // plugin ctor once debug-mode is known. No-op in debug mode (devs keep their localhost selection).
+    public void EnforceRelayServiceForMode(bool debugMode)
+    {
+        // Haven supports self-hosted endpoints in every mode. No vendor access key.
+        EnsureRelayServicesSeeded();
+    }
+
+    // v0.7.248: migrate pre-key-field configs. Before the Key field existed, users pasted the FULL keyed URL
+    // (wss://host/?k=KEY) into svc.Url. That baked-in key rode every connection even after the new Key field was
+    // emptied (SyncSelectedRelayUrl saw ?k= already present and used the URL verbatim - the "master key won't clear"
+    // bug). Split any ?k=/&k= token out of every service URL into svc.Key, leaving a clean base URL, so the Key field
+    // becomes authoritative and emptying it actually clears the key. Also re-canonicalises the Enceladeum built-in base.
+    public void MigrateRelayKeys()
+    {
+        // Haven does not connect to the upstream relay.
+        SyncSelectedRelayUrl();
+    }
+
+    // Compose the selected service's connect URL into RelayUrl so existing Connect(config.RelayUrl, ...) calls pick it
+    // up. v0.7.247: if the service has a Key, append it as ?k=/&k= (users enter just the key; base URL is fixed). A
+    // Url that already carries ?k= (legacy or a custom full URL) is used verbatim.
+    public void SyncSelectedRelayUrl()
+    {
+        if (SelectedRelayService >= 0 && SelectedRelayService < RelayServices.Count)
+        {
+            var svc = RelayServices[SelectedRelayService];
+            var baseUrl = svc.Url ?? "";
+            if (!string.IsNullOrEmpty(svc.Key) && !baseUrl.Contains("?k=") && !baseUrl.Contains("&k="))
+            {
+                var sep = baseUrl.Contains("?") ? "&" : "?";
+                RelayUrl = baseUrl + sep + "k=" + svc.Key;
+            }
+            else
+            {
+                RelayUrl = baseUrl;
+            }
+        }
+    }
+    // v0.7.466 (D-12): `TickRateHz` REMOVED - it was declared here and read by NOTHING. The real cadence is
+    // `const double TickInterval = 0.1` in StateCaptureService (10 Hz, compile-time).
+    //
+    // ⚠ DO NOT RE-ADD THIS AS A USER SETTING WITHOUT TALKING TO THE RELAY. The relay's ingress rate brake
+    // (RMS 1.0.0 / F3) is sized against that fixed 10 Hz: a non-host peer's structural ceiling is 2 lanes ×
+    // 10 Hz = 20 msg/s, which sits BELOW the relay's 25 msg/s refill - which is why normal play cannot trip the
+    // brake at all. Making the tick rate user-tunable breaks that arithmetic silently: a peer at 30 Hz would
+    // trip the throttle constantly through no fault of their own, and the symptom (an amber "relay throttling"
+    // banner during ordinary play) would look like a relay bug. If this ever becomes a setting, the relay's
+    // token-bucket budgets must be re-tuned FIRST.
+
+    // S319/S320c: carpet tunables persisted across sessions. Defaults match CarpetService's preset.
+    public bool CarpetShowRings { get; set; } = true;
+    public float CarpetRadius { get; set; } = 1.3f;
+    public float CarpetStep { get; set; } = 2.2f;
+    public int CarpetTrail { get; set; } = 5;
+    public float CarpetLeadBase { get; set; } = 1.0f;
+    public float CarpetLeadPerSpeed { get; set; } = 0.25f;
+    public float CarpetPitch { get; set; } = -0.05f;       // walking slope (was CarpetYOffset/flat-lock)
+    public float CarpetDropOffset { get; set; } = -0.05f;  // first-patch offset (cinematic drop-in)
+
+    // S326: map-state backbone - the host's last-chosen map settings, persisted so a scene can be re-dialled
+    // quickly across sessions. MapSettingsTerritory is the territory selected in the Map Settings tab dropdown.
+    public uint MapSettingsTerritory { get; set; }         // selected territory in the Map Settings tab (0 = none)
+    public byte MapWeatherId { get; set; }                 // 0 = default/atmospheric (valid)
+    public uint MapWeatherDonor { get; set; }              // b183: day/night sky-graft donor tt (0 = static weather, no graft)
+    // NB-44: is MapWeatherId an EXPLICIT host pick (imposed on peers) vs the zone's native baseline (peers keep their
+    // own natively-loaded sky)? A byte can't tell "picked None (0)" from "no pick / follow native" — this flag does.
+    // Set true by DoMapWeather/setweather (the pick funnels), reset false on every zone load + session teardown.
+    public bool MapWeatherForced { get; set; }             // NB-44: true = force this weather on peers; false = peers keep native
+    public bool MapTimeForced { get; set; }
+    public ushort MapEorzeaHour { get; set; } = 12;
+    public byte MapEorzeaMinute { get; set; }
+    public uint MapBgmId { get; set; }                     // 0 = none
+    // NB-20: these two are now the "effective for the CURRENTLY-LOADED map" cache. The durable, per-map store is
+    // MapNpcHide below; LoadNpcHideCache/SaveNpcHideCache copy between the dict entry (persisted) and these three
+    // runtime values (MapRemoveNpcs, MapHideQuestSigns, MapHiddenNpcDataIds). They stay serialized for back-compat and
+    // because PushMapState/DriveNpcVisibility already read them; the dict is what makes the choice per-map.
+    public bool MapRemoveNpcs { get; set; }
+    public bool MapHideQuestSigns { get; set; }   // S328aa: hide over-head quest markers (keep NPC bodies)
+    // (S328ag DirtyCheckEnabled removed at release hardening - change-detection is always on, no longer configurable.)
+
+    // ── NB-20: per-map NPC-hide store (host prefs recorded per territory, so a host's choices re-apply on the maps
+    // they set them on). All three toggles are per-map: hide-all, hide-quest-markers, and the granular hidden-DataId
+    // set. Identity is (TerritoryId → DataId=ENpcResident BaseId), stable across visits and characters, so hiding a
+    // DataId hides every live instance of that NPC kind on that map (and syncs cleanly - object indices don't). Ships
+    // empty; entries are pruned when a map's prefs all clear. ──
+    public sealed class MapNpcHideEntry
+    {
+        public bool RemoveAll { get; set; }               // hide ALL event NPCs on this map
+        public bool HideMarkers { get; set; }             // null just the over-head quest markers
+        public List<uint> HiddenDataIds { get; set; } = new();  // granular: specific ENpc BaseIds to hide (set semantics)
+    }
+    public Dictionary<uint, MapNpcHideEntry> MapNpcHide { get; set; } = new();
+
+    // Runtime cache: the current loaded map's granular hidden-DataId set. NOT persisted directly (the dict is the
+    // store) - JsonIgnore so the transient copy never leaks into the config file. Mirror of MapNpcHide[zone].HiddenDataIds.
+    [Newtonsoft.Json.JsonIgnore] public HashSet<uint> MapHiddenNpcDataIds { get; set; } = new();
+
+    /// <summary>Load the persisted per-map NPC-hide prefs for <paramref name="zone"/> into the effective cache
+    /// (MapRemoveNpcs / MapHideQuestSigns / MapHiddenNpcDataIds). Absent entry → all-clear. Call on loaded-zone change.</summary>
+    public void LoadNpcHideCache(uint zone)
+    {
+        if (MapNpcHide.TryGetValue(zone, out var e))
+        {
+            MapRemoveNpcs = e.RemoveAll;
+            MapHideQuestSigns = e.HideMarkers;
+            MapHiddenNpcDataIds = new HashSet<uint>(e.HiddenDataIds);
+        }
+        else
+        {
+            MapRemoveNpcs = false;
+            MapHideQuestSigns = false;
+            MapHiddenNpcDataIds = new HashSet<uint>();
+        }
+    }
+
+    /// <summary>Persist the current effective cache back into the per-map store for <paramref name="zone"/> and Save().
+    /// An all-clear map prunes its entry so the dict stays sparse.</summary>
+    public void SaveNpcHideCache(uint zone)
+    {
+        if (!MapRemoveNpcs && !MapHideQuestSigns && MapHiddenNpcDataIds.Count == 0)
+        {
+            MapNpcHide.Remove(zone);
+        }
+        else
+        {
+            MapNpcHide[zone] = new MapNpcHideEntry
+            {
+                RemoveAll = MapRemoveNpcs,
+                HideMarkers = MapHideQuestSigns,
+                HiddenDataIds = new List<uint>(MapHiddenNpcDataIds),
+            };
+        }
+        Save();
+    }
+
+    // S328d: when true, /say from players NOT in the HMS session is hidden from chat while a session is active
+    // (a privacy-safe display filter - hides strangers' /say during RP sessions; no chat is collected or relayed).
+
+    // ── Say-passthrough opcode management (S328p) ──────────────────────────────────────────────────────────────────
+    // The ONLY two hardcoded opcodes in the filter, now config-driven so they survive a patch without a rebuild.
+    // 300 = ChatHandler (outbound /say/yell/shout submission); 912 = inbound spatial-chat delivery. A structural
+    // validator (chat-shape check) guards the inbound pass so a rotated opcode fails CLOSED. ShowDebugCommands gates
+    // the debug UI. GameVersionStamp records the game version these were last confirmed on - a version change marks
+    // them unverified and shuts the passthrough until re-learned. SayOpcodesVerified is the live gate.
+    public uint SayOutboundOpcode { get; set; } = 300;
+    public uint SayInboundOpcode { get; set; } = 912;
+    // v0.7.462 (P2, QA + V): DEFAULT UNVERIFIED (fail-closed). A fresh install must NOT auto-arm the
+    // hardcoded 300/912 - a game patch could have repurposed the send-opcode since these were captured, and
+    // passing the wrong outbound packet is a security exposure. The seed values above are a hint for the
+    // learner, not a trusted default. Passthrough stays OFF until the user runs Re-learn (which captures the
+    // live opcodes AND stamps the current game version). README documents "initiate on first use".
+    public bool SayOpcodesVerified { get; set; } = false;
+    public string SayOpcodesGameVersion { get; set; } = "";
+    public bool ShowDebugCommands { get; set; }
+
+    // b225: show the current displayed weather in the server-info (DTR) bar, like the Weatherman plugin. Off by
+    // default (opt-in HUD clutter). Clicking the entry opens HMS's Map Control tab. The entry text tracks the
+    // real zone's displayed weather out of session and the synced/authored weather in a session (whatever
+    // MapSettingsService.GetActiveWeather reports). Managed by WeatherDtrService.
+    public bool ShowWeatherDtr { get; set; }
+
+    // b240: show the current BGM track in the server-info (DTR) bar, mirroring ShowWeatherDtr. Off by default. Clicking
+    // the entry opens HMS's pop-out BGM picker. Text tracks MapSettingsService.GetCurrentBgm() named via BgmName. Managed
+    // by TrackDtrService.
+    public bool ShowTrackDtr { get; set; }
+
+    // b195: sync Moniker nameplates in the LOBBY (connected + room-joined, no synthetic map loaded). The Moniker courier
+    // normally rides the Cold transform lane, which only runs inside a synthetic session - so out-of-map, peers can't see
+    // each other's custom names. This opts into a dedicated relay-opaque lane (WireKind.LobbyNameplate 0x54) that carries
+    // the local chosen name to peers while lobbied. ON by default (b198): matches in-session nameplate sync so the lobby
+    // "just works" without a hidden toggle - the off-by-default original twice read as a phantom "no-sync bug". Still a
+    // local preference the user can untick. Only does anything with Moniker installed + peers in the lobby.
+    public bool SyncLobbyNameplates { get; set; } = true;
+
+    // b200: replace the DISPLAYED chat sender with a session member's synced Moniker name (and our own). HMS already
+    // syncs the moniker onto peers' NAMEPLATES, but chat lines carry the real character's PlayerPayload, so chat kept
+    // showing the real name while the plate showed the moniker. This restamps the sender at the display layer (SDK 15
+    // IHandleableChatMessage.Sender) for shown say/yell/shout, using a plain masked name (no clickable real-name link).
+    // Emote (/em custom + standard emotes) carry the actor's name in the message BODY, not the sender, so those are
+    // covered by a second rewrite (find the real name in the text, swap the first occurrence) under this SAME toggle —
+    // players don't care about channel technicalities, they just want "what I send" to look consistent. Local
+    // preference; only acts in-session with Moniker present and a moniker actually set for that member. ON by default
+    // to match nameplate sync.
+    public bool ReplaceChatNames { get; set; } = true;
+
+    // b209: per-channel-group granularity for the chat restamp — all four gated UNDER the ReplaceChatNames master above.
+    // RP users want their IC presentation channels to show the disguise Moniker but leave everything else on the real
+    // name. The classifier lives in HavenNativePlugin (channel→bucket→bool), consumed by SayFilterService.
+    //  - MapAudibles: /say /yell /shout AND /em emotes. b210: emotes moved here (from "Other") — UX-wise /em is used in
+    //    the SAME presentation sequence as /say ("Name says…" then "Name does…"), so they belong to the same toggle.
+    //  - Party:       party + cross-world party.
+    //  - Cwls:        the 8 cross-world linkshells.
+    //  - Other:       everything else that carries a player sender — FC, alliance, LS1-8, novice network, PvP team.
+    // b210 DEFAULTS: Map chat (the IC presentation channel) ON; Party/CWLS/Other OFF. RP presentation happens in
+    // /say + /em; party/LS/FC are typically OOC-or-mixed, so the disguise name there is usually unwanted. Persisted, so
+    // an existing user's saved choices win; only fresh configs (and everyone upgrading from ≤v1.0.1.6, which has no
+    // Restamp* keys) take these defaults.
+    public bool RestampMapAudibles { get; set; } = true;
+    public bool RestampParty { get; set; } = false;
+    public bool RestampCwls { get; set; } = false;
+    public bool RestampOther { get; set; } = false;
+
+    // b185: drop section colliders (boss-arena fences, section gates, phase walls, NPC pens) automatically on every HMS
+    // map load, so a loaded scene is freely traversable with no command. Local preference (never synced). Reversible and
+    // persisted: /havenengine dropcolliders off restores them and clears this; on re-engages. Meshes remain (ghost-through);
+    // HMS-load scoped, never touches natural play. Default ON.
+    public bool AutoDropColliders { get; set; } = true;
+
+    // Action-button / active-toggle accent, user-set in the Config tab. Gold by default. Neutral and Danger are fixed
+    // in the UI; hover and text-on-accent are derived so any accent stays legible.
+    public float[] AccentColor { get; set; } = { 0.83f, 0.62f, 0.20f, 1f };
+
+    // Say proximity is fixed game behavior, not a preference - no config. The values match the game (see the
+    // SayFilterService constants). "Hide non-session say" is likewise always-on: in a session you're isolated, so any
+    // /say from outside the session is hidden (in-session members are heard via the passthrough + proximity cull).
+
+    // S326m: per-territory USER spawn override. When set for a territory, LoadZone uses it instead of the curated/LGB
+    // spawn. Keyed by territory id; value is [X, Y, Z, Facing]. Absent = fall back to curated resolution. Stored as
+    // float[] for clean JSON round-trip (Vector3 doesn't serialize cleanly through the config).
+    public Dictionary<uint, float[]> UserSpawns { get; set; } = new();
+
+    // v0.7.227: user-captured spawns for SWAP cutscene stages, keyed by bg path (not territoryId). Swap stages share a
+    // donor territory id, so keying by territoryId leaked one stage's spawn to every co-donor stage. bg is unique per
+    // stage. Value is [X, Y, Z, Facing] like UserSpawns. Curated (baked) stage spawns live in CutsceneStageService;
+    // this dict is only the user's own "Set spawn" captures on a swap stage.
+    public Dictionary<string, float[]> UserStageSpawns { get; set; } = new();
+
+    // S326m: adjustable heights (px) for the Session-dashboard Maps + Participants tables (drag-handle persisted).
+    public float DashMapsHeight { get; set; } = 220f;
+    public float DashParticipantsHeight { get; set; } = 180f;
+
+    // S322: Emotes tab - favourites (user-starred) + recently-played (rolling, most-recent-first). Both
+    // persisted so the top split survives restarts. This is the template for the future mount list.
+    public List<uint> FavouriteEmotes { get; set; } = new();
+    public List<uint> RecentEmotes { get; set; } = new();
+
+    // S326q: the display list for a section's "Recent" - STARRED (pinned) items first (they survive the FIFO
+    // overwrite), then the most-recent non-starred, capped at 6 total. Starring pins; un-starring lets it age out
+    // of Recent normally. This is what the Character-tab quadrants show under "Recent".
+    public const int PinnedRecentCap = 6;
+    public static List<uint> BuildPinnedRecent(List<uint> favourites, List<uint> recent)
+    {
+        var outList = new List<uint>(PinnedRecentCap);
+        foreach (var f in favourites)          // pinned first, in star order
+        {
+            if (outList.Count >= PinnedRecentCap) break;
+            if (!outList.Contains(f)) outList.Add(f);
+        }
+        foreach (var r in recent)              // then recent, skipping already-pinned
+        {
+            if (outList.Count >= PinnedRecentCap) break;
+            if (!outList.Contains(r)) outList.Add(r);
+        }
+        return outList;
+    }
+
+    public void ToggleFavouriteEmote(uint id)
+    {
+        if (!FavouriteEmotes.Remove(id)) FavouriteEmotes.Add(id);
+        Save();
+    }
+
+    public void PushRecentEmote(uint id)
+    {
+        RecentEmotes.Remove(id);          // move-to-front (dedupe)
+        RecentEmotes.Insert(0, id);
+        const int max = 6;                // 3×2 rows - exactly fills the History grid's default height
+        if (RecentEmotes.Count > max)
+            RecentEmotes.RemoveRange(max, RecentEmotes.Count - max);
+        Save();
+    }
+
+    public List<uint> RecentZones { get; set; } = new();
+    // S332: Zones-tab favourites - territory ids the user has pinned (★). Persisted across sessions.
+    public List<uint> FavouriteZones { get; set; } = new();
+
+    // NB-11: Cutscene-stage favourites. Cutscenes are loaded by index and share a donor territory id, so they can't
+    // key off FavouriteZones (uint) - they're pinned by their bg PATH, the same stable identity RecentPlace.StageBg
+    // uses. Parallel list so the ★ replicates on cutscene chips (which previously had a blank star column). Persisted.
+    public List<string> FavouriteCutsceneBgs { get; set; } = new();
+    public void ToggleFavouriteCutscene(string bg)
+    {
+        if (string.IsNullOrEmpty(bg)) return;
+        if (!FavouriteCutsceneBgs.Remove(bg)) FavouriteCutsceneBgs.Add(bg);
+        Save();
+    }
+
+    // v0.7.231: unified recent list. From the user's chair a cutscene stage is just a place they visited, so Recent
+    // must list it like any zone. Zones have a unique territory id; swap cutscene stages share a donor id and are
+    // identified by their bg path instead. RecentPlace carries both - StageBg==null means a plain territory, else a
+    // swap stage reloaded via CutsceneStageService. RecentZones (the old uint list) is kept only so existing configs
+    // migrate forward (see MigrateRecentZones, called once on load).
+    public class RecentPlace
+    {
+        public uint TerritoryId { get; set; }        // the zone id (plain zone) OR the donor id (swap stage - informational)
+        public string? StageBg { get; set; }         // set => swap cutscene stage, reloaded by bg; null => plain zone
+    }
+    public List<RecentPlace> RecentPlaces { get; set; } = new();
+
+    public void PushRecentPlace(uint territoryId, string? stageBg)
+    {
+        // Dedupe on identity: bg for a stage, territory id for a zone.
+        RecentPlaces.RemoveAll(r => stageBg != null ? r.StageBg == stageBg : (r.StageBg == null && r.TerritoryId == territoryId));
+        RecentPlaces.Insert(0, new RecentPlace { TerritoryId = territoryId, StageBg = stageBg });
+        const int max = 5;
+        if (RecentPlaces.Count > max)
+            RecentPlaces.RemoveRange(max, RecentPlaces.Count - max);
+        Save();
+    }
+
+    // One-time forward-migration of the legacy RecentZones (uint) list into RecentPlaces. Idempotent: only runs while
+    // RecentPlaces is empty and RecentZones has entries. Cutscene stages were never in the old list (they recorded the
+    // donor id, a known wrong behaviour), so nothing is lost.
+    public void MigrateRecentZones()
+    {
+        if (RecentPlaces.Count > 0 || RecentZones.Count == 0) return;
+        foreach (var id in RecentZones)
+            RecentPlaces.Add(new RecentPlace { TerritoryId = id, StageBg = null });
+    }
+
+    public void PushRecentZone(uint id)
+    {
+        RecentZones.Remove(id);           // move-to-front (dedupe)
+        RecentZones.Insert(0, id);
+        const int max = 5;                // Recent-5 quick-load
+        if (RecentZones.Count > max)
+            RecentZones.RemoveRange(max, RecentZones.Count - max);
+        Save();
+    }
+
+    // S322: Minions tab - favourites (user-starred) + recently-summoned (rolling). Mirror of the emote lists.
+    public List<uint> FavouriteMinions { get; set; } = new();
+    public List<uint> RecentMinions { get; set; } = new();
+
+    public void ToggleFavouriteMinion(uint id)
+    {
+        if (!FavouriteMinions.Remove(id)) FavouriteMinions.Add(id);
+        Save();
+    }
+
+    public void PushRecentMinion(uint id)
+    {
+        RecentMinions.Remove(id);
+        RecentMinions.Insert(0, id);
+        const int max = 6;                // 3×2 rows - exactly fills the History grid's default height
+        if (RecentMinions.Count > max)
+            RecentMinions.RemoveRange(max, RecentMinions.Count - max);
+        Save();
+    }
+
+    // S322k: Accessories tab - favourites + recently-equipped, same shape as the minion/emote lists.
+    public List<uint> FavouriteOrnaments { get; set; } = new();
+    public List<uint> RecentOrnaments { get; set; } = new();
+
+    public void ToggleFavouriteOrnament(uint id)
+    {
+        if (!FavouriteOrnaments.Remove(id)) FavouriteOrnaments.Add(id);
+        Save();
+    }
+
+    public void PushRecentOrnament(uint id)
+    {
+        RecentOrnaments.Remove(id);
+        RecentOrnaments.Insert(0, id);
+        const int max = 6;
+        if (RecentOrnaments.Count > max)
+            RecentOrnaments.RemoveRange(max, RecentOrnaments.Count - max);
+        Save();
+    }
+
+    // S323c: Mounts tab - favourites + recently-summoned, same shape as the other lists.
+    public List<uint> FavouriteMounts { get; set; } = new();
+    public List<uint> RecentMounts { get; set; } = new();
+
+    public void ToggleFavouriteMount(uint id)
+    {
+        if (!FavouriteMounts.Remove(id)) FavouriteMounts.Add(id);
+        Save();
+    }
+
+    public void PushRecentMount(uint id)
+    {
+        RecentMounts.Remove(id);
+        RecentMounts.Insert(0, id);
+        const int max = 6;
+        if (RecentMounts.Count > max)
+            RecentMounts.RemoveRange(max, RecentMounts.Count - max);
+        Save();
+    }
+
+    // S322: persisted per-section heights for the Emotes/Minions quick grids. 0 = use the computed 3-row
+    // default; >0 = a user override set by dragging the resize handle under that grid. Favourites and History
+    // are independent so a long favourites list and a tidy history can be sized separately.
+    public float EmoteFavHeight { get; set; } = 0f;
+    public float EmoteHistHeight { get; set; } = 0f;
+    public float MinionFavHeight { get; set; } = 0f;
+    public float MinionHistHeight { get; set; } = 0f;
+    public float OrnamentFavHeight { get; set; } = 0f;
+    public float OrnamentHistHeight { get; set; } = 0f;
+    public float MountFavHeight { get; set; } = 0f;
+    public float MountHistHeight { get; set; } = 0f;
+    // S326n: the "All" lists are now trimmed to ~3 rows by default + adjustable, like Favourites/History.
+    public float EmoteAllHeight { get; set; } = 0f;
+    public float MinionAllHeight { get; set; } = 0f;
+    public float OrnamentAllHeight { get; set; } = 0f;
+    public float MountAllHeight { get; set; } = 0f;
+
+    // S326o: character tab 2x2 quadrant layout - height of the TOP row of quadrants (Emotes/Mounts); the bottom row
+    // (Minions/Accessories) fills the remainder. Dragging the divider trades space between the two rows.
+    public float CharQuadrantTopHeight { get; set; } = 260f;
+
+    // Persist after a resize-handle drag ends (the UI mutates the height live, saves once on release).
+    public void SaveHeights() => Save();
+
+    private IDalamudPluginInterface? pluginInterface;
+
+    public void Initialize(IDalamudPluginInterface pi)
+    {
+        pluginInterface = pi;
+    }
+
+    public void Save()
+    {
+        pluginInterface?.SavePluginConfig(this);
+    }
+}
+
+// S328am: a named relay endpoint for the service picker. BuiltIn services can't be deleted (only custom ones).
+public class RelayService
+{
+    public string Name { get; set; } = "";
+    public string Url { get; set; } = "";
+    // v0.7.247: the access key, entered alone. The full connect URL is composed as {Url}?k={Key} by
+    // SyncSelectedRelayUrl - users type only the key they're handed, the plugin does the wss://.../?k= bureaucracy.
+    public string Key { get; set; } = "";
+    public bool BuiltIn { get; set; } = false;
+}
+

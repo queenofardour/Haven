@@ -1,0 +1,5201 @@
+// Derived from Enceladeum/HMapSync at 8140dbb04cfbfa59da9ff0c3f4e787978d368303. AGPL-3.0-or-later. See THIRD_PARTY_NOTICES.md.
+using System;
+using System.Linq;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using Dalamud.Game.Command;
+using Dalamud.Plugin;
+using Dalamud.Plugin.Services;
+using HavenNative.Services;
+using HavenNative.Sync;
+using HavenNative.UI;
+using Glamourer.Api.Enums;
+using CharacterModes = FFXIVClientStructs.FFXIV.Client.Game.Character.CharacterModes;
+
+namespace HavenNative;
+
+public sealed partial class NativeEngine : IDisposable
+{
+    private readonly IDalamudPluginInterface pluginInterface;
+    private readonly ICommandManager commands;
+    private readonly IObjectTable objectTable;
+    private readonly IFramework framework;
+    private readonly IPluginLog log;
+    private readonly IChatGui chat;
+    private readonly IGameInteropProvider hooks;
+    private readonly ISigScanner sigScanner;
+    private readonly IDataManager dataManager;
+    private EmoteLogService? emoteLog;
+    private Haven.Native.EmoteWindowService? emoteWindow;
+    private Haven.Native.SocialListKeeper? socialLists;
+    private Haven.Native.SocialRequests? socialRequests;
+    private readonly IClientState clientState;
+    private readonly IGameGui gameGui;   // S316: for carpet orientation-ring WorldToScreen overlay
+    private readonly ITextureProvider textureProvider;   // S322e: emote-browser icons
+    private readonly IAddonLifecycle addonLifecycle;   // v0.7.339: mount-HUD icon click-to-dismount
+    private readonly IDtrBar dtrBar;   // b225: server-info-bar (DTR) weather readout
+    private readonly ICondition condition;   // Haven: refuse entry from duties, PvP, combat, events and queues
+    private readonly IToastGui toast;        // Haven: safety refusals use the game's own red error message
+    private readonly DutyFinderGuard dutyFinderGuard;
+
+    private readonly HavenNativeConfig config;
+    private readonly RelaySyncService relay;
+    private readonly StateCaptureService stateCapture;
+    private readonly StateApplyService stateApply;
+    private readonly PacketFilterService packetFilter;
+    private readonly OpcodeMapService opcodeMap;
+    private SayFilterService sayFilter = null!;
+    private readonly PrivateRoomChatService privateRoomChat;
+    private readonly TypingIndicatorService typingIndicators;
+    private bool sayDriftBanner;   // S328p: set when the say passthrough auto-shuts (drift/patch); shown in the Config tab + session strip
+    private readonly ZoneLoadService zoneLoad;
+    private readonly QuestSpoofService questSpoof;   // NB-19 Phase 1: quest-populace read-spoof (per-zone policy) + /havenengine questprobe read-log
+    private readonly CutsceneStageService cutscene;   // cutscene free-roam (Tier B LoadZone / Tier A donor-redirect)
+    private readonly NoclipService noclip;
+    private readonly CarpetService carpet;   // S315: ported HCollider ground-carpet (walk anywhere)
+    private readonly DeckFloorService deckFloor;   // v0.7.351: constructive collision - add box floor patches
+    private readonly GPoseMountDrawService gposeMountDraw;   // v0.7.358: keep HMS mounts drawn in gpose
+    private readonly SkillSyncService skillSync;   // COSM_1_016: cosmetic skill capture + peer replay
+    private readonly EmoteUnlockService emoteUnlock;   // NB-40: in-session ownership bypass so native triggers fire locked emotes
+    private readonly InstalledPluginService installedPlugins;   // v0.7.371: Modules panel presence + open
+    private readonly LocalStateDetector detector;
+    private readonly MonikerService moniker;   // S328x: Moniker nameplate integration
+    private readonly HdmIpc hdm;   // FEAT-R2: HDM (mob-disguise) IPC consumer (optional; inert if HDM absent)
+    private readonly HmsIpcProvider hmsProvider;   // HMS's first IPC PROVIDER surface (HavenNative.* — accent + version gate)
+    private readonly DisguiseSyncService disguiseSync;   // FEAT-R2: HDM ⇄ relay disguise-sync bridge
+    private readonly LightsOutService lightsOut;   // Q-0010: instanced-dungeon stage-light / flame-VFX suppression, synced to peers (0x56)
+    private readonly LobbyNameplateSyncService lobbyNameplate;   // b195: Moniker nameplate sync in the lobby (out of map)
+    private readonly WeatherDtrService weatherDtr;   // b225: optional server-info-bar readout of the displayed weather
+    private readonly TrackDtrService trackDtr;       // b240: optional server-info-bar music readout (click → BGM picker)
+    private readonly NpcVisibilityService npcVisibility;   // S328aa: host-authoritative NPC scene-cleanup
+    private readonly NetStatsService netStats;   // S328ag: relay bandwidth instrumentation
+    private readonly RelayHealthService relayHealth;   // background /health poll → relay traffic-light
+    private readonly LocoDiagService locoDiag;   // S328ai: receiver-side locomotion diagnostic
+    private readonly EmoteDiagService emoteDiag;
+    private readonly ActorVisibilityService actorVisibility;
+    private readonly MapSettingsService mapSettings;   // S326: host-authoritative environment (time/weather/BGM/NPC)
+    private readonly TimeFreezeService timeFreeze;      // S327f: Brio-style Eorzea-time freeze hook
+    private readonly WeatherCramService weatherCram;    // WEATHER-CRAM b96: Brio-style UpdateEnvironment restamp hook
+    private readonly WeatherPresetStore weatherPresets;  // WEATHER-CRAM Tier-1 b98: baked EnvState preset library
+    private readonly KeyframeSetStore keyframeSets;      // PATH I b163: durable day-night sky-graft keyframe library
+    private readonly GlamourerIpc glamourer;   // S246: cosmetic visibility toggles via Glamourer (if installed)
+    private readonly AfkNotificationSuppressor afkSuppressor;   // S250: hide duty AFK warning in-session only
+    private readonly MountHudDismountService mountHudDismount;   // v0.7.339: click-to-dismount on the mount HUD icon
+    private readonly HavenNativeUI ui;
+
+    private readonly ConcurrentQueue<Action> mainThreadQueue = new();
+
+    // S247: HMS-tracked INTENDED state for the cosmetic display toggles. We must NOT read "current"
+    // from the DrawData bit to decide the next toggle: when Glamourer owns the state (S246), it sets
+    // VisorState/WeaponState in its OWN state and does NOT reliably flip the IsVisorToggled/
+    // IsWeaponHidden DrawData bits, so reading them back gives a stale value and the toggle pushes
+    // the same state every click (the "visor only ever turns on" / "arms only ever shows" bug).
+    // Headgear happened to work because HideHeadgear writes its bit through. Tracking our own
+    // intent makes all three flip correctly regardless of whether Glamourer or DrawData is backing.
+    // hidden-semantics for hat/arms (true = hidden), toggled-semantics for visor (true = visor up).
+    private bool headgearHidden;
+    private bool weaponHidden;
+    private bool visorToggled;
+
+    public NativeEngine(
+        IDalamudPluginInterface pluginInterface,
+        ICommandManager commands,
+        IObjectTable objectTable,
+        IFramework framework,
+        IPluginLog log,
+        IChatGui chat,
+        IGameInteropProvider hooks,
+        ISigScanner sigScanner,
+        IDataManager dataManager,
+        IClientState clientState,
+        IGameGui gameGui,
+        ITextureProvider textureProvider,
+        IAddonLifecycle addonLifecycle,
+        IDtrBar dtrBar,
+        ICondition condition,
+        IToastGui toast)
+    {
+        this.pluginInterface = pluginInterface;
+        this.commands = commands;
+        this.objectTable = objectTable;
+        this.framework = framework;
+        this.log = log;
+        this.chat = chat;
+        this.hooks = hooks;
+        this.sigScanner = sigScanner;
+        this.dataManager = dataManager;
+        this.clientState = clientState;
+        this.gameGui = gameGui;
+        this.textureProvider = textureProvider;
+        this.addonLifecycle = addonLifecycle;
+        this.dtrBar = dtrBar;
+        this.condition = condition;
+        this.toast = toast;
+
+        config = pluginInterface.GetPluginConfig() as HavenNativeConfig ?? new HavenNativeConfig();
+        config.MigrateRecentZones();   // v0.7.231: forward-migrate legacy RecentZones → RecentPlaces (idempotent)
+        config.MigrateRelayKeys();     // v0.7.248: split baked-in ?k= keys into the Key field (fixes stale-master-key bug)
+        config.Initialize(pluginInterface);
+        config.EnsureRelayServicesSeeded();   // S328am: populate built-in relay services on first run
+        config.EnforceRelayServiceForMode(config.ShowDebugCommands);   // v0.7.338: keep non-debug users off the localhost dev endpoint
+
+        // S329a (Stage 1): validate the sync-lane census - every TransformData field must map to exactly one lane
+        // (or be marked non-render). This is the anti-orphan guard: it fails LOUD here if a field is added without a
+        // lane assignment, rather than silently not-syncing after the Stage 2/3 split. Scaffolding only right now -
+        // the wire still carries the monolithic TransformUpdate; this just keeps the census honest ahead of the split.
+        var laneCensusError = HavenNative.Sync.LaneCensus.Validate();
+        if (laneCensusError != null)
+            log.Error("[HavenNative] SYNC-LANE CENSUS INVALID - a field is orphaned or misassigned:\n" + laneCensusError);
+        else
+        {
+            var lc = HavenNative.Sync.LaneCensus.LaneCounts();
+            log.Information("[HavenNative] Sync-lane census OK - HOT:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Hot)
+                + " WARM:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Warm)
+                + " COLD:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Cold)
+                + " HOST:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Host)
+                + " (scaffolding - wire still monolithic TransformUpdate).");
+        }
+
+        relay = new RelaySyncService(log);
+        netStats = new NetStatsService();   // S328ag
+        relay.NetStats = netStats;          // relay feeds byte counters
+        relayHealth = new RelayHealthService(config, log, () => ui?.IsOpen ?? false);
+        relayHealth.Start();                // /health poll while the window is open → the uplink light
+        // Auto-validate a stored key on load. KeyStatus defaults to NoKey and used to only advance on a MANUAL confirm,
+        // so after a plugin update/reopen a perfectly valid key showed "○ No key" until the user re-edited + re-confirmed
+        // it. Kick the same WS-handshake probe ConfirmRelayKey uses against the already-stored key (fire-and-forget,
+        // off-thread) so the status dot reflects reality without any manual step. Empty key → CheckKey no-ops to NoKey.
+        {
+            var svcs0 = config.RelayServices; int s0 = config.SelectedRelayService;
+            if (s0 >= 0 && s0 < svcs0.Count && !string.IsNullOrWhiteSpace(svcs0[s0].Key))
+                _ = relayHealth.CheckKey(svcs0[s0].Key ?? "");
+        }
+        detector = new LocalStateDetector(objectTable, dataManager, log);
+        detector.DebugTrace = config.ShowDebugCommands;   // S328w: LOCOTRACE only when debug mode is on
+        moniker = new MonikerService(pluginInterface, log);   // S328x: Moniker nameplate integration (optional; inert if absent)
+        hmsProvider = new HmsIpcProvider(pluginInterface, log, () => config.AccentColor);   // HMS→modules IPC (HavenNative.* accent/version)
+        npcVisibility = new NpcVisibilityService(objectTable, log);   // S328aa: NPC scene-cleanup (despawn / hide quest signs)
+        stateCapture = new StateCaptureService(objectTable, framework, relay, detector, log);
+        // (S328ag dirty-check toggle removed - change-detection is always on now.)
+        locoDiag = new LocoDiagService(log);   // S328ai
+        stateApply = new StateApplyService(objectTable, framework, dataManager, log, pluginInterface, sigScanner);
+        stateApply.LocoDiag = locoDiag;        // receiver-side locomotion diagnostic hook (after stateApply exists)
+        stateApply.DebugTrace = config.ShowDebugCommands;   // S329b: receiver traces respect plugin debug mode
+        // FEAT-R2: HDM disguise sync. HdmIpc is the (optional) IPC boundary to the mob-disguise plugin; DisguiseSyncService
+        // bridges it to the relay wire (0x50/0x51/0x52), resolving identity via stateApply's roster. Inert if HDM absent.
+        hdm = new HdmIpc(pluginInterface, log);
+        disguiseSync = new DisguiseSyncService(hdm, relay, stateApply, framework, log, LocalContentId);
+        // Q-0010: lights-out. Self-contained local suppression (stage Lights + all VFX) that rides its own relay lane
+        // (0x56) so anyone in a co-located session can black out the map for everyone. Gated ONLY by "is an HMS map
+        // loaded" (works on ANY map — city/overworld/dungeon, not just instanced content); no host gate; inert (idle
+        // no-op) when no map is loaded.
+        // TT source is the EFFECTIVE/loaded territory, not the raw client TT: in a synthetic HMS session
+        // clientState.TerritoryType is the ORIGIN zone we physically stand in, while the rendered map layout
+        // (the lights/VFX we suppress) belongs to zoneLoad.CurrentLoadedZone. Deferred Func — zoneLoad is assigned
+        // later in this ctor but only read at command/tick time. Falls back to the real TT when no map is loaded.
+        lightsOut = new LightsOutService(relay, framework,
+            () => zoneLoad!.IsZoneLoaded ? zoneLoad!.CurrentLoadedZone : clientState.TerritoryType,
+            () => zoneLoad!.IsZoneLoaded,   // gate: works on ANY loaded HMS map (city/overworld/dungeon), not just instanced content
+            () => !relay.IsSessionActive,   // b221/b241: out-of-session local-cinematic exception (real zone's own layout; b241 dropped the Debug-mode gate)
+            log, LocalContentId, s => chat.Print(s));
+        // NOTE: puppet POSSESSION (drive an NPC from the DM's MoveController intent while the DM body stays static) is
+        // owned by HDM, not HMS. HMS's role is peer sync only: when HDM drives a possessed puppet it fires PuppetMoved
+        // each frame, which DisguiseSyncService.OnLocalPuppetMoved reads + broadcasts (transform + resolved timeline)
+        // to session peers. No HMS-side possession loop. (The b191 HMS-side PossessionService was rolled back.)
+        packetFilter = new PacketFilterService(log, hooks, sigScanner);
+        dutyFinderGuard = new DutyFinderGuard(addonLifecycle, framework, gameGui, toast, () => packetFilter.IsActive);
+        opcodeMap = new OpcodeMapService(log);
+        // Say filter: supplier returns the set of session-member character names (local + peers), lower-cased. Used to
+        // decide whose /say to allow; everyone else's /say is hidden while the filter is enabled (session active + opt-in).
+        sayFilter = new SayFilterService(chat, log, () =>
+        {
+            var names = new System.Collections.Generic.HashSet<string>();
+            var lp = objectTable.LocalPlayer;
+            if (lp != null) names.Add(lp.Name.TextValue.ToLowerInvariant());
+            foreach (var info in stateApply.Peers.Values)
+                if (!string.IsNullOrEmpty(info.CharacterName)) names.Add(info.CharacterName.ToLowerInvariant());
+            return names;
+        },
+        // Synthetic distance (yalms) from local player to the named sender's puppet. Same computation as the
+        // participants list: distance between local player and the peer's rendered (synthetic-position) object.
+        // 0 for the local player (always in range); -1 if the sender isn't a resolvable session peer.
+        senderName =>
+        {
+            var lp = objectTable.LocalPlayer;
+            if (lp == null) return -1f;
+            if (string.Equals(lp.Name.TextValue, senderName, StringComparison.OrdinalIgnoreCase)) return 0f;
+            foreach (var info in stateApply.Peers.Values)
+            {
+                if (!string.Equals(info.CharacterName, senderName, StringComparison.OrdinalIgnoreCase)) continue;
+                if (info.ObjectIndex.HasValue)
+                {
+                    var obj = objectTable[info.ObjectIndex.Value];
+                    if (obj != null) return (lp.Position - obj.Position).Length();
+                }
+                return -1f;   // known peer but no resolved body → don't cull
+            }
+            return -1f;
+        },
+        // b200 chat-name replacement: real name → the chosen Moniker name. Self-aware — if the real name is the local
+        // player's, returns our own Moniker (GetLocalName); otherwise the peer's synced LastAppliedMonikerName (the same
+        // value HMS pushed to their nameplate). Null when the pref is off, Moniker is absent, the name isn't a session
+        // member, or they have no moniker set → the say filter then leaves the real name untouched.
+        realName =>
+        {
+            if (!config.ReplaceChatNames || !moniker.Available || string.IsNullOrEmpty(realName)) return null;
+            var lp = objectTable.LocalPlayer;
+            if (lp != null && string.Equals(lp.Name.TextValue, realName, StringComparison.OrdinalIgnoreCase))
+            {
+                var own = moniker.GetLocalName().name;
+                return string.IsNullOrEmpty(own) ? null : own;
+            }
+            foreach (var info in stateApply.Peers.Values)
+                if (string.Equals(info.CharacterName, realName, StringComparison.OrdinalIgnoreCase))
+                    return string.IsNullOrEmpty(info.LastAppliedMonikerName) ? null : info.LastAppliedMonikerName;
+            return null;
+        },
+        // b200: our own REAL name, so own emote/flat lines (which never carry a PlayerPayload) can be resolved back
+        // through the self-aware moniker lookup above.
+        () => objectTable.LocalPlayer?.Name.TextValue,
+        // b209/b210: per-channel-group restamp gate. Classify the chat kind into one of four buckets and return that
+        // bucket's toggle. The master ReplaceChatNames is already enforced inside monikerForRealName (returns null when
+        // off), so this only carries the per-bucket preference. b210: /em (CustomEmote/StandardEmote) now rides the
+        // map-audibles bucket — from the presentation UX it's identical to /say (both are used in the same in-map RP
+        // sequence). Any unlisted player-sender channel (FC, alliance, LS1-8, novice, PvP team) falls to RestampOther.
+        kind =>
+        {
+            switch (kind)
+            {
+                case Dalamud.Game.Text.XivChatType.Say:
+                case Dalamud.Game.Text.XivChatType.Yell:
+                case Dalamud.Game.Text.XivChatType.Shout:
+                case Dalamud.Game.Text.XivChatType.CustomEmote:
+                case Dalamud.Game.Text.XivChatType.StandardEmote:
+                    return config.RestampMapAudibles;
+                case Dalamud.Game.Text.XivChatType.Party:
+                case Dalamud.Game.Text.XivChatType.CrossParty:
+                    return config.RestampParty;
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell1:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell2:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell3:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell4:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell5:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell6:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell7:
+                case Dalamud.Game.Text.XivChatType.CrossLinkShell8:
+                    return config.RestampCwls;
+                default:
+                    return config.RestampOther;
+            }
+        });
+        zoneLoad = new ZoneLoadService(objectTable, log, sigScanner, hooks, framework, dataManager);
+        // b195: lobby nameplate sync — carries the local Moniker name to peers on the dedicated 0x54 lane while in the
+        // lobby (out of map), where the Cold-lane courier isn't running. Constructed here (after zoneLoad) so its
+        // inLoadedMap probe (zoneLoad.IsZoneLoaded) references an assigned field. Off unless config.SyncLobbyNameplates.
+        lobbyNameplate = new LobbyNameplateSyncService(relay, stateApply, moniker, config, framework, log,
+            LocalContentId, () => zoneLoad.IsZoneLoaded);
+        zoneLoad.DebugMode = config.ShowDebugCommands;      // v0.7.259: origin/map-hop notifications only in debug (must be AFTER construction)
+        zoneLoad.AutoDropColliders = config.AutoDropColliders;   // b185: auto-drop section colliders on every HMS map load (default ON)
+        questSpoof = new QuestSpoofService(sigScanner, hooks, framework, dataManager, log);   // NB-19 read-spoof (hooks created disabled)
+        zoneLoad.ArmQuestSpoof = questSpoof.ArmForZone;   // wire the virtual-load-only quest-populace spoof lifecycle
+        zoneLoad.DisarmQuestSpoof = questSpoof.Disarm;
+        cutscene = new CutsceneStageService(pluginInterface, log, dataManager, zoneLoad);
+        noclip = new NoclipService(objectTable, framework, log, sigScanner, hooks);
+        carpet = new CarpetService(objectTable, framework, log, config);
+        emoteDiag = new EmoteDiagService(objectTable, framework, dataManager, log);
+        actorVisibility = new ActorVisibilityService(objectTable, framework, log);
+        timeFreeze = new TimeFreezeService(sigScanner, hooks, log);   // S327f: Brio-style time-freeze hook
+        weatherCram = new WeatherCramService(sigScanner, hooks, log);   // WEATHER-CRAM b96: Brio-style UpdateEnvironment restamp
+        weatherPresets = new WeatherPresetStore(pluginInterface, log);   // WEATHER-CRAM Tier-1 b98: baked EnvState preset library
+        keyframeSets = new KeyframeSetStore(pluginInterface, log);       // PATH I b163: durable day-night sky-graft keyframe library
+        mapSettings = new MapSettingsService(dataManager, log, timeFreeze, weatherCram, weatherPresets, keyframeSets, sigScanner);   // S326
+        // b237: disk cache for the lazy per-category LGB track→name parse, so the one-time indexing runs once per build (not per launch).
+        mapSettings.InitBgmCache(System.IO.Path.Combine(pluginInterface.ConfigDirectory.FullName, "bgm-track-names.cache"));
+        glamourer = new GlamourerIpc(pluginInterface);   // S246: optional Glamourer routing for visibility toggles
+        // S248: when Glamourer reports ANY actor's state changed, mark badges dirty. The refresh
+        // (main thread) reads the LOCAL player's state - we don't need to match the address here;
+        // a cheap re-read on any change keeps the badges correct without per-frame polling.
+        glamourer.StateChanged += _ => glamourerBadgesDirty = true;
+
+        // S250: AFK-warning suppressor. Gated on relay.IsConnected so it ONLY acts during an HMS
+        // session - never swallows a real player's expel warning in a real dungeon.
+        // Haven 0.38.1: and the game's own away-status lines (LogMessage 97 and 98), which repeat while the filter holds
+        // the status change back.
+        var awayLines = new[] { 97u, 98u }.Select(id => dataManager.GetExcelSheet<Lumina.Excel.Sheets.LogMessage>()?.GetRowOrDefault(id)?.Text.ToString() ?? "")
+            .Where(text => text.Length > 0).ToArray();
+        afkSuppressor = new AfkNotificationSuppressor(chat, log, () => relay.IsSessionActive, awayLines, s => chat.Print(s));
+
+        // v0.7.351: deck-floor patcher. Player-position getter reuses ReadLivePosition (native GameObject.Position).
+        deckFloor = new DeckFloorService(log, () => ReadLivePosition());
+
+        // v0.7.358: keep HMS-applied mounts drawn while gposing (the probe proved state is fine; draw is the issue).
+        gposeMountDraw = new GPoseMountDrawService(log, clientState, objectTable,
+            () => relay.IsSessionActive, () => stateApply.GetPeerObjectIndices(),
+            // v0.7.391: only let the recovery pass un-hide objects HMS itself hid. Blanket-clearing 0x02
+            // undid the game's own hide of gpose originals, so original + clone both drew.
+            idx => actorVisibility.WasHiddenByUs(idx));
+        // v0.7.360: the hide sweep must stand down during gpose - it was hiding the player's gpose COPY
+        // (different object index than the live local player) and the mount inherited the hide.
+        actorVisibility.IsGPosing = () => clientState.IsGPosing;
+
+        // D-16.2/.3: when the packet filter passes a real walk-in's spawn through (inbound), it fires this on the NETWORK
+        // thread. QueueImmediateHide only enqueues (thread-safe); ActorVisibility.Update drains it next frame so the
+        // newcomer is hidden before the throttled sweep would catch it, avoiding a real-room flash into the virtual
+        // scene. If they later join the session, the ContentId-bind → RegisterPeer path reveals + drives them.
+        packetFilter.OnRoomActorArrived = eid => actorVisibility.QueueImmediateHide(eid);
+
+        // COSM_1_016: skills. Capture hooks UseAction (original runs first, so the game keeps enforcing cooldowns/
+        // restrictions); the sender carries the cast on WARM; the receiver replays it on the peer's puppet via the
+        // engine's own ActionEffectHandler.Receive, which cascades animation + VFX + sound for free.
+        installedPlugins = new InstalledPluginService(pluginInterface);
+        skillSync = new SkillSyncService(log, hooks, () => relay.IsSessionActive);
+        skillSync.CompanionAction = UseMinionInHome;
+        skillSync.Init();
+        // NB-40: open the game's NATIVE emote path (/wave, emote menu, hotbar) to fire LOCKED emotes in session,
+        // the last asymmetry vs `/havenengine emote`. Two guards let the command reach its executor, then an executor
+        // redirect diverts a genuinely-locked in-session play to HMS's own force-play (TryForcePlayLockedEmote) -
+        // the identical client-force path `/havenengine emote <locked>` uses. Session-gated, SelfCall-immune, firewall-covered.
+        emoteUnlock = new EmoteUnlockService(log, hooks, dataManager, () => relay.IsSessionActive, TryForcePlayLockedEmote);
+        HavenNative.Wire.WireSanity.Initialise(dataManager);
+        relay.CleanWarm = HavenNative.Wire.WireSanity.Clean;
+        emoteUnlock.BeforeLocalEmote = PrepareLocalEmote;
+        emoteUnlock.LocalEmoteTarget = LocalEmoteTarget;
+        emoteUnlock.Init();
+        stateCapture.SkillCastSupplier = () => (skillSync.PendingActionId, skillSync.PendingActionType,
+                                                skillSync.PendingActionEpoch, skillSync.PendingActionTarget,
+                                                skillSync.PendingActionTargetCid);
+        // The delegate's signature contains a Character*, so CONSTRUCTING it needs unsafe context here (the bridge
+        // method being unsafe isn't sufficient - CS0214 is raised at the conversion site).
+        unsafe { stateApply.SkillReplay = SkillReplayBridge; }
+
+        // v0.7.339: click-to-dismount on the mount-status HUD icon (_StatusCustom2). The native click fires a dismount
+        // ACTION the filter drops behind the firewall; route the click to HMS's local dismount instead. Only acts while
+        // a synthetic session is active AND you're actually mounted - outside a session the native click works normally,
+        // so we no-op and let the game handle it.
+        mountHudDismount = new MountHudDismountService(addonLifecycle, gameGui, log, () =>
+        {
+            if (!relay.IsSessionActive) return;         // real play → let the game's own click handle it
+            if (CurrentMountId() == 0) return;          // not mounted → nothing to do
+            var result = stateApply.MountSelf(0);
+            if (result == StateApplyService.MountResult.Dismounted)
+            {
+                noclip.DisableFlight();
+                chat.Print("[HavenNative] Dismounted.");
+            }
+        });
+        mountHudDismount.Enable();
+
+        relay.OnTransformReceived += stateApply.OnTransformReceived;
+        stateApply.OnPeerBound = idx => { actorVisibility.RegisterPeer(idx); zoneLoad.UnhidePreservedObject(idx); disguiseSync.OnPeerBound(idx); zoneLoad.RedrawBoundPeer(idx, actorVisibility.IsGPosing, actorVisibility.IsPeer); };   // S327/v0.7.335: show a puppet the moment it binds, clearing BOTH hide systems; FEAT-R2: apply any cached disguise
+        // S328x: Moniker nameplate integration - capture the local chosen name into outgoing transforms, and apply a
+        // peer's chosen name to their puppet. Both no-op if Moniker isn't installed (MonikerService.Available == false).
+        stateCapture.MonikerNameSupplier = () => moniker.GetLocalName();
+        stateApply.ApplyMonikerName = (idx, name, hideFc, hideName, hideTitle, hideStatus, redraw) => moniker.ApplyName(idx, name, hideFc, hideName, hideTitle, hideStatus, redraw);
+        moniker.LocalPlayerIndex = () => { var lp = objectTable.LocalPlayer; return lp != null ? (int)lp.ObjectIndex : -1; };
+        relay.OnPeerJoined += OnPeerJoined;
+        relay.OnHousingSceneReady += OnHousingSceneReady;
+        relay.OnPeerLeft += OnPeerLeft;
+        relay.OnHostTransfer += OnHostTransfer;
+        relay.OnRoomJoined += OnRoomJoined;
+        relay.WireDumpEmit = s => chat.Print(s);   // S331: route /havenengine wiredump output to chat
+        relay.OnZoneLoadReceived += OnZoneLoadReceived;
+        relay.OnSessionEnded += OnSessionEnded;
+        relay.OnDisconnected += OnDisconnected;
+        relay.OnRecovered += OnRecoveryComplete;
+        relay.OnRecoveryNotice += OnRecoveryNotice;
+        relay.OnError += OnRelayError;
+        relay.OnRateLimited += OnRelayRateLimited;   // v0.7.464: soft throttle - advisory banner, no teardown
+
+        packetFilter.Initialize();
+        privateRoomChat = new PrivateRoomChatService(hooks, chat, log, framework, commands, objectTable, dataManager, relay, () => packetFilter.IsActive);
+        privateRoomChat.TryPlayLockedEmote = emoteUnlock.TryPlayLockedCommand;
+        privateRoomChat.PlayEmote = emoteUnlock.PlayLikeTheWindow;
+        privateRoomChat.ShowTag = () => config.RoomChatTag;
+        privateRoomChat.WorldAllowed = () => Haven.Core.WorldChannels.All & ~(Haven.Core.WorldChannels)config.WorldChatOff;
+        privateRoomChat.WatchWorldChat = packetFilter.WatchWorldChat;
+        emoteLog = new EmoteLogService(dataManager, objectTable, log, privateRoomChat, () => config.RoomEmoteMessages && packetFilter.IsActive);
+        privateRoomChat.RenderEmote = emoteLog.RenderFor;
+        // Haven: inside a home the emote window lists the emotes you don't own, as usable (they play there).
+        emoteWindow = new Haven.Native.EmoteWindowService(addonLifecycle, framework, gameGui, dataManager, log, () => relay.IsSessionActive, emoteUnlock.IsOwned);
+        socialLists = new Haven.Native.SocialListKeeper(hooks, addonLifecycle, framework, log, () => packetFilter.IsActive);
+        socialRequests = new Haven.Native.SocialRequests(sigScanner, hooks, packetFilter, log);
+        socialRequests.EstateTeleportAsked += character => HousingEstateTeleportAsked?.Invoke(character);
+        socialLists.PassRefresh = socialRequests.PassListRefresh;
+        pluginInterface.Inject(emoteLog);
+        emoteUnlock.LocalEmoted = emoteLog.LocalEmoted;
+        typingIndicators = new TypingIndicatorService(pluginInterface, framework, gameGui, objectTable, log, relay, stateApply, privateRoomChat,
+            () => HousingZoneReady(zoneLoad.CurrentLoadedZone) && !clientState.IsGPosing)
+        { ShareOwn = () => config.TypingShareOwn, ShowOthers = () => config.TypingShowOthers };
+        sayFilter.Initialize();
+        zoneLoad.Initialize();
+        questSpoof.Initialize();   // NB-19 Phase 1: create the three quest-read hooks (disabled until a policy arms or /havenengine questprobe)
+        noclip.Initialize();
+        carpet.Initialize();
+        afkSuppressor.Initialize();
+
+        // Route status messages (e.g. flight) to chat - same surface as the /havenengine commands.
+        noclip.StatusReport = msg => chat.Print(msg);
+        carpet.StatusReport = msg => chat.Print(msg);
+        zoneLoad.StatusReport = msg => chat.Print(msg);
+        stateApply.Notify = msg => chat.Print(msg);
+        // S326: peers apply the host's map-state (weather/time now; BGM/NPC stored for when their helpers land) from
+        // the host's stream. Runs on the framework thread (StateApplyService bounces it there). Weather/time are
+        // environment-global (not per-puppet), so this just drives the local EnvManager to match the host.
+        stateApply.ApplyMapState = td =>
+        {
+            // Store the host's state always (so it applies when this peer's map finishes loading), but only touch the
+            // live environment if a map is actually loaded here - never in the open world. Weather/time/BGM applied;
+            // NPC-removal is still a held flag (despawn functionality pending).
+            mapSettings.WeatherId = td.MapWeatherId;
+            mapSettings.WeatherDonor = td.MapWeatherDonor;   // b183: pair the graft donor so Reassert/late-join can re-engage the day-night sky
+            mapSettings.TimeForced = td.MapTimeForced;
+            mapSettings.EorzeaHour = td.MapEorzeaHour;
+            mapSettings.EorzeaMinute = td.MapEorzeaMinute;
+            mapSettings.BgmId = td.MapBgmId;
+            mapSettings.RemoveNpcs = td.MapRemoveNpcs;
+            mapSettings.HideQuestSigns = td.MapHideQuestSigns;
+            mapSettings.MarkStateSet();
+            if (zoneLoad.IsZoneLoaded)
+            {
+                // v0.7.475 - MIRROR VERBATIM, INCLUDING 0. The v0.7.429 version substituted the zone's native
+                // default whenever the host sent 0, on the reasoning that 0 renders an invalid "void" sky. That
+                // reasoning was right about the render and wrong about the intent: the invalid void IS the
+                // feature ("None - Atmospheric", the cinematic blank), and it is also where most debug weathers
+                // legitimately land. Since the host now ships the sky it is actually rendering (PushMapState
+                // reads live EnvManager), there is nothing here left to resolve - re-deriving would reintroduce
+                // exactly the host/peer divergence both guards were written to prevent.
+                // b127 - ROUTE THROUGH THE UNIFIED LEVER, not native-only. The old ApplyWeather() here only ever did a
+                // NATIVE write, so when the host picked a FOREIGN weather (a crammed sky, or a doodad weather like 149),
+                // the peer native-applied an off-bank id → void/black sky and NO doodads: "the extra weather doesn't sync."
+                // SetWeatherUnified takes the SAME verbatim id and routes it exactly as the host did — in-bank/0 → native
+                // (clearing any stale cram), foreign preset → sky cram, foreign doodad → full re-establish (subject to this
+                // peer's own DoodadsAllowedFor gate: 207/208 always refused, others when `wxdoodall on` or proven-safe). It
+                // does NOT re-derive the id (the divergence guard above still holds), it just applies the host's pick with
+                // the full effects machinery instead of the native-only stub. Return string ignored (no chat spam).
+                // b183: DONOR-AWARE routing. SetWeatherOrGraft(id, donor) subsumes the old SetWeatherUnified path exactly
+                // when donor==0 (falls straight through to SetWeatherUnified — the verbatim static route). When the host
+                // ships a day/night city sky (donor = a marching keyframe set's tt), the SAME embedded graft engages here:
+                // every peer lerps the identical keyframe pair against the shared Eorzea clock, so the crammed sky travels
+                // the sun in lockstep. Non-marching donor falls back to static automatically (SetWeatherOrGraft guard).
+                // b184: only (re)engage the weather/graft on an ACTUAL (weather,donor) change. A host time-slider drag bumps
+                // the epoch every frame → this receiver fires every frame; re-calling SetWeatherOrGraft each time would
+                // StopKfGraft+ImportKeyframes+SetKfReplay per frame (graft restart thrash). Guarding on change mirrors the BGM
+                // latch below. Time still applies unconditionally beneath, so the graft interpolates to the new tod each frame.
+                if (td.MapWeatherId != lastAppliedPeerWeather || td.MapWeatherDonor != lastAppliedPeerDonor)
+                {
+                    // NB-44: split the peer's weather apply by INTENT. The map-load reassert ships forced=false (the zone's
+                    // deterministic native baseline); an explicit host pick (mapweather/setweather) ships forced=true.
+                    //   • forced=true  → SetWeatherOrGraft: the FULL machinery (foreign cram, day-night city graft, doodads).
+                    //                    This is a deliberate host choice and MUST be imposed verbatim on peers.
+                    //   • forced=false → SetWeatherNativeOnly: a PLAIN native write of the zone's own resolved byte, which
+                    //                    NEVER routes through the marching-graft branch. This is the Magna Glacies (1010) fix:
+                    //                    the old path called SetWeatherOrGraft even for the native load byte, and because the
+                    //                    dungeon "Fair Skies" byte carries a baked time-marching city set, IsTimeMarching()
+                    //                    was true → the peer grafted a bright day-night CITY sky over the host's fixed dungeon
+                    //                    one. We still APPLY on load (a synthetic load leaves a stale/generic sky otherwise —
+                    //                    the same reason the host's Reassert re-applies native), but via the native lever so
+                    //                    the deterministic byte lands as the plain native sky, matching the host.
+                    // Both branches CancelNativeSkyVerify (NB-43): the deferred black-rescue independently re-resolves the id
+                    // and MISFIRES on the sync path — a legitimately-dark dungeon sky scores as "black" and gets rescued into
+                    // the very city graft we're avoiding. The host arms no verify on its native load, so neither must the peer.
+                    if (td.MapWeatherForced)
+                        mapSettings.SetWeatherOrGraft(td.MapWeatherId, td.MapWeatherDonor);   // explicit pick: verbatim id + graft donor (0/0 == static)
+                    else
+                        mapSettings.SetWeatherNativeOnly(td.MapWeatherId);                    // native baseline: plain native write, never the marching graft
+                    mapSettings.CancelNativeSkyVerify();
+                    lastAppliedPeerWeather = td.MapWeatherId;
+                    lastAppliedPeerDonor = td.MapWeatherDonor;
+                }
+                // Single time path: freeze at the host's time when held, release to the real clock when not.
+                if (td.MapTimeForced) mapSettings.ApplyTime(td.MapEorzeaHour, td.MapEorzeaMinute);
+                else mapSettings.DisableTimeOverride();
+                // SINGLE-AUTHORITY BGM: the host broadcasts a RESOLVED concrete id (never 0). Mirror it VERBATIM - no
+                // peer-side GetDefaultBgm/live-read (that independent resolution caused the host#3/peer-Silence drift).
+                // Only (re)play on change so rapid epoch bumps (a time drag) don't restart the track.
+                if (!mapSettings.HousingMusicOwned && td.MapBgmId != 0 && td.MapBgmId != lastAppliedPeerBgm)
+                    mapSettings.PlayBgm(td.MapBgmId);
+                lastAppliedPeerBgm = td.MapBgmId;
+                // S328aa: NPC scene-cleanup - engage the host's chosen NPC modes locally (despawn all / hide quest signs).
+                // The service is a persistent watch (NPCs stream in by proximity), started when either mode is on and
+                // stopped when both are off. Same host-authoritative broadcast + late-join replay as the rest of map-state.
+                DriveNpcVisibility(td.MapRemoveNpcs, td.MapHideQuestSigns, td.MapHiddenNpcDataIds);
+            }
+        };
+        // S291: once the deferred home-restore settles the actor at home, drop the packet filter. Held up
+        // through the entire reload+restore so the server can't snap us back to the stale foreign-zone
+        // position (the air-stop fling). This is the Hyperborea firewall-after-revert ordering, adapted
+        // to our async (deferred-restore) revert.
+        // Penumbra's RedrawObject (index, RedrawType.Redraw = 0). Absent Penumbra throws, which the caller logs once.
+        zoneLoad.RedrawThroughPenumbra = idx => pluginInterface.GetIpcSubscriber<int, int, object?>("Penumbra.RedrawObject.V5").InvokeAction(idx, 0);
+        zoneLoad.OnHomeRestoreComplete = () =>
+        {
+            // v0.7.419 - POSTURE SANITISE AFTER SETTLE. Force-clear any posture the reload
+            // rebuilt from the client's internal cache.
+            // v0.7.449 - only evict the base lane (idle stomp) when the ORIGIN was a genuine seated/emote
+            // posture (the cache-rebuild case that needs it). If the origin was merely STANDING (e.g. a
+            // folded-arms cpose), the forced clear still resets mode/emote/draw-offset but SKIPS the idle
+            // stomp that would otherwise flicker the cpose off-and-on for one cycle on exit.
+            bool originWasPosture = originMode == CharacterModes.InPositionLoop
+                                 || originMode == CharacterModes.EmoteLoop;
+            // Haven: the restore poll has held the actor at the origin by now, so nothing here may stop the filter's
+            // release below: a failure would leave it on for the session with nothing to retry it.
+            try { SanitiseLocalPosture("post-settle", force: true, evictBaseLane: originWasPosture); }
+            catch (Exception ex) { log.Warning("[HavenNative] [RETURN] posture reset failed: " + ex.Message); }
+
+            // Haven: resume a real house's orchestrion, paused on entry, while the filter still holds every packet.
+            try { zoneLoad.RestoreOriginOrchestrion(); }
+            catch (Exception ex) { log.Warning("[HavenNative] [RETURN] house orchestrion restore failed: " + ex.Message); }
+            if (packetFilter.IsActive)
+            {
+                packetFilter.Disable();
+                chat.Print("[HavenNative] Packet filter OFF.");
+            }
+            ClearReturnGuard();
+            // Haven: the server sends the zone's weather only on a real zone change, so the reload left whatever the
+            // client fell back to. Put back the weather the player left.
+            try { zoneLoad.RestoreOriginWeather(); zoneLoad.RestoreOriginInterior(); }
+            catch (Exception ex) { log.Warning("[HavenNative] [RETURN] weather or interior restore failed: " + ex.Message); }
+            // Every other player was draw-disabled for the reload. Redraw them, then let Penumbra redraw them again so
+            // sync plugins (Lightless, Mare), Glamourer and Customize+ re-apply their appearance.
+            try { zoneLoad.RedrawRealWorldPlayers(); }
+            catch (Exception ex) { log.Warning("[HavenNative] [RETURN] real-world redraw failed: " + ex.Message); }
+            // Haven: the exit sweep put every minion away, and the server resends none. Put back the ones the player
+            // and the peers had out in the real world.
+            try { zoneLoad.RestoreOriginCompanions(retPeerIndices); }
+            catch (Exception ex) { log.Warning("[HavenNative] [RETURN] minion restore failed: " + ex.Message); }
+
+            // v0.7.419 - SERVER-ACKNOWLEDGED STANDUP. The filter prevented us from telling the
+            // server we stood up. After the filter drops, re-enter the origin posture and execute
+            // the sit toggle so the server processes the mode transition. See ServerAckStandup().
+            if (originWasPosture)
+                ServerAckStandup();
+
+            // v0.7.419 - re-clear peers after the reload rebuilt them from cached HMS state.
+            // Stop() ran before the reload but the reload overwrites it. Do a second pass now
+            // that the actors are settled. The server's natural update cadence will repaint
+            // peers with their real state once both filters are down.
+            stateApply.SanitisePeerPostures(retPeerIndices);
+
+            // v0.7.328: write each preserved peer's captured origin position back onto its frozen actor, undoing the
+            // synthetic-coord freeze (the "peer stuck at ~75u / OOB on return" bug). The actor is a continuously-present
+            // real player pinned at origin by the firewall, so its true position is the session-start spot we captured.
+            // Re-assert for a short window since a stray late settle-write could re-touch it right after the reload.
+            if (retPeerOrigins.Count > 0)
+            {
+                foreach (var (idx, pos, rot) in retPeerOrigins) stateApply.WritePeerPosition(idx, pos, rot);
+                retOriginFrames = 120;   // ~2s of re-assert
+            }
+
+            // b212: NOW that the reload has settled, re-revert the peer disguises. The pre-clear revert in DoLeaveInternal
+            // fired BEFORE the reload; the reload rebuilt each peer's real body and HDM re-asserted the disguise on the
+            // rebuild — this is the disguise analogue of SanitisePeerPostures's post-settle pass above. Reproduces the
+            // manual-HDM-revert-tap timing so the base model sticks with no user action. Re-asserted over the window below.
+            if (retDisguisedIndices.Count > 0)
+            {
+                disguiseSync.ReRevertDisguises(retDisguisedIndices);
+                if (retOriginFrames <= 0) retOriginFrames = 120;   // arm the window even when no origins needed re-asserting
+            }
+        };
+        zoneLoad.OriginCaptured = SaveReturnGuard;
+        zoneLoad.OnHomeRestoreStalled = () => toast.ShowError("Haven is still returning you to your real position.");
+        zoneLoad.OnHomeRestoreStalled += () => chat.PrintError("[Haven] Still returning you to your real position. Your movement stays hidden from the server until this finishes. If it does not finish, close the game: you will log back in where you started.");
+        // Movement hooks stay inert during any zone load/revert (teardown window where zone
+        // objects may be half-destroyed).
+        noclip.TransitionGuard = () => zoneLoad.IsTransitioning;
+        carpet.TransitionGuard = () => zoneLoad.IsTransitioning;
+        // S320: carpet is map-specific and must not carry across a zone load (you'd glide flat off the
+        // first staircase on arrival). Turn it OFF + notify on ANY zone change - HMS-driven (/havenengine load)
+        // or external (normal teleport / zone line). /havenengine stop|leave is handled in DoLeaveInternal.
+        zoneLoad.ZoneWillChange += carpet.Disable;
+        zoneLoad.ZoneWillChange += lightsOut.ClearForZoneChange;   // b213: lights-out/VFX toggles never carry across a map load/change/cutscene
+
+        // S240: single consolidated window (Session + Zones tabs). Zone directory
+        // wiring moves onto the unified UI; reuses the proven DoLoad path, greys out
+        // Load unless hosting.
+        ui = new HavenNativeUI(config, relay, log, dataManager, gameGui, textureProvider)
+        {
+            OnLoadZone = id => RunOnMainThread(() => DoLoad(id)),
+            OnQuickLoad = id => RunOnMainThread(() => DoQuickLoad(id)),
+            OnLoadCutscene = idx => RunOnMainThread(() =>
+            {
+                if (idx < 0 || idx >= cutscene.Stages.Count) return;
+                uint donor = clientState.TerritoryType != 0 ? clientState.TerritoryType : 1u;   // current zone as the donor
+                if (!relay.IsSessionActive) DoStartSolo();                 // solo-if-idle, mirrors DoQuickLoad
+                if (relay.IsSessionActive) cutscene.LoadStage(cutscene.Stages[idx], donor, DoLoad);   // DoLoad brings up the filter
+            }),
+            CutsceneEntries = cutscene.Stages.Select((st, i) => new HavenNativeUI.CutsceneEntry
+            {
+                Name = st.Name, Region = st.Expansion, Quest = st.Quest, Code = st.Code, Bg = st.Bg, Id = st.TerritoryId, Index = i
+            }).ToList(),
+            // v0.7.371: Modules panel. Aliases cover the internal-vs-display name gap (HMS itself ships as "HM-Sync"),
+            // so a module isn't silently reported missing just because its manifest name differs from the label.
+            // HDM ships as internal name "HDM" (renamed from "HGuise" at 0.8.54); keep the old name as an alias so a
+            // peer on a pre-rename build still resolves. Moniker keeps its own alias set.
+            ModulePresent = n => n == "Moniker"
+                ? installedPlugins.IsPresent("Moniker", "HMoniker", "HM-Moniker")
+                : n == "HDM"
+                    ? installedPlugins.IsPresent("HDM", "HGuise")
+                    : installedPlugins.IsPresent(n, "H" + n, "HM-" + n),
+            ModuleCanOpen = n => n == "Moniker"
+                ? installedPlugins.CanOpen("Moniker", "HMoniker", "HM-Moniker")
+                : n == "HDM"
+                    ? installedPlugins.CanOpen("HDM", "HGuise")
+                    : installedPlugins.CanOpen(n, "H" + n, "HM-" + n),
+            OpenModule = n => { if (n == "Moniker") installedPlugins.Open("Moniker", "HMoniker", "HM-Moniker");
+                                else if (n == "HDM") installedPlugins.Open("HDM", "HGuise");
+                                else installedPlugins.Open(n, "H" + n, "HM-" + n); },
+            CanLoad = () => relay.HasMapAuthority,
+            RunCommand = (sub, arg) => RunCommandFromUI(sub, arg),
+            CanUseEmote = CanUseEmoteSafe,   // S322: lets the Emotes tab grey locked rows out of session
+            CanUseMinion = CanUseMinionSafe, // S322: same for the Minions tab
+            CanUseOrnament = CanUseOrnamentSafe, // S322k: same for the Accessories tab
+            CanUseMount = CanUseMountSafe,    // S323c: same for the Mounts tab
+            Carpet = carpet,   // S315: Carpet tab binds live to the service
+            MapSettings = mapSettings,   // S326: Map Settings tab reads legal weather / BGM names per territory
+            CurrentLoadedZone = () => zoneLoad.CurrentLoadedZone,   // S326d: live-vs-prep mode discrimination
+            CurrentRealTerritory = () => clientState.TerritoryType,   // b220: out-of-session weather presets act on the REAL zone we stand in
+            CurrentStageName = () => zoneLoad.ActiveStageBg != null ? cutscene.GetStageName(zoneLoad.ActiveStageBg) : null,   // v0.7.340: cutscene name for the Zone: header
+            CurrentStageTag = () => zoneLoad.ActiveStageBg != null ? StageTagFromBg(zoneLoad.ActiveStageBg) : null,   // NB-37: cutscene's OWN tag (e3e4) for the Zone: header paren, not the donor territory id
+            MovementAllowed = () => MovementEnableAllowed(),        // v0.7.262: one gate for all movement buttons
+            MovementResearchAllowed = () => MovementResearchAllowed(), // v0.7.445: stricter gate for fly/noclip (teleport)
+            PacketFilterActive = () => packetFilter.IsActive,       // S326e/f: packet-filter status (now a status dot)
+            DebugMode = () => config.ShowDebugCommands,
+            SetDebugMode = v => { config.ShowDebugCommands = v; config.Save(); detector.DebugTrace = v; stateApply.DebugTrace = v; zoneLoad.DebugMode = v; },
+            ConnectedRelay = () => relay.IsConnected,                              // S328am: service-picker live indicator
+            RelayKeyStatusGet = () => relayHealth.KeyStatus,                       // v0.7.317: key-status dot (grey/green/amber/red)
+            ConfirmRelayKey = () =>                                                // verify the key via the relay's real WS handshake (101 = accepted)
+            {
+                var svcs = config.RelayServices; int s = config.SelectedRelayService;
+                if (s >= 0 && s < svcs.Count) _ = relayHealth.CheckKey(svcs[s].Key ?? "");
+            },
+            ResetRelayKeyEdit = () => relayHealth.ResetKeyStatus(),                // re-open editing → clear the status
+            RelayLightFn = () => relayHealth.Light,                                // relay reachability traffic-light
+            ActiveRelayUrl = () => relay.IsConnected ? relay.ConnectedUrl : "",    // active endpoint (only when connected)
+            SayOpcodeState = () => (config.SayOutboundOpcode, config.SayInboundOpcode, config.SayOpcodesVerified, config.SayOpcodesGameVersion),
+            SetSayOpcodes = (o, i) => { config.SayOutboundOpcode = o; config.SayInboundOpcode = i; config.Save(); },
+            VerifySayOpcodes = () => chat.PrintError("[Haven] World chat passthrough is disabled. House chat uses the private relay."),
+            RelearnSayOpcodes = () => chat.PrintError("[Haven] Chat calibration is no longer used. House chat uses the private relay."),
+            SayDriftBanner = () => sayDriftBanner,
+            DismissSayDriftBanner = () => sayDriftBanner = false,
+            MonikerAvailable = () => moniker.Available,
+            HdmAvailable = () => hdm.Available,
+            AccentChanged = () => hmsProvider.NotifyAccentChanged(),   // push HavenNative.AccentChanged on accent commit (drops the consumer's poll lag)
+            // S327x: packet inspector (Packets tab) wiring.
+            CaptureActive = () => packetFilter.CaptureInbound,
+            SetCapture = filterCsv => RunOnMainThread(() => DoPktCap(filterCsv ?? "")),
+            StopCapture = () => RunOnMainThread(() => { if (packetFilter.CaptureInbound) DoPktCap(null); }),
+            ClearCapture = () => packetFilter.ClearCapture(),
+            SnapshotCapture = () => packetFilter.SnapshotCapture(),
+            OpcodeName = op => opcodeMap.InboundName(op),
+            OpcodeMapStatus = () => opcodeMap.StatusLine(),
+            LocalEntityId = () => objectTable.LocalPlayer?.EntityId ?? 0u,
+            EntityName = eid => objectTable.SearchByEntityId(eid)?.Name.TextValue ?? "",
+            FlyActive = () => noclip.FlightActive,                  // S326m: folded movement toggle states
+            NoclipActive = () => noclip.NoclipActive,
+            CarpetActive = () => carpet.On,
+            HereCoords = () => ReadHereCoords(),                    // S326m: spawn management
+            LivePosition = () => ReadLivePosition(),
+            OnTeleport = pos => RunOnMainThread(() => DoTeleport(pos)),
+            OnTeleportForward = units => RunOnMainThread(() => DoTeleportForward(units)),
+            CaptureSpawnFor = terr => CaptureSpawn(terr),
+            RevertSpawnFor = terr => RevertSpawn(terr),
+            // v0.7.230: stage-aware. On a swap cutscene stage the user spawn lives in UserStageSpawns keyed by bg
+            // (not UserSpawns keyed by the shared donor id), so a plain UserSpawns[terr] check reported "no spawn" and
+            // greyed the reset button even though one was set - and it couldn't be cleared. Check the active stage bg
+            // first, then fall back to territory.
+            HasUserSpawn = terr =>
+                (zoneLoad.ActiveStageBg != null && config.UserStageSpawns.ContainsKey(zoneLoad.ActiveStageBg))
+                || config.UserSpawns.ContainsKey(terr),
+            BgmNowPlaying = () => config.MapBgmId == 0 ? "" : mapSettings.BgmName(config.MapBgmId),
+            // S327g: the SINGLE host time-set path. Silent (no chat) - updates config, applies locally (freeze or
+            // release via the Brio hook), and pushes map-state (bumps the epoch) so peers get this exact value on the
+            // next transform. Called on drag (every frame), Freeze, and reset - one path, no spam, no separate mirror.
+            SetHostTime = (h, m, forced) =>
+            {
+                config.MapEorzeaHour = h; config.MapEorzeaMinute = m; config.MapTimeForced = forced;
+                if (forced) mapSettings.ApplyTime(h, m); else mapSettings.DisableTimeOverride();
+                PushMapState();   // bump epoch → rides the next transform to peers
+                config.Save();
+            },
+            EmotePlaying = () => IsEmotePlaying(),                  // S326p: dynamic action-button states
+            MinionOut = () => CurrentMinionId() != 0,
+            OrnamentOut = () => CurrentOrnamentId() != 0,
+            MountOut = () => CurrentMountId() != 0,
+            SessionParticipants = BuildParticipantList,             // S326f: Wholist-style participant table
+            SummonPeer = peerId => DoSummonPeer(peerId),            // S326f: host summons a peer to their position
+            KickPeer = peerId => DoKickPeer(peerId),                // S326f: host removes a peer from the room
+            TransferHost = peerId => DoTransferHost(peerId),        // S326h: host hands the session to a peer
+            TeleportToPeer = peerId => RunOnMainThread(() => DoTeleportToPeer(peerId)),  // local self-move to a peer's spot
+            // NB-20: granular NPC hide (dot-lens picker). Enumeration runs during UI Draw (main thread) so direct object
+            // access is safe; toggle/restore route through the main thread + host-authoritative push.
+            EnumerateNpcDots = BuildNpcDotList,
+            ToggleNpcHide = id => RunOnMainThread(() => ToggleHiddenNpc(id)),
+            RestoreNpcHides = () => RunOnMainThread(() => RestoreHiddenNpcs()),
+            HiddenNpcCount = () => config.MapHiddenNpcDataIds.Count,
+            CanEditNpcHides = () => relay.HasMapAuthority && zoneLoad.IsZoneLoaded,
+            StageLightsActive = () => lightsOut.StageLightsSuppressed,   // b213: Map-control "Toggle ambient lights" checkbox mirror
+            VfxHidden = () => lightsOut.VfxSuppressed,                    // b213: Map-control "Hide VFX" checkbox mirror
+        };
+        // NB-33: the Cutscenes chip snapshots CutsceneEntries once (in the initializer above). The venue
+        // auto-detection runs on a background thread and finishes seconds later, so rebuild that snapshot on
+        // its completion signal (marshalled to the framework thread) - otherwise detected venues never show.
+        cutscene.StagesChanged += () => RunOnMainThread(() =>
+        {
+            ui.CutsceneEntries = cutscene.Stages.Select((st, i) => new HavenNativeUI.CutsceneEntry
+            {
+                Name = st.Name, Region = st.Expansion, Quest = st.Quest, Code = st.Code, Bg = st.Bg, Id = st.TerritoryId, Index = i
+            }).ToList();
+            log.Information("[HavenNative] Cutscene chip refreshed: " + ui.CutsceneEntries.Count + " venue(s)");
+        });
+
+        // Haven: one handler for the engine's windows, so cinematic mode can hide them all.
+        pluginInterface.UiBuilder.Draw += DrawEngineUi;
+        // Haven owns the housing UI.       // installer "Open" button → window on Session tab
+        // Haven owns the housing settings.   // installer "Settings" button → window on Config tab
+
+        // b225: optional server-info-bar (DTR) weather readout, like Weatherman's "clear skies" entry. Off by default;
+        // the Config tab toggle flips config.ShowWeatherDtr and calls Reload() to create/remove the entry. Text tracks
+        // the currently displayed weather (real zone out of session, authored/synced value in a session); clicking it
+        // opens HMS's Map Control tab. Driven by weatherDtr.Tick() from OnFrameworkUpdate (framework thread).
+        weatherDtr = new WeatherDtrService(dtrBar, mapSettings, () => config.ShowWeatherDtr, () => ui.OpenWeatherPresets(), log);
+        ui.ReloadWeatherDtr = () => weatherDtr.Reload();   // Config-tab toggle hook
+
+        // b240: the music twin - the current BGM track in the DTR bar; clicking it opens the pop-out BGM picker.
+        trackDtr = new TrackDtrService(dtrBar, mapSettings, () => config.ShowTrackDtr, () => ui.OpenBgmPickerAuto(), log);
+        ui.ReloadTrackDtr = () => trackDtr.Reload();   // Config-tab toggle hook
+
+        framework.Update += OnFrameworkUpdate;
+
+        // A previous Haven instance unloaded during a visit in this same game process: finish its return first.
+        framework.RunOnTick(RecoverInterruptedReturn);
+
+        // v0.7.448: if a prior session crashed with maps still auto-revealed, a pending-restore file exists.
+        // Replay those restores once the discovery manager is live (deferred poll), then delete the file.
+        ArmRevealCrashRecovery();
+
+#if HMS_TESTING
+        // NB-11 / NB-22: TESTING-BUILD ONLY. The testing build registers ONLY "/havenenginet" (hms + t for testing) and NOT
+        // "/havenengine". This lets a testing build run side-by-side with a prod install with no command collision AND —
+        // the point of NB-22 — means typing "/havenengine" during testing always reaches the PROD plugin, never the testing
+        // one by accident. OnCommand dispatches on args and ignores the command name, so every subcommand works
+        // identically via /havenenginet. Gated on HMS_TESTING; the prod build (no symbol) registers the real "/havenengine" in the
+        // #else branch. Do NOT promote the HMS_TESTING DefineConstants line.
+        commands.AddHandler("/havenenginet", new CommandInfo(OnCommand)
+        {
+            HelpMessage = "Open the HMapSync window (testing build).",
+            ShowInHelp = true,
+        });
+#else
+        commands.AddHandler("/havenengine", new CommandInfo(OnCommand)
+        {
+            HelpMessage = "Haven native engine diagnostics.",
+            ShowInHelp = false,
+        });
+#endif
+
+        var asmVer = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+        log.Information("[HavenNative] Plugin loaded v" + (asmVer != null ? asmVer.ToString(3) : "?"));
+
+        // F3: best-effort once-per-session refresh of the packet-inspector opcode-name map from GitHub. Non-blocking;
+        // falls back to the bundled map if GitHub is unreachable. Labels only - cannot affect the firewall.
+        opcodeMap.StartRefresh(GetGameVersion());
+    }
+
+    // Teleport hold - a one-shot SetPosition gets re-grounded/reverted by the engine each tick (which is why noclip
+    // writes every frame), so we force the target for a few frames to make it stick.
+    private System.Numerics.Vector3? teleportHoldTarget;
+    private int teleportHoldFrames;
+    private int retOriginFrames;   // v0.7.328: post-return re-assert window for restoring peer origin positions
+    private System.Collections.Generic.List<(ushort idx, System.Numerics.Vector3 pos, float? rot)> retPeerOrigins = new();
+    private System.Collections.Generic.HashSet<ushort> retPeerIndices = new();   // Haven: whose postures the return may clear
+    private System.Collections.Generic.List<int> retDisguisedIndices = new();   // b212: peer bodies to re-revert after the return settles (the reload re-asserts HDM disguises)
+
+    // v0.7.419 - origin posture state, captured at engage BEFORE SanitiseLocalPosture clears it.
+    // Used in post-settle to execute a server-acknowledged standup if the server still thinks we're
+    // in a posture. The server is the mode authority; the filter prevented us from telling it we stood.
+    private CharacterModes originMode;
+    private byte originModeParam;
+    private ushort originEmoteId;   // v0.7.420: which emote to re-execute for origin restore
+    // Dynamic face control auto-clear-on-move: anchor the player pose when a gaze is set; clear if they move/turn.
+    private System.Numerics.Vector3 faceGazeAnchorPos;
+    private float faceGazeAnchorRot;
+    private bool faceGazeHasAnchor;
+    private static float NormalizeAngle(float a) => Haven.Core.SafeAngles.Wrap(a);
+
+    private void OnFrameworkUpdate(IFramework fw)
+    {
+        while (mainThreadQueue.TryDequeue(out var action))
+        {
+            try { action(); }
+            catch (Exception ex) { log.Error("[HavenNative] Main thread error: " + ex.Message); }
+        }
+
+        // Apply an in-progress teleport for a few frames so the engine's re-grounding doesn't revert it.
+        if (teleportHoldFrames > 0 && teleportHoldTarget.HasValue) { ApplyTeleportHold(); teleportHoldFrames--; }
+
+        // b195: drive lobby nameplate sync (broadcast our Moniker name + apply peers' names while out of a map). Self-
+        // gating: no-op unless config.SyncLobbyNameplates && connected && room-joined && NOT in a loaded map.
+        lobbyNameplate.Tick();
+        lightsOut.Tick();   // Q-0010: hold the dungeon light/flame suppression against re-streaming; idle no-op unless active
+        weatherDtr.Tick();  // b225: refresh the server-info-bar weather readout (change-gated; idle no-op unless enabled)
+        trackDtr.Tick();    // b240: refresh the server-info-bar music readout (change-gated; idle no-op unless enabled)
+ // b248: drop peers whose heartbeat went silent (silent DC the relay never announced); self-throttled
+
+        // b140 Path I: hold the donor-bank handle swap in EnvSpace+0x90 against any per-frame zone reassert (no-op unless
+        // a wxcyclecram is active). Runs before the zone-change clear below so a real hop still tears it down cleanly.
+        weatherCram.TickCycleCram();
+        // b149 Path I: hold the swapped sky cubemap in EnvLocation+0x98/+0xA8 against any zone re-pin (no-op unless a
+        // wxskyswap is active). Same lifetime discipline as the cram: torn down on the native zone change below.
+        weatherCram.TickSkySwap();
+        weatherCram.TickAmbientSwap();   // b152: hold the swapped ambient set in EnvLocation+0x90/+0xA0 (no-op unless active)
+        weatherCram.TickStarForce();     // b155: hold the forced StarRenderer intensity params (no-op unless active)
+        mapSettings.TickNativeSkyVerify(); // b173: deferred black-sky check after a native weather pick (no-op unless armed)
+
+        // WEATHER-CRAM safety disarm (b105): a foreign restamp is a per-frame override that must not bleed across a REAL
+        // zone change (aetheryte/gate/death) — HMS's own DoLoad already clears it on virtual hops, but a native zone
+        // change has no such seam, so a stuck dark donor sky would ride into the new map. Poll clientState.TerritoryType
+        // and drop any active replay the moment the real zone changes. Cram is never auto-armed on load (manual/chip
+        // only), so clearing here can only prevent a stale override, never cancel an intended one.
+        {
+            uint ttNow = clientState.TerritoryType;
+            if (ttNow != lastCramTerritory)
+            {
+                lastCramTerritory = ttNow;
+                if (weatherCram.ReplayActive) { weatherCram.SetReplay(false); log.Information("[HavenNative] [WXCRAM] auto-cleared restamp on zone change → " + ttNow); }
+                // b140: a real zone change frees the old EnvScene/EnvSpaces — our swapped handle pointer would dangle.
+                // Tear the cycle cram down on any native hop (the swapped slot belongs to the departing zone's graph).
+                if (weatherCram.CycleActive) { weatherCram.StopCycleCram(); log.Information("[HavenNative] [WXCYCLE] auto-cleared handle swap on zone change → " + ttNow); }
+                // b149: the swapped sky cubemap belongs to the departing zone's EnvLocation graph — restore before the hop.
+                if (weatherCram.SkyActive) { weatherCram.RestoreSkyCubemap(); log.Information("[HavenNative] [WXSKY] auto-cleared cubemap swap on zone change → " + ttNow); }
+                // b152: same for the swapped ambient set.
+                if (weatherCram.AmbientActive) { weatherCram.RestoreAmbientSet(); log.Information("[HavenNative] [WXSKY] auto-cleared ambient swap on zone change → " + ttNow); }
+                // b155: the forced StarRenderer params belong to the departing scene — restore on the hop.
+                if (weatherCram.StarForceActive) { weatherCram.StopStarForce(); log.Information("[HavenNative] [WXSTAR] auto-cleared star-force on zone change → " + ttNow); }
+                // b162: the keyframe graft restamps the departing zone's EnvState — drop it on the hop like the siblings
+                // above. KEEPS the captured set (the donor→target travel flow needs it to survive); only the graft stops.
+                if (mapSettings.StopKfGraftForZoneChange()) log.Information("[HavenNative] [WXKF] auto-cleared keyframe graft on zone change → " + ttNow);
+                // b166: the whole-city tour must stay in the donor zone (it walks that bank's weathers). A native hop
+                // aborts it — the swept-so-far sets are already persisted, so cancelling just stops mid-list cleanly.
+                if (mapSettings.KeyframeTourActive) log.Information("[HavenNative] [WXKFTOUR] " + mapSettings.CancelKeyframeTour() + " (zone change → " + ttNow + ")");
+            }
+        }
+
+        // WEATHER session-end sanitise (b113): the zone-change poll above only drops a CRAM override, never a NATIVE
+        // ActiveWeather write (setweather/wxnative/wxtrans) — which is what left a forced sky bleeding into the apartment
+        // past session end. On the logged-in→out transition, sanitise fully (disarm cram + reset ActiveWeather to a
+        // natural weather). IsLoggedIn is a stable bool across Dalamud versions, so we poll it rather than binding the
+        // version-variant Logout event.
+        {
+            bool loggedIn = clientState.IsLoggedIn;
+            if (wasLoggedIn && !loggedIn)
+            {
+                mapSettings.SanitiseWeather();
+                // b162: SanitiseWeather reverts ActiveWeather + cram but NOT the keyframe graft — which was persisting
+                // across logout/login (the reported "wxkfclear persists between sessions" bug). Fully reset it here.
+                mapSettings.ResetKeyframeGraftForSession();
+                log.Information("[HavenNative] weather sanitised on logout.");
+                // NOTE (b201): no HDM own-body sanitise on the LOGOUT edge — it isn't needed. A true logout DESTROYS the
+                // local GameObject; relog recreates it fresh, so the game resets Scale + DrawOffset on its own (they can't
+                // survive an object that no longer exists). The real leak is the session-STOP edge (DoLeaveInternal),
+                // where the object is NOT destroyed — only its draw object is rebuilt by a zone reload while the logical
+                // GameObject's Scale/DrawOffset persist. That edge is sanitised in DoLeaveInternal below.
+                // (HDM independently keeps its own OnLogout revert; nothing here relies on it.)
+            }
+            wasLoggedIn = loggedIn;
+        }
+
+        actorVisibility.Update();
+        npcVisibility.Update();   // S328aa: persistent NPC re-scan (NPCs stream in by proximity like furniture)
+
+        // v0.7.352: apply/clear baked collision patches for the active cutscene stage (o1e1 observation deck, etc.).
+        // Idempotent - creates the colliders once when the stage becomes active, drops them when it changes to null or
+        // another stage. Only while a session's virtual map is active (patches are a synthetic-scene edit).
+        deckFloor.EnsureStagePatches(relay.IsSessionActive ? zoneLoad.ActiveStageBg : null);
+
+        gposeMountDraw.Update();    // v0.7.358: keep HMS mounts drawn while gposing
+
+        // v0.7.328: re-assert restored peer origin positions for a brief window after return, in case a late settle
+        // write re-touches the actor right after the reload. Self-limiting; only runs when armed on return.
+        if (retOriginFrames > 0)
+        {
+            retOriginFrames--;
+            if (retOriginFrames % 15 == 0)
+            {
+                foreach (var (idx, pos, rot) in retPeerOrigins) stateApply.WritePeerPosition(idx, pos, rot);
+                // b212: re-revert peer disguises across the same window — HDM could re-assert on a redraw a few frames
+                // after settle. Idempotent (no-op on an already-clean body, no per-frame HDM re-assert → no flicker).
+                if (retDisguisedIndices.Count > 0) disguiseSync.ReRevertDisguises(retDisguisedIndices);
+            }
+        }
+
+        // v0.7.320: guarantee the furniture de-draw poll is running on EVERY client in a session on a virtual map -
+        // not just whoever's load path armed it. A peer pulled into the host's map (by any path) must de-draw
+        // furniture the same as the host; the trigger is role-agnostic, so once the poll is subscribed the peer
+        // catches re-streaming furniture whenever it's visible, no matter who approached. Idempotent (no state reset).
+        if (relay.IsSessionActive && zoneLoad.IsZoneLoaded)
+            zoneLoad.EnsureDeDrawPollRunning();
+
+        // Dynamic face control: apply the local player's own gaze so they SEE it while setting it (apply only drives
+        // puppets). Auto-clear on movement (fire-and-forget): set a gaze, then walking/turning releases it - matches
+        // the RP flow of glancing away then pivoting back. ApplyGazeToLocal is called EVERY frame (not gated on
+        // anyGaze) so that when the last slot clears, its own on/off tracking fires the release - otherwise the head
+        // would stick in the last gaze after clearing.
+        {
+            bool anyGaze = FaceControlState.EyesOn || FaceControlState.BodyOn || FaceControlState.HeadOn;
+            var lp = objectTable.LocalPlayer;
+            if (anyGaze && lp != null)
+            {
+                var p = lp.Position; float rot = lp.Rotation;
+                if (!faceGazeHasAnchor)
+                {
+                    // First frame this gaze is active: anchor the pose ONCE. Don't re-anchor every frame - otherwise
+                    // 'moved' only ever measures one frame's delta, so gradual walking never trips the threshold
+                    // (that was the walk-doesn't-clear-but-pivot-does bug). Anchor-at-set makes displacement cumulative.
+                    faceGazeAnchorPos = p; faceGazeAnchorRot = rot; faceGazeHasAnchor = true;
+                }
+                else if (!FaceControlState.Locked)
+                {
+                    // Fire-and-forget auto-clear (unless "hold coords" is locked): moving OR turning past a small
+                    // threshold clears the gaze. Measured against the ANCHOR (set-point), so walking accumulates.
+                    float moved = (p - faceGazeAnchorPos).Length();
+                    float rotDelta = Math.Abs(NormalizeAngle(rot - faceGazeAnchorRot));
+                    if (moved > 0.05f || rotDelta > 0.05f)
+                        FaceControlState.ClearAll();
+                }
+                if (!(FaceControlState.EyesOn || FaceControlState.BodyOn || FaceControlState.HeadOn))
+                    faceGazeHasAnchor = false;
+            }
+            else faceGazeHasAnchor = false;
+
+            // Always apply/release self-gaze (release path fires when a slot just turned off).
+            stateApply.ApplyGazeToLocal();
+        }
+        // (end face control self-apply)
+
+        // S248: when the window transitions closed→open, force a badge refresh.
+        if (ui.IsOpen && !uiWasOpen)
+            glamourerBadgesDirty = true;
+        uiWasOpen = ui.IsOpen;
+
+        // S248: refresh the Glamourer display badges when the window is open and either Glamourer
+        // signalled a state change or we haven't read yet this open-session. Event-driven (no
+        // per-frame IPC) - glamourerBadgesDirty is set by the StateChanged handler and on window open.
+        if (ui.IsOpen && glamourerBadgesDirty)
+        {
+            glamourerBadgesDirty = false;
+            RefreshGlamourerBadges();
+        }
+
+        // S326h: re-assert host map-state a short while AFTER a load settles. A zone/map load can clobber weather+time
+        // (the load writes its own environment), so setting them before/during the load doesn't stick - we re-apply
+        // once the load has settled. mapReassertCountdown is armed on load (ArmMapReassert) and on the host only.
+        if (mapReassertCountdown > 0)
+        {
+            mapReassertCountdown--;
+            if (mapReassertCountdown == 0 && relay.HasMapAuthority)
+            {
+                // NB-25 WEATHER SETTLE-RACE FIX - two hardening changes over the old "blind countdown → Reassert →
+                // PushMapState()":
+                //   (1) The 150-frame countdown is a lower-bound settle DELAY, not the trigger. A slow/big load can
+                //       exceed 2.5s, and reasserting against a not-yet-loaded zone resolves weather/BGM against the
+                //       WRONG (stale) territory. So HOLD (re-arm to 1) until the zone has actually finished loading -
+                //       exactly the guard the guest re-apply path below already has.
+                //   (2) Broadcast the RESOLVED weather, not the live displayed byte. Reassert() now returns the
+                //       concrete id it engaged (held-legal pick, else the zone's deterministic native), and we hand
+                //       THAT to PushMapState as the override. That skips GetActiveWeather() (EnvManager+0x26), whose
+                //       displayed value LAGS the load and could ship a stale/transition sky to peers ("weather not
+                //       uniform on load"). Same verbatim-broadcast principle the explicit-pick path uses (v0.7.475).
+                if (!zoneLoad.IsZoneLoaded)
+                {
+                    mapReassertCountdown = 1;   // zone still loading - hold and re-check next frame
+                }
+                else
+                {
+                    // NB-20: swap the effective NPC-hide cache to THIS map's saved per-map prefs BEFORE the push, so the
+                    // host's recorded hide-all / hide-markers / granular set for the loaded map re-apply and broadcast.
+                    config.LoadNpcHideCache(zoneLoad.CurrentLoadedZone);
+                    byte resolvedWeather = mapSettings.Reassert(zoneLoad.CurrentLoadedZone);   // engages locally + returns the resolved id
+                    PushMapState(resolvedWeather);   // broadcast the RESOLVED map-state (deterministic weather, BGM) - not a lagging live read
+                    log.Debug("[HavenNative] [WX-REASSERT] host reassert broadcast: zone=" + zoneLoad.CurrentLoadedZone
+                        + " resolvedWeather=" + resolvedWeather + " (" + mapSettings.WeatherName(resolvedWeather) + ")");
+                }
+            }
+        }
+
+        // NB-40: host-set-weather nudge. Re-broadcast the last explicit pick a couple more times (fresh epoch each) to
+        // defeat a dropped/not-yet-ready first delivery. Host-only; idempotent on peers (change-guard). Self-cancels if a
+        // load re-arms the reassert (ArmMapReassert → CancelMapNudge) so we never re-ship the previous map's sky.
+        if (mapNudgeCountdown > 0)
+        {
+            mapNudgeCountdown--;
+            if (mapNudgeCountdown == 0)
+            {
+                if (relay.HasMapAuthority) PushMapState(mapNudgeWeather, mapNudgeDonor);
+                if (--mapNudgeReps > 0) mapNudgeCountdown = 20;   // schedule the next repeat
+            }
+        }
+
+        // S327j: guest post-load map-state re-apply. When it fires, clear the applied-epoch so the next transform
+        // re-applies the host's held time/weather/BGM to the freshly-loaded map.
+        if (guestMapReapplyCountdown > 0)
+        {
+            guestMapReapplyCountdown--;
+            // S328ab: don't fire the re-apply until the zone is ACTUALLY loaded. A blind countdown can hit 0 mid-load,
+            // where ApplyMapState skips the live write (IsZoneLoaded false) but still consumes the epoch → the state
+            // never lands. Hold the countdown (re-arm to 1) while the zone is still loading so the forced re-apply lands
+            // on a loaded map. The countdown is just a lower bound / settle delay now, not the trigger.
+            if (guestMapReapplyCountdown == 0 && !relay.HasMapAuthority)
+            {
+                if (zoneLoad.IsZoneLoaded)
+                    stateApply.ForceMapStateReapply();   // re-apply the host's (resolved, concrete) map-state on the next transform
+                else
+                    guestMapReapplyCountdown = 1;         // not loaded yet - check again next frame
+            }
+        }
+
+        // v0.7.448: AUTO MAP REVEAL, settle-gated. Armed on every HMS load (ArmMapReveal) for host AND guest -
+        // both load the zone and each reveals its OWN HUD fog locally. Like the guest re-apply above, hold the
+        // countdown until the zone is actually loaded AND the agent's CurrentMapId has caught up, so we reveal
+        // the RIGHT map (a blind countdown could fire mid-load on the stale/previous map). Purely local; the
+        // original bytes are snapshotted for restore-on-exit + crash recovery inside AutoRevealMap.
+        if (mapRevealCountdown > 0)
+        {
+            mapRevealCountdown--;
+            if (mapRevealCountdown == 0)
+            {
+                if (zoneLoad.IsZoneLoaded)
+                {
+                    uint mapId = 0;
+                    unsafe
+                    {
+                        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMap.Instance();
+                        if (agent != null) mapId = agent->CurrentMapId;
+                    }
+                    if (mapId != 0) AutoRevealMap(mapId);
+                    else mapRevealCountdown = 1;   // agent not ready - check again next frame
+                }
+                else
+                {
+                    mapRevealCountdown = 1;        // zone not loaded yet - hold
+                }
+            }
+        }
+
+        // S327j: the old per-frame time-override lifecycle block was REMOVED here. It was the mystery disabler: it
+        // gated "want time held" on `relay.IsHost`, so on a PEER (IsHost=false) it hit the else-branch and called
+        // DisableTimeOverride() EVERY FRAME - unfreezing the clock ~1 frame after ApplyMapState froze it (the two
+        // fought at frame cadence; the real clock won). It also fought the host's own SetHostTime path. Time is now
+        // driven entirely by: host UI → SetHostTime (apply + push epoch) and peer → ApplyMapState (freeze if
+        // MapTimeForced, else release). No per-frame re-assertion is needed - the Brio hook HOLDS once set, and
+        // Reassert() re-applies after a map load. A single writer per client, no races.
+
+        // S326h: PACKET-FILTER SAFETY WATCHDOG. The filter is what keeps the server seeing us idle while we're on a
+        // virtual map broadcasting movement. If it drops UNEXPECTEDLY (hook failure, exception, external toggle) while
+        // a map is loaded, we are exposed - the server sees real movement on a map we shouldn't be roaming. Previously
+        // nothing reacted; the status dot just went red and relied on the host noticing. This makes it automatic and
+        // immediate: an unexpected drop while loaded → full safe teardown (which returns us to origin + ends the
+        // session, via the same idempotent DoLeaveInternal used on hard disconnect). We only trip when the filter was
+        // EXPECTED to be on: connected + a virtual map loaded. During normal teardown the filter is turned off on
+        // purpose, but by then IsZoneLoaded is being torn down too and DoLeaveInternal is already running/idempotent,
+        // so re-entry is harmless. Latched so it fires once.
+        if (relay.IsSessionActive && zoneLoad.IsZoneLoaded && !packetFilter.IsActive && !filterDropHandled)
+        {
+            filterDropHandled = true;
+            log.Warning("[HavenNative] Packet filter dropped while a virtual map was loaded - emergency return to origin + session end.");
+            chat.PrintError("[HavenNative] Lost protection on a virtual map. Returning you to safety and ending the session.");
+            DoLeaveInternal(silent: true);
+        }
+        else if (packetFilter.IsActive || !relay.IsSessionActive)
+        {
+            // Reset the latch once we're safe again (filter back on, or fully out of a session).
+            filterDropHandled = false;
+        }
+    }
+
+    // S326: arm the post-load map-state re-assert (~2.5s at 60fps, comfortably after the furniture de-draw settle so
+    // the environment has finished loading). Called after a successful load/host-load.
+    private int mapReassertCountdown;    private int guestMapReapplyCountdown;   // S327j: after a guest zone-load, force map-state (held time) re-apply
+    private uint lastAppliedPeerBgm;   // S327g: guest-side last-applied BGM id (idempotent apply - don't restart music every epoch bump)
+    private int lastAppliedPeerWeather = -1;   // b184: guest-side last-applied (weather,donor) — idempotent graft engage so a host time-drag
+    private uint lastAppliedPeerDonor = uint.MaxValue;   //       (epoch bump every frame) doesn't re-import the keyframe set / restart the graft each frame
+    private uint lastCramTerritory = uint.MaxValue;   // b105: last-seen real TerritoryType, for the weather-cram auto-disarm on zone change
+    private bool wasLoggedIn;   // b113: prior-frame login state, for the session-end weather sanitise on logout
+    private bool filterDropHandled;   // S326h: latch so the packet-filter-drop emergency return fires once
+
+    // NB-40: host-set-weather BROADCAST NUDGE. A single HOST-lane epoch is fire-and-forget: if that one emit is dropped
+    // in transit, or a peer is momentarily not-ready (mid-transition), the pick silently never lands ("occasionally host
+    // set weather wouldn't broadcast once set"). This is the "peers need a nudge" hardening we already learned the hard
+    // way for the plain-weather path. After an explicit host weather pick we re-broadcast the SAME verbatim (weather,donor)
+    // a couple more times over ~0.7s, each bumping a fresh epoch. Re-application is idempotent on peers (the
+    // lastAppliedPeerWeather change-guard skips an unchanged sky), so the extra epochs cost nothing when the first
+    // already landed, and self-correct the peer that missed it. Values are the explicit pick (not a live read) so a
+    // graft/None/debug id ships verbatim on every repeat, exactly as the first push did.
+    private int mapNudgeCountdown; private int mapNudgeReps;
+    private byte? mapNudgeWeather; private uint? mapNudgeDonor;
+    private void ArmMapNudge(byte? weather, uint? donor)
+    {
+        mapNudgeWeather = weather; mapNudgeDonor = donor;
+        mapNudgeReps = 2; mapNudgeCountdown = 20;   // ~0.33s to first repeat at 60fps, then again
+    }
+    private void CancelMapNudge() { mapNudgeReps = 0; mapNudgeCountdown = 0; }
+
+    private void ArmMapReassert() { mapReassertCountdown = 150; CancelMapNudge(); }   // a load re-pushes fresh; drop any stale per-pick nudge so we never re-ship the old map's sky
+
+    // v0.7.448: arm the settle-gated auto map-reveal (consumed in the tick loop). Same ~2.5s lower bound as
+    // the reassert; the tick holds it until the zone + agent are actually ready, so the value is just a floor.
+    private int mapRevealCountdown;
+    private void ArmMapReveal() => mapRevealCountdown = 150;
+
+    // S328aa: engage/disengage the NPC scene-cleanup service from the two host modes. Start when either mode is on,
+    // stop (restoring every NPC) when both are off, and push mode changes through live. Called from the map-state apply
+    // (peers + host) and from Reassert (host/solo local engage) so despawn/quest-sign-hide behaves exactly like the
+    // rest of the map-state backbone - host-authoritative, broadcast, late-join-replayed, solo-compatible.
+    private void DriveNpcVisibility(bool despawn, bool hideQuestSigns, uint[]? granularHidden = null)
+    {
+        bool anyGranular = granularHidden != null && granularHidden.Length > 0;
+        if (despawn || hideQuestSigns || anyGranular)
+        {
+            npcVisibility.SetModes(despawn, hideQuestSigns, granularHidden);
+            npcVisibility.Start();   // idempotent; SetModes already re-applied if it was already running
+        }
+        else
+        {
+            npcVisibility.Stop();    // all off → restore all NPCs
+        }
+    }
+
+    // NB-20: snapshot the currently-rendered EventNpcs for the dot-lens picker overlay. Runs during UI Draw (main
+    // thread), so direct native access is safe. Only NPCs with a live DrawObject (streamed/rendered) are included -
+    // phantoms (logic shells with no render) would give un-clickable dots. Name from the object table; DataId = BaseId
+    // (the ENpcResident row, the stable synced identity). Hidden flag mirrors the current map's granular set so a hidden
+    // NPC still shows a (red) dot to un-hide it.
+    private unsafe IReadOnlyList<HavenNativeUI.NpcDotInfo> BuildNpcDotList()
+    {
+        var list = new List<HavenNativeUI.NpcDotInfo>();
+        foreach (var obj in objectTable)
+        {
+            if (obj.ObjectKind != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc) continue;
+            var native = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)obj.Address;
+            if (native == null || native->DrawObject == null) continue;   // not rendered → skip (no clickable dot)
+            uint dataId = native->BaseId;
+            if (dataId == 0) continue;   // director-spawned actors with no stable DataId can't be hidden/synced
+            var pos = obj.Position;
+            pos.Y += 1.0f;   // lift the dot toward head height for an easier click target
+            list.Add(new HavenNativeUI.NpcDotInfo(pos, dataId, obj.Name.TextValue ?? "", config.MapHiddenNpcDataIds.Contains(dataId)));
+        }
+        return list;
+    }
+
+    private bool uiWasOpen;
+
+    private bool glamourerBadgesDirty = true;
+
+    // Reads Glamourer meta-state for the local player and pushes it to the UI badges. Main-thread only.
+    private void RefreshGlamourerBadges()
+    {
+        try
+        {
+            if (!glamourer.Available)
+            {
+                ui.SetGlamourerBadges(false, false, false, false, false);
+                return;
+            }
+            bool known = glamourer.TryGetMeta(0, out var wpn, out var hat, out var vis);
+            ui.SetGlamourerBadges(true, known, wpn, hat, vis);
+        }
+        catch (Exception ex)
+        {
+            log.Debug("[HavenNative] Glamourer badge refresh failed: " + ex.Message);
+            ui.SetGlamourerBadges(false, false, false, false, false);
+        }
+    }
+
+    private void RunOnMainThread(Action action) => mainThreadQueue.Enqueue(action);
+
+    // Lets the GUI buttons run any /havenengine subcommand. Routes through the same dispatch as the
+    // slash command, on the main thread. `sub` is the subcommand (e.g. "start"), `arg` optional.
+    public void RunCommandFromUI(string sub, string? arg = null)
+    {
+        var args = arg == null ? sub : sub + " " + arg;
+        RunOnMainThread(() => OnCommand("/havenengine", args));
+    }
+
+    private void OnCommand(string command, string args)
+    {
+        var parts = args.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) { ui.ToggleMain(); return; }
+
+        var sub = parts[0].ToLowerInvariant();
+        var arg = parts.Length > 1 ? parts[1].Trim() : null;
+
+        // ── Default-deny session gate ──
+        // Inverts the old per-handler whitelist (which failed OPEN - most commands fired with no
+        // session check). Only these commands are allowed when NOT in a session: the ones that
+        // START/ENTER a session, and pure-UI commands that touch no game state. EVERYTHING ELSE
+        // returns "not in session". This is fail-closed: a new command is gated by default unless
+        // explicitly added here.
+        if (!relay.IsSessionActive)
+        {
+            switch (sub)
+            {
+                case "start":
+                case "startsolo":
+                case "starts":
+                case "join":
+                case "maps":
+                case "load":       // v0.7.363: allowed out of session - it routes through DoQuickLoad, which starts a
+                                   // solo session first (exactly what clicking a zone/recent chip has always done).
+                                   // The command was the odd one out; the UI never required /havenengine start first.
+                case "status":
+                case "visor":      // S320: harmless cosmetic toggles (Glamourer-equivalent) - no session needed
+                case "displayhead":
+                case "displayarms":
+                case "emote":      // S322: client-side self-emote (also useful solo for previewing/testing IDs)
+                case "minion":     // S322: client-side self-minion (unlocked summonable solo; locked gated in DoMinion)
+                case "accessory":  // S322k: client-side self-ornament (fashion accessory; locked gated in DoAccessory)
+                case "senddiag":   // v0.7.418: outbound observer - must run OUT of session (that is the window under test)
+                case "pktcap":     // S327: packet inspector capture - a diagnostic; useful out of session (passes packets through when not filtering)
+                case "rosterdump": // b31 (D-16 measurement): read-only spawn/despawn struct dump - MUST run out of session (idle in a populated area, no filter)
+                case "firecut":    // P1 cutscene probe - arms capture; must run in an inn (out of session)
+                case "cutstop":    // P1 safety escape - must work anywhere
+                case "stagelights":// Q-0010: local dungeon light suppression (broadcasts only if connected; useful solo too)
+                case "vfxoff":     // Q-0010: local dungeon UNIVERSAL VFX suppression (broadcasts only if connected; useful solo too)
+                case "vfxlist":    // Q-0010: read-only VFX dry-run — full list to log, flame-token tagged (diagnostic; harmless solo)
+                case "mapweather": // b221: local cinematic sky on the REAL zone — purely-local EnvManager write, self-gated to Debug mode in DoMapWeather (no session/host needed)
+                case "maptime":    // b221: local cinematic time freeze — purely-local Brio hook, self-gated to Debug mode in DoMapTime
+                case "mapbgm":     // b221: local cinematic BGM — purely-local scene-0 write, self-gated to Debug mode in DoMapBgm
+                    break; // allowed outside a session
+                default:
+                    chat.Print("[HavenNative] Not in a session. Use /havenengine start or /havenengine join <code> first.");
+                    return;
+            }
+        }
+
+        // ── Debug-command gate (S328ad) ──
+        // Developer/troubleshooting commands are hidden behind ShowDebugCommands so the user surface stays clean.
+        // With debug off they report the requirement instead of running. This is the single place the whole debug
+        // class is gated (no per-handler checks) - add a new debug command by listing it here.
+        switch (sub)
+        {
+
+            case "firecut":
+                if (arg != null && uint.TryParse(arg, out var _cutId)) zoneLoad.FireCutscene(_cutId);
+                else chat.Print("[HavenNative] usage: /havenengine firecut <cutsceneRowId>");
+                return;
+
+
+            case "cutstop":
+                zoneLoad.CutStop();
+                return;
+
+            case "mapdiag":
+            case "mapreveal":
+            case "maprestore":
+            case "netdiag":
+            case "lanecensus":
+            case "wiredump":
+            case "lgbdump":
+            case "diag":
+            case "diagpeer":
+            case "locodiag":
+            case "gposediag":
+            case "dumpstructs":
+            case "housingdiag":
+            case "furndiag":
+            case "casttest":   // NB-18-RETEST: cold-entry layer-filter-key discriminator (Fable)
+            case "questprobe": // NB-19 Phase 1: quest-read diagnostic log toggle (Fable)
+            case "debug":
+            case "teardownhousing":
+                if (!config.ShowDebugCommands)
+                {
+                    chat.Print("[HavenNative] /havenengine " + sub + " is a debug command. Enable debug mode in Config to use it.");
+                    return;
+                }
+                break;
+        }
+
+        switch (sub)
+        {
+            case "start": DoStart(arg); break;
+            case "starts": case "startsolo": DoStartSolo(); break;   // 'starts' primary; 'startsolo' kept as alias
+            // Q-0010: instanced-dungeon lights-out. Two independent map-global toggles (stage Lights vs flame VFX) +
+            // a read-only dry-run. Each runs the local suppression and broadcasts the intent bit (0x56) to peers; the
+            // service self-gates to instanced content and is a no-op elsewhere. See LightsOutService.
+            case "stagelights": lightsOut.ToggleStageLights(); break;
+            case "vfxoff": lightsOut.ToggleVfx(); break;
+            case "vfxlist": lightsOut.DryRunVfx(); break;
+            case "memo": CaptureSpawn(0); break;   // record a spawn point for the current map (== the Set spawn button)
+            case "join":
+                if (arg == null) { chat.Print("[HavenNative] Usage: /havenengine join <code>"); return; }
+                DoJoin(arg); break;
+            case "load":
+            {
+                if (arg == null) { chat.Print("[HavenNative] Usage: /havenengine load <territory ID | zone name | cutscene name/tag>"); return; }
+                // v0.7.363: use DoQuickLoad (solo-if-idle → load), the same path the zone chips and recent-map chips
+                // take. The command used to call DoLoad directly, which refuses when idle ("Not in a session") - an
+                // inconsistency, not a safeguard: clicking a chip from idle has always started solo automatically.
+                if (uint.TryParse(arg, out var zoneId)) { DoQuickLoad(zoneId); break; }
+                // v0.7.362: cutscene stages resolve in TWO passes around the zone lookup, deliberately:
+                //   (a) an exact TAG match ("o1e1") wins outright - tags never collide with place names;
+                //   (b) zones are tried next, so real place names win. Several stage names ARE real zone names
+                //       ("Limsa Lominsa", "Kholusia", "Baelsar's Wall", "The Burn"), and someone typing those means
+                //       the zone, not the cutscene;
+                //   (c) only then do stage NAMES match, catching stage-only names like "ship cabin".
+                int csIdx = cutscene.ResolveStage(arg, out var csName, out var csTag, out var csOthers);
+                bool exactTag = csIdx >= 0 && string.Equals(csTag, arg.Trim(), StringComparison.OrdinalIgnoreCase);
+                if (exactTag)
+                {
+                    chat.Print("[HavenNative] Loading " + csName + " (" + csTag + ").");
+                    ui.OnLoadCutscene?.Invoke(csIdx);   // same path as the UI chip: solo-if-idle, donor = current zone
+                    break;
+                }
+                if (ui.ResolveZoneByName(arg, out var namedId, out var resolvedName, out var others))
+                {
+                    chat.Print("[HavenNative] Loading " + resolvedName + " (" + namedId + ")" +
+                        (others > 0 ? "  [" + others + " other match" + (others == 1 ? "" : "es") + "]" : "") + ".");
+                    DoQuickLoad(namedId);
+                    break;
+                }
+                if (csIdx >= 0)
+                {
+                    chat.Print("[HavenNative] Loading " + csName + " (" + csTag + ")" +
+                        (csOthers > 0 ? "  [" + csOthers + " other match" + (csOthers == 1 ? "" : "es") + "]" : "") + ".");
+                    ui.OnLoadCutscene?.Invoke(csIdx);
+                    break;
+                }
+                chat.Print("[HavenNative] No zone or cutscene found matching \"" + arg + "\".");
+                break;
+            }
+            case "reload": DoReload(); break;
+            case "leave": DoLeave(); break;
+            case "stop": DoStop(); break;
+            case "fly":
+                if (!noclip.FlightActive && !MovementResearchAllowed()) { chat.Print("[HavenNative] Flight is only available on a loaded map or cutscene."); break; }
+                DoToggleFly(); break;
+            case "facecamdump":
+                DoFaceCamDump(); break;
+            case "noclip":
+                if (!noclip.NoclipActive && !MovementResearchAllowed()) { chat.Print("[HavenNative] Noclip is only available on a loaded map or cutscene."); break; }
+                DoToggleNoclip(); break;
+            case "carpet":
+                if (!carpet.On && !MovementResearchAllowed()) { chat.Print("[HavenNative] Carpet is only available on a loaded map or cutscene."); break; }
+                carpet.Toggle(); break;   // S315: ground-carpet - walk on unwired surfaces
+            case "emote": DoEmote(arg); break;        // S322: play + sync an emote (locked ones gated to in-session)
+            case "minion": DoMinion(arg); break;      // S322: summon + sync a minion (locked ones gated to in-session)
+            case "accessory": DoAccessory(arg); break; // S322k: equip + sync a fashion accessory (ornament)
+            case "mapweather": DoMapWeather(arg); break; // S326: host set forced weather (broadcast + apply)
+            case "maptime": DoMapTime(arg); break;       // S326: host hold/set Eorzea time ("H:M" or "off")
+            case "mapbgm": DoMapBgm(arg); break;         // S326: host set BGM (0 = none)
+            case "npc": DoMapNpc(arg); break;             // S326/S328aa: host despawn all event NPCs ("on"/"off")
+            case "qbubble": DoMapQuestSigns(arg); break;  // S328aa: host hide over-head quest bubbles ("on"/"off")
+            case "roompassword": DoRoomPassword(arg); break; // S326f: room password (enforcement needs relay)
+            case "roomlock": DoRoomLock(arg); break;         // S326f: lock room to new joiners (needs relay)
+            case "transferhost": if (arg != null) DoTransferHost(arg); break; // S326h: hand host to a peer (needs relay)
+            case "here": DoPrintHere(); break;
+            case "casttest": DoCastTest(arg); break;   // NB-18-RETEST: cold-entry layer-filter-key discriminator (Fable)
+            case "questprobe": DoQuestProbe(); break;   // NB-19 Phase 1: toggle the quest-read diagnostic log (spoof itself is automatic per-zone)
+            case "debug":
+                // S262: toggle development/research mode at runtime (no recompile). ON = LoadZone sets
+                // up the InstanceContentDirector (re-arms MapEffect/director-update machinery for
+                // explorer-mode investigation; the Duty-Info HUD will show). OFF = clean shipping load.
+                // Applies on the NEXT /havenengine load. Resets to OFF on plugin reload.
+                {
+                    zoneLoad.ResearchMode = !zoneLoad.ResearchMode;
+                    LocalStateDetector.Verbose = zoneLoad.ResearchMode; // S304: gate pose/cpose/mode traces too
+                    chat.Print("[HavenNative] Research mode " + (zoneLoad.ResearchMode ? "ON" : "OFF") +
+                        " - director setup " + (zoneLoad.ResearchMode ? "ENABLED (Duty-Info HUD will show on next load)" : "disabled (clean load)") +
+                        ". Applies on the next /havenengine load.");
+                }
+                break;
+            case "lgbdump":
+                if (arg != null && uint.TryParse(arg.Trim(), out var lgbTid))
+                { zoneLoad.DumpLgb(lgbTid); chat.Print("[HavenNative] LGB dump for " + lgbTid + " logged - check [LGBDUMP]."); }
+                else chat.Print("[HavenNative] Usage: /havenengine lgbdump <territoryId>");
+                break;
+            case "stagestate":
+                // NB-35: toggle a coplanar-state cutscene venue between its states (the auto de-flicker picks a default; this
+                // flips A/B so you can pick the right one in-game). e3e4 Doma finale = intact/destroyed; u5e2 "The Edge of
+                // Creation" = event/battle floor. No arg (or "next") cycles; a name jumps to that state. Only works while a
+                // 2+ state venue is loaded; the pick rides the same per-frame hold and /havenengine stop restores everything.
+                zoneLoad.SelectStageState(arg);
+                chat.Print("[HavenNative] stagestate " + (string.IsNullOrWhiteSpace(arg) ? "(cycle)" : arg.Trim())
+                    + " - check [STAGEHIDE] in /xllog.");
+                break;
+            case "battlehide":
+                // b178: real-zone battle-rubble hide. Solution Nine (1186) / Tuliyollal (1185) auto-arm on load; this is the
+                // manual A/B lever. No arg / "on" re-applies the loaded zone's destruction id-set (reveals the peaceful city);
+                // "off" restores.
+                zoneLoad.BattleHideCmd(arg);
+                chat.Print("[HavenNative] battlehide " + (string.IsNullOrWhiteSpace(arg) ? "(on)" : arg.Trim())
+                    + " - check [BATTLEHIDE] in /xllog.");
+                break;
+            case "dropcolliders":
+                // b181: universal free-traversal via section-collider drop (Fable brief). No arg / "on" drops every
+                // InstanceType.CollisionBox (boss-arena fences, section gates, phase walls, NPC pens) in the layout and
+                // keeps re-arming on zone load; "off" restores exactly what was dropped. Meshes remain (ghost-through).
+                zoneLoad.DropCollidersCmd(arg);
+                config.AutoDropColliders = zoneLoad.AutoDropColliders;   // b185: persist the on/off choice across restarts
+                config.Save();
+                chat.Print("[HavenNative] dropcolliders " + (string.IsNullOrWhiteSpace(arg) ? "(on)" : arg.Trim())
+                    + " - check [DROPCOLLIDERS] in /xllog.");
+                break;
+            case "setweather":
+                // UNIFIED weather lever (/havenengine setweather <id>): the SINGLE user-facing verb. The user doesn't care
+                // whether the id is native to this zone or a foreign cram — SetWeatherUnified routes it: in-bank ids
+                // (and 0) apply natively (clearing any active restamp first); foreign ids with a baked preset render
+                // via the crash-free restamp path; foreign ids with no preset are refused with a bake redirect.
+                // b134: BROADCAST when hosting. The local apply is unconditional (host or solo), but if this client
+                // holds map authority we ALSO fold the pick into map-state and PushMapState it verbatim, so peers see
+                // the crammed sky/doodads via their line-341 SetWeatherUnified receipt path — which is NOT gated by the
+                // peer's own debug mode (only by their DoodadsAllowedFor: 207/208 land sky-only, crash-free). This makes
+                // setweather a first-class synced lever like the picker, instead of a host-only local preview.
+                if (byte.TryParse(arg, out var swid))
+                {
+                    var swResult = mapSettings.SetWeatherUnified(swid);
+                    if (relay.HasMapAuthority)
+                    {
+                        config.MapWeatherId = swid; config.MapWeatherDonor = 0;   // b183: manual setweather is a static pick — no day-night graft donor
+                        config.MapWeatherForced = true;   // NB-44: explicit pick — force it on peers (reset on next zone load)
+                        PushMapState(swid, 0, weatherForcedOverride: true);   // verbatim id, donor 0 → peers apply via SetWeatherOrGraft(id,0)=static (full-effects, un-gated)
+                        chat.Print(swResult + " Displayed now: " + mapSettings.GetActiveWeather() + ". Broadcast to peers.");
+                    }
+                    else chat.Print(swResult + " Displayed now: " + mapSettings.GetActiveWeather() + ".");
+                }
+                else chat.Print("[HavenNative] usage: /havenengine setweather <id>  (integer weather id 0-255).");
+                break;
+            case "status": DoStatus(); break;
+            case "senddiag":
+                // v0.7.418: OUTBOUND packet observer. Logs every opcode the client emits, with
+                // PASS/SUPPRESS, and installs the send hook in pass-through so it works with NO session
+                // running - which is the window the exit-freeze needs (does the client resume sending
+                // movement after teardown, or stay silent?).
+                // Safe to leave on: OnSendPacket returns Original unconditionally while !IsActive.
+                {
+                    packetFilter.SendDiag = !packetFilter.SendDiag;
+                    if (packetFilter.SendDiag) packetFilter.EnableCaptureOnly();
+                    else if (!packetFilter.CaptureInbound) packetFilter.DisableCaptureOnly();
+                    chat.Print("[HavenNative] Outbound packet diagnostic " + (packetFilter.SendDiag ? "ON" : "OFF") +
+                        " - watch [SEND-DIAG] in /xllog. Nothing is filtered while out of session.");
+                }
+                break;
+            case "rosterdump":
+                // b31 (D-16 opcode-agnostic redesign, measurement step): READ-ONLY full-payload dump of
+                // PlayerSpawn/DespawnCharacter so we can measure the 7.55 struct (ContentId/name/customize/length for
+                // spawn; leaver-id offset for despawn) before writing the structural validators. Seeds the spawn/despawn
+                // opcodes from the live map so the packets are recognised, then installs capture-only (no session
+                // needed - idle in a populated area and watch players walk in/out). Nothing is filtered while off-session.
+                {
+                    packetFilter.RosterDump = !packetFilter.RosterDump;
+                    if (packetFilter.RosterDump)
+                    {
+                        packetFilter.ConfigureRosterOpcodes(
+                            opcodeMap.InboundOpcodesForNames("PlayerSpawn"),
+                            opcodeMap.InboundOpcodesForNames("DespawnCharacter"));
+                        packetFilter.EnableCaptureOnly();
+                        chat.Print("[HavenNative] Roster struct dump ON - seeded spawn=[" +
+                            string.Join(",", packetFilter.SpawnOpcodes) + "] despawn=[" +
+                            string.Join(",", packetFilter.DespawnOpcodes) + "]. Idle in a populated area; watch " +
+                            "[ROSTER-DUMP] in /xllog as players spawn/despawn. Nothing is filtered out of session.");
+                    }
+                    else
+                    {
+                        if (!packetFilter.SendDiag && !packetFilter.CaptureInbound) packetFilter.DisableCaptureOnly();
+                        chat.Print("[HavenNative] Roster struct dump OFF.");
+                    }
+                }
+                break;
+            case "pktcap": DoPktCap(arg); break;
+            case "mapdiag": DoMapDiag(); break;   // S328ab: map-reveal investigation (logs AgentMap + discovery state)
+            case "mapreveal": DoMapReveal(); break;   // v0.7.447: TEST - snapshot + reveal the current map's discovery table (research mode)
+            case "maprestore": DoMapRestore(); break; // v0.7.447: TEST - write the snapshot back (undo mapreveal)
+            case "netdiag": DoNetDiag(arg); break;   // S328ag: relay bandwidth diag (live rates + reset)
+            case "mounthud":
+                // v0.7.339 probe: force a mount-HUD attach attempt + dump the addon/node state, so we can see whether
+                // _StatusCustom2 is found, whether the node exists, and whether AddEvent takes - independent of the
+                // lifecycle listener timing. Run it WHILE MOUNTED.
+                mountHudDismount.DebugProbe();
+                break;
+            case "doordump":
+                // v0.7.342 probe: in o1e1, report the gate state + total BgPart count + every BgPart near the two door
+                // positions (path/pos/dist/loaded). Tells us whether the door pass runs and whether the doors exist as
+                // BgPart instances (cutscene layouts may populate InstancesByType differently than real zones).
+                zoneLoad.DumpDoorsO1E1();
+                break;
+            case "roaddump":
+                // v0.7.353b probe (/havenengine roaddump [term]): list every BgPart whose path contains term (default flo01) with
+                // real path/pos/collider-type - to fix the road-clone source match (which found nothing).
+                zoneLoad.DumpRoads1345(arg ?? "");
+                break;
+            case "weatherdiag":
+                // v0.7.473: dump the weather picker's inputs for the loaded zone. Read /xllog for [WXDIAG].
+                mapSettings.DumpWeatherDiag(zoneLoad.CurrentLoadedZone);
+                chat.Print("[HavenNative] Weather diagnostic written to /xllog - look for [WXDIAG]. Also reports config.MapWeatherId=" + config.MapWeatherId + ".");
+                break;
+            case "linevfx":
+            {
+                // v0.7.466 (/havenengine linevfx [scan|gfx|one|off|destroy|on]): boss-barrier LINE suppression, type 59.
+                // DIAGNOSTIC-FIRST - run with no argument and read /xllog before mutating anything. The scan says
+                // which of the three mechanisms is usable; `one` exists so the first SetActive costs one call.
+                // NB: named lvSub, not sub - `sub` is the outer dispatcher's subcommand local (line ~772) and
+                // C# forbids shadowing it here (CS0136).
+                string lvSub = (arg ?? "scan").Trim().ToLowerInvariant();
+                switch (lvSub)
+                {
+                    case "scan":
+                        zoneLoad.DumpLineVfx();
+                        chat.Print("[HavenNative] LineVFX scan written to /xllog - look for [LINEVFX]. Read the last line: it names the mechanism to use.");
+                        break;
+                    case "gfx":
+                        chat.Print("[HavenNative] LineVFX: hid graphics leaf on " + zoneLoad.SuppressLineVfx("gfx", 0) + " instance(s).");
+                        break;
+                    case "one":
+                    case "near":
+                        // v0.7.468: targets the instance NEAREST the player, so a single-instance test is also a
+                        // visual one. On 893 the old first-in-map-order pick was 240 units away.
+                        chat.Print("[HavenNative] LineVFX: DestroyPrimary on " + zoneLoad.SuppressLineVfx("destroy", 1, nearest: true)
+                            + " nearest instance.");
+                        break;
+                    case "auto":
+                        zoneLoad.SetLineVfxAuto(!zoneLoad.LineVfxAuto);
+                        chat.Print("[HavenNative] LineVFX auto-cadence " + (zoneLoad.LineVfxAuto ? "ON" : "OFF")
+                            + (zoneLoad.LineVfxAuto ? " - lines are re-suppressed every frame as they re-stream." : " - lines will return on movement."));
+                        break;
+                    case "off":
+                        chat.Print("[HavenNative] LineVFX: SetActive(false) on " + zoneLoad.SuppressLineVfx("setactive", 0) + " instance(s).");
+                        break;
+                    case "destroy":
+                        chat.Print("[HavenNative] LineVFX: DestroyPrimary on " + zoneLoad.SuppressLineVfx("destroy", 0)
+                            + " instance(s) - NOT reversible without a re-stream.");
+                        break;
+                    case "on":
+                        // Disable the cadence BEFORE restoring - otherwise the very next frame re-destroys
+                        // everything we just restored and the command silently appears to do nothing.
+                        zoneLoad.SetLineVfxAuto(false);
+                        chat.Print("[HavenNative] LineVFX: auto-cadence OFF; restored " + zoneLoad.RestoreLineVfx()
+                            + " instance(s) (a destroyed primary returns on re-stream, i.e. when you move).");
+                        break;
+                    default:
+                        chat.Print("[HavenNative] /havenengine linevfx [scan|near|gfx|off|destroy|on|auto] - auto-cadence is ON by default.");
+                        break;
+                }
+                break;
+            }
+            case "vfxdump":
+                // v0.7.380 probe (/havenengine vfxdump [term]): list every VFX instance's real .avfx path in this zone,
+                // whether the current suppression patterns would match it, and whether its graphics leaf is
+                // reachable. Turns "suppress that effect" into an exact substring instead of a guess, and
+                // distinguishes layout VFX (hideable here) from actor/system VFX (not in the layout graph at all).
+                zoneLoad.DumpVfxPaths(arg ?? "");
+                chat.Print("[HavenNative] VFX dump written to /xllog - look for [VFXDUMP]. MATCH = a current pattern hits it.");
+                break;
+            // v0.7.456: /havenengine gposemount (the gpose mount-flicker diagnostic probe) REMOVED - a spent v0.7.357
+            // investigation tool (its finding is recorded in GPoseMountDrawService). NB-26 (2026-08-03): the deep-clean
+            // is now done - the GPoseMountProbe class, the GPoseProbe field, and the five null-safe
+            // GPoseProbe?.NoteClear stubs in StateApplyService are all gone. Nothing left to strip.
+            // v0.7.456: /havenengine deckfloor (the manual place-and-see collision-patch authoring tool) REMOVED - it was
+            // a one-off used to dial in the o1e1 ship-cabin observation-deck floor, now baked into DeckFloorService
+            // (StagePatches) and auto-applied via EnsureStagePatches on stage load. The service + baked patch stay;
+            // only the runtime hand-placement command is gone (superseded, and carpet covers the general case).
+            case "wiredump":
+                // S331 (Stage 4): arm the binary-frame decoder - capture the next N frames (sent+received) and
+                // pretty-print kind + decoded msgpack payload as readable JSON. Buys back the eyeball-ability the JSON
+                // wire gave for free. Default 10 frames. Usage: /havenengine wiredump [n]
+                {
+                    int n = 10;
+                    if (!string.IsNullOrWhiteSpace(arg) && int.TryParse(arg.Trim(), out var parsed) && parsed > 0)
+                        n = Math.Min(parsed, 200);
+                    relay.ArmWireDump(n);
+                }
+                break;
+            case "lanecensus":
+                // S329a: print the sync-lane census to chat on demand - verifies the anti-orphan guard without
+                // hunting the startup log. Shows the field→lane breakdown, or the error if a field is orphaned.
+                {
+                    var err = HavenNative.Sync.LaneCensus.Validate();
+                    if (err != null)
+                        chat.PrintError("[HavenNative] LANE CENSUS INVALID:\n" + err);
+                    else
+                    {
+                        var lc = HavenNative.Sync.LaneCensus.LaneCounts();
+                        int total = HavenNative.Sync.LaneCensus.Map.Count;
+                        chat.Print("[HavenNative] Lane census OK - " + total + " render fields mapped: "
+                            + "HOT:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Hot)
+                            + " WARM:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Warm)
+                            + " COLD:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Cold)
+                            + " HOST:" + lc.GetValueOrDefault(HavenNative.Sync.SyncLane.Host)
+                            + ". Wire is lane-split (binary, per-lane change detection).");
+                    }
+                }
+                break;
+            case "teardownhousing":
+                // CONTINGENCY ONLY (console command, intentionally not in HelpMessage). The normal
+                // furniture lifecycle is fully handled by the deferred de-draw (despawn on load) +
+                // lean revert (respawn on stop) - this nuclear Dtor(1) territory teardown is NOT in
+                // that path and is kept only as a manual fallback if the de-draw ever fails on some
+                // map. Clunky to type by design; do not wire into auto-flow.
+                DoTeardownHousing();
+                break;
+            case "gposediag":
+                // v0.7.390: audit the object table across a gpose enter->exit cycle. Logs index AND
+                // ContentId side by side every frame (change-gated), so a ContentId appearing at two
+                // indices identifies the clone, and localIdx disagreeing with our own ContentId's index
+                // catches the self-hide in the act. Covers both gpose symptoms in one run.
+                actorVisibility.Diag = !actorVisibility.Diag;
+                chat.Print("[HavenNative] gpose diagnostic " + (actorVisibility.Diag ? "ON" : "OFF") +
+                    " - enter gpose, look around, exit. Watch [GPOSEDIAG] in /xllog.");
+                break;
+            case "locodiag":
+                locoDiag.Start();
+                chat.Print("[HavenNative] Locomotion diagnostic armed - 15s. Jump, dismount, stop, turn near a peer; watch [LOCODIAG] in /xllog.");
+                break;
+            case "diag":
+                emoteDiag.StartLogging();
+                chat.Print("[HavenNative] Diagnostic logging started (LOCAL) - 15 seconds.");
+                break;
+            case "diagpeer":
+                emoteDiag.StartLogging(15000, peer: true);
+                chat.Print("[HavenNative] Diagnostic logging started (PEER) - 15 seconds.");
+                break;
+            case "dumpstructs":
+                try
+                {
+                    var dumpPath = StructDumper.Dump(pluginInterface.ConfigDirectory.FullName);
+                    log.Information("[HavenNative] Struct dump written to " + dumpPath);
+                    chat.Print("[HavenNative] Struct dump written to: " + dumpPath);
+                }
+                catch (Exception ex)
+                {
+                    log.Error("[HavenNative] Struct dump failed: " + ex);
+                    chat.Print("[HavenNative] Struct dump failed: " + ex.Message);
+                }
+                break;
+            case "mount":
+                // S197f ASYNC complete: /havenengine mount SELF-mounts the local player. The two proven halves,
+                // now joined:
+                //   (1) Self-view: MountSelf mounts YOU locally (Mode=Mounted) → your own client renders
+                //       the mount natively (you see yourself mounted, the self-illusion).
+                //   (2) Peer-view: the sender broadcasts your MountId + PLAIN ON-FOOT locomotion (iter 1:
+                //       moveMode forced to Ground even while mounted), so every peer applies your mount to
+                //       your puppet and drives it through the PROVEN testmount path - native mounted
+                //       animation, all restrictions/speed limits respected, skate-free, with the free
+                //       native dismount/dismiss animation.
+                // They run async and reconcile visually because everyone sees the same world. "/havenengine mount 0"
+                // dismounts you (native dismiss plays); session exit (stop/leave/disconnect/crash) clears it
+                // via SanitizePeerStates; the mount PERSISTS across map loads (only session-exit tears down).
+                // S326q: mount toggle + bare-arg convenience.
+                //   • "/havenengine mount" (bare) while MOUNTED → dismount; while unmounted → mount the MOST RECENT.
+                //   • "/havenengine mount <id>" while THAT mount (or any, engine-toggle) is out → dismount; else mount it.
+                // This makes the dynamic Mount/Dismount button and a repeated row-click both dismount as expected.
+                {
+                    var curMount = CurrentMountId();
+                    short reqMount;
+                    var marg = arg?.Trim() ?? "";
+                    if (marg.Length == 0)
+                    {
+                        // Bare: dismount if mounted, else most-recent from history.
+                        if (curMount != 0) reqMount = 0;
+                        else
+                        {
+                            var recent = config.RecentMounts;
+                            if (recent.Count == 0)
+                            { chat.Print("[HavenNative] No recent mount to summon. Try /havenengine mount <id> or pick one in the Character tab."); break; }
+                            reqMount = (short)recent[0];
+                        }
+                    }
+                    else if (!short.TryParse(marg, out reqMount))
+                    {
+                        chat.Print("[HavenNative] Usage: /havenengine mount [id]  (bare = most recent / dismount if mounted; 0 = dismount).");
+                        break;
+                    }
+                    // Toggle: clicking the mount that's already out (or "0") dismounts.
+                    if (reqMount != 0 && curMount == (ushort)reqMount) reqMount = 0;
+
+                    var result = stateApply.MountSelf(reqMount);
+                    switch (result)
+                    {
+                        case StateApplyService.MountResult.Mounted:
+                            noclip.EnableFlight();
+                            config.PushRecentMount((ushort)reqMount);
+                            chat.Print("[HavenNative] Mounted " + reqMount + ".");
+                            break;
+                        case StateApplyService.MountResult.Dismounted:
+                            noclip.DisableFlight();
+                            chat.Print("[HavenNative] Dismounted.");
+                            break;
+                        case StateApplyService.MountResult.InvalidId:
+                            chat.Print("[HavenNative] Invalid mount ID " + reqMount + ". No such mount exists.");
+                            break;
+                        case StateApplyService.MountResult.NoLocalPlayer:
+                            chat.Print("[HavenNative] Can't mount: no local player.");
+                            break;
+                    }
+                }
+                break;
+            case "housingdiag":
+                // S145 [HOUSINGDIAG]: read-only decoration-state dump. "/havenengine housingdiag" starts,
+                // "/havenengine housingdiag stop" stops early. Walk into the FC room while it runs.
+                if (arg != null && arg.Equals("stop", StringComparison.OrdinalIgnoreCase))
+                {
+                    zoneLoad.StopHousingDiag();
+                    chat.Print("[HavenNative] HOUSINGDIAG stopped.");
+                }
+                else
+                {
+                    zoneLoad.StartHousingDiag();
+                    chat.Print("[HavenNative] HOUSINGDIAG started - now run the test sequence (see chat/log). Auto-stops in ~20s.");
+                }
+                break;
+            case "furndiag":
+                // v0.7.422 [FURNDIAG]: one-shot dump of every furniture-manager object AND every
+                // GOM slot in the EventObjectManager range (440-500): kind, RenderFlags, DrawObject,
+                // visibility, position. Run once with leaked items VISIBLE (post-hop) and once with
+                // them hidden (post-initial-load); the diff names the rendering object + its kind.
+                zoneLoad.DumpFurnDiag();
+                chat.Print("[HavenNative] FURNDIAG dumped - see log.");
+                break;
+            case "maps":
+                // S240: open the consolidated window on the Zones tab.
+                ui.OpenZones();
+                chat.Print("[HavenNative] Opened HM-Sync window (Zones).");
+                break;
+            case "displayarms": DoToggleDisplayArms(); break;
+            case "displayhead": DoToggleDisplayHead(); break;
+            case "visor": DoToggleVisor(); break;
+            default: chat.Print("[HavenNative] Unknown: " + sub); break;
+        }
+    }
+
+    // ── Commands ──────────────────────────────────
+
+    private void DoStart(string? code = null)
+    {
+        // Force-clear stale connection state
+        if (relay.IsConnected)
+        {
+            DoLeaveInternal(silent: true);
+        }
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null) { chat.Print("[HavenNative] No local player."); return; }
+
+        // Guard: if the heartbeat sig didn't resolve (a patch broke the signature), starting a session would suppress
+        // the heartbeat too and disconnect you. Fail loudly here instead. (The one opcode/sig failure mode - §14.)
+        if (!packetFilter.HeartbeatResolved)
+        {
+            chat.Print("[HavenNative] Cannot start: a game patch changed the heartbeat signature.");
+            chat.Print("[HavenNative] Starting a session now would disconnect you. This needs a plugin update to fix the signature.");
+            return;
+        }
+
+        // The typed value is the room PASSWORD (the relay generates the opaque RoomId). Blank → auto-generate a short,
+        // shareable one (shown in-session so the host can read it out); a custom /havenengine start <pw> still works.
+        var password = (code ?? "").Trim();
+        if (password.Length == 0) { password = GenerateShortPassword(); chat.Print("[HavenNative] Room password: " + password); }
+
+        DoStartAsync(password, LocalContentId(), localPlayer.EntityId, localPlayer.Name.TextValue);
+    }
+
+    // S328f - SOLO SESSION. Runs the full map-authoring feature set (zone load, time/weather/BGM, NPC, cosmetics,
+    // movement, packet filter) with NO relay and no peers - the same client-side loop Hyperborea does. It's the
+    // DoStartAsync engage sequence MINUS relay.Connect, with SoloMode set so HasMapAuthority/IsSessionActive are true.
+    // The peer apply loop, roster, and all transmit are naturally inert without a connection (transmit gates on
+    // IsConnected; the apply loop has no peers). Teardown reuses DoLeaveInternal verbatim (relay-independent).
+    private void DoStartSolo()
+    {
+        if (relay.IsConnected || relay.SoloMode)
+        {
+            DoLeaveInternal(silent: true);
+        }
+
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null) { chat.Print("[HavenNative] No local player."); return; }
+
+        // Same heartbeat guard as a networked session - solo still engages the packet filter, so a broken heartbeat sig
+        // would disconnect. Fail loudly instead. (§14.)
+        if (!packetFilter.HeartbeatResolved)
+        {
+            chat.Print("[HavenNative] Cannot start solo: a game patch changed the heartbeat signature.");
+            chat.Print("[HavenNative] Starting now would disconnect you. This needs a plugin update to fix the signature.");
+            return;
+        }
+
+        // Solo lobby: set the flag so HasMapAuthority/IsSessionActive are true, but DON'T engage the synthetic
+        // session yet - that fires on zone-load (EngageSyntheticSession in DoLoad), same as a hosted session. Until
+        // then you're a normal player.
+        relay.SoloMode = true;
+
+        ui.SetStatus("Solo");
+        chat.Print("[HavenNative] Solo session ready. Load a map to start the scene. /havenengine stop to end.");
+    }
+
+    // S328p - say-passthrough pre-flight, run at every session start. Checks the game version against the stamp the
+    // opcodes were confirmed on; if the game has patched since, the opcodes are UNVERIFIED → the passthrough stays
+    // shut and the user is prompted to re-learn (fail-closed on patch). Otherwise loads the configured opcodes and
+    // arms the passthrough. Wires the drift handler so a mid-session rotation (validator failures) also shuts it.
+    private string GetGameVersion()
+    {
+        try { unsafe { return FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->GameVersionString ?? ""; } }
+        catch { return ""; }
+    }
+
+    // S327f: clear all targets before the packet filter engages on session start. A queued/hard/focus target on an
+    // INTERACTABLE (e.g. a door) can start an interaction whose server response the filter then DROPS, leaving the
+    // character "occupied"-locked (only alt-F4 recovers - even logout shows "you're occupied"). Nulling the target
+    // pointers means no interactable is queued, so nothing can get stuck. Safe: just clears selection state.
+    private unsafe void ClearTargetsOnStart()
+    {
+        try
+        {
+            var ts = FFXIVClientStructs.FFXIV.Client.Game.Control.TargetSystem.Instance();
+            if (ts == null) return;
+            ts->Target = null;
+            ts->SoftTarget = null;
+            ts->FocusTarget = null;
+            ts->MouseOverTarget = null;
+            ts->MouseOverNameplateTarget = null;
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] ClearTargetsOnStart failed: " + ex.Message); }
+    }
+
+    // S327: read the local player's stable ContentId (Character.ContentId @0x2358). Used as our identity on the wire.
+    private unsafe ulong LocalContentId()
+    {
+        var lp = objectTable.LocalPlayer;
+        if (lp == null) return 0;
+        var ch = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)lp.Address;
+        return ch == null ? 0 : ch->ContentId;
+    }
+
+    private async void DoStartAsync(string password, ulong contentId, uint entityId, string charName)
+    {
+        try
+        {
+            // Host: relay generates the opaque RoomId (we send it empty), CreateIfMissing=true, and stores the
+            // password. The party joins by nearby-resolution + this password.
+            var ok = await relay.Connect(config.RelayUrl, "", createIfMissing: true, password: password, nearbyContentIds: null, contentId, entityId, charName);
+            RunOnMainThread(() =>
+            {
+                // Success ("Lobby open") now waits for the relay's RoomJoined (see OnRoomJoined) - connect-ok only
+                // means the socket opened and JoinRoom was sent; a refusal (e.g. AlreadyHosting) still arrives after.
+                if (!ok) chat.Print("[HavenNative] Failed to connect to relay.");
+            });
+        }
+        catch (Exception ex) { RunOnMainThread(() => chat.Print("[HavenNative] Error: " + ex.Message)); }
+    }
+
+    private void DoJoin(string code)
+    {
+        var localPlayer = objectTable.LocalPlayer;
+        if (localPlayer == null) { chat.Print("[HavenNative] No local player."); return; }
+
+        if (!packetFilter.HeartbeatResolved)
+        {
+            chat.Print("[HavenNative] Cannot join: a game patch changed the heartbeat signature.");
+            chat.Print("[HavenNative] Joining now would disconnect you. This needs a plugin update to fix the signature.");
+            return;
+        }
+
+        if (relay.IsConnected)
+        {
+            chat.Print("[HavenNative] Leaving current session.");
+            DoLeaveInternal(silent: true);
+        }
+
+        var password = (code ?? "").Trim();
+        if (password.Length == 0) { chat.Print("[HavenNative] Enter the room password to join."); return; }
+
+        DoJoinAsync(password, LocalContentId(), localPlayer.EntityId, localPlayer.Name.TextValue);
+    }
+
+    private async void DoJoinAsync(string password, ulong contentId, uint entityId, string charName)
+    {
+        try
+        {
+            // Join: the relay resolves WHICH room from the ContentIds we can see (the presence gate) + the password -
+            // no target, no picker. Send everyone visible; the relay disambiguates multiple candidate rooms by the
+            // password. If nobody's visible there's no one to resolve against - say so before connecting.
+            var nearby = EnumerateNearbyContentIds();
+            if (nearby.Length == 0)
+            {
+                RunOnMainThread(() => chat.Print("[HavenNative] Nobody nearby is hosting - you must be in visual range of the host to join."));
+                return;
+            }
+            var ok = await relay.Connect(config.RelayUrl, "", createIfMissing: false, password: password, nearbyContentIds: nearby, contentId, entityId, charName);
+            RunOnMainThread(() =>
+            {
+                // Success ("Joined") now waits for RoomJoined (see OnRoomJoined). Connect-ok is just socket+JoinRoom; a
+                // wrong-password / no-host-nearby refusal arrives as an Error after this and must NOT read as "joined".
+                if (!ok) chat.Print("[HavenNative] Failed to reach the relay.");
+            });
+        }
+        catch (Exception ex) { RunOnMainThread(() => chat.Print("[HavenNative] Error: " + ex.Message)); }
+    }
+
+    // The ContentIds of every player character currently in our object table (visual range), sent on Join so the relay
+    // can resolve which room we mean by intersecting with live session members - the presence gate. ContentId is read
+    // natively (same as LocalContentId); our own is excluded. Everyone visible is included - the relay disambiguates
+    // multiple candidate rooms by password, so we don't filter to one group.
+    private unsafe ulong[] EnumerateNearbyContentIds()
+    {
+        var ids = new System.Collections.Generic.List<ulong>();
+        ulong self = LocalContentId();
+        foreach (var obj in objectTable)
+        {
+            if (obj is Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter pc)
+            {
+                var ch = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)pc.Address;
+                if (ch == null) continue;
+                ulong cid = ch->ContentId;
+                if (cid != 0 && cid != self) ids.Add(cid);
+            }
+        }
+        return ids.ToArray();
+    }
+
+    // Quick-load from the Recent list: if idle, silently start a solo lobby first (so there's map authority), then
+    // load; if already in a session, just load. The load itself goes synthetic (EngageSyntheticSession in DoLoad) -
+    // the filter comes up before the zone changes, so nothing is exposed.
+    // COSM_1_016: bridge for StateApplyService.SkillReplay - an unsafe method (not a lambda) because the delegate
+    // takes a Character*, which can't be an implicitly-typed lambda parameter in this non-unsafe class.
+    private unsafe void SkillReplayBridge(FFXIVClientStructs.FFXIV.Client.Game.Character.Character* caster,
+        uint actionId, byte actionType, System.Numerics.Vector3 targetPos,
+        FFXIVClientStructs.FFXIV.Client.Game.Character.Character* target)
+        => skillSync.ReplayOn(caster, actionId, actionType, targetPos, target);
+
+    private void DoQuickLoad(uint territoryId)
+    {
+        if (!relay.IsSessionActive) DoStartSolo();
+        if (relay.IsSessionActive) DoLoad(territoryId);
+    }
+
+    // NB-18-RETEST (2026-08-02, Fable): cold-entry discriminator for the layer-filter-key mechanism. Arms a
+    // one-shot key override on the CreateScene detour (see ZoneLoadService.PendingCastKeyOverride), which passes
+    // the forced key AND zeroes the territoryId arg - the argument set FindFilter (0x717930) keys on, since it
+    // consults the key only when the layout TT is 0. Earlier NB-18 test overrode only the key (left TT=919) so
+    // FindFilter(919) always returned the base cast - the confound. This MUST be a COLD entry: a same-zone reload
+    // can be served a cached/prefetched layout (0x70cb9b promotion, LoadedLayouts find at 0x70c960) regardless of
+    // key. Predicted observable if live: 919 + key 257010 + TT->0 -> war-memorial cenotaph, ~98 NPCs. Debug-gated.
+    private void DoCastTest(string? arg)
+    {
+        var parts = (arg ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2 || !uint.TryParse(parts[0], out var tt) || !uint.TryParse(parts[1], out var key))
+        {
+            chat.Print("[HavenNative] usage: /havenengine casttest <territoryId> <key>   (e.g. /havenengine casttest 919 257010). Load COLD - not the zone you're already in.");
+            return;
+        }
+        if (zoneLoad.CurrentLoadedZone == tt)
+        {
+            chat.Print("[HavenNative] Already in " + tt + " - that would be a WARM reload (cached layout). Leave the zone first, then re-run for a cold entry.");
+            return;
+        }
+        zoneLoad.PendingCastKeyOverride = key;
+        chat.Print("[HavenNative] [CASTTEST] armed key " + key + " (TT->0) for the next load; loading " + tt + " cold...");
+        DoQuickLoad(tt);
+    }
+
+    // NB-19 Phase 1 (2026-08-02, Fable): toggle the quest-read DIAGNOSTIC log. The spoof itself is automatic — a
+    // per-zone policy arms inside LoadZone and drives populace visibility with NO command needed. This just turns on
+    // read-logging so you can watch the real→spoofed quest reads during a virtual load: each distinct (fn,questId,
+    // result) logs once, SPOOFED reads annotated, chain ids 4735-4743 flagged. Watch [QUESTSPOOF] in /xllog; auto-
+    // closes after ~2 min.
+    private void DoQuestProbe()
+    {
+        bool on = questSpoof.ToggleLogReads();
+        if (on)
+            chat.Print("[HavenNative] [QUESTSPOOF] read-log on (~2 min). Load 1160 to see the spoofed quest reads in /xllog (chain 4735-4743).");
+        else
+            chat.Print("[HavenNative] [QUESTSPOOF] read-log off.");
+    }
+
+    // Engage the synthetic session - the packet filter plus everything that isolates you from the real server and
+    // drives peers as puppets. This is phase two: it fires on ZONE-LOAD (host DoLoad, guest OnZoneLoadReceived), NOT
+    // on host/join/solo start, so the lobby stays a normal-player gather where friends are real characters and Mare
+    // can cache them. Idempotent - a second zone-load while already synthetic no-ops. Returns false (aborting the
+    // load) if the heartbeat signature is unresolved, so the filter can never fail to come up while the zone changes.
+    private unsafe bool EngageSyntheticSession()
+    {
+        if (packetFilter.IsActive) return true;   // already synthetic - don't re-engage on a subsequent load
+        // v0.7.461 (P1, QA): gate on CanEnable (all critical hooks created AND heartbeat resolved), not just
+        // HeartbeatResolved. A patch that broke only the send-packet sig would pass the old heartbeat-only check and
+        // engage the session with outbound traffic UNFILTERED to the live server. CanEnable closes that exposure.
+        if (!packetFilter.CanEnable || !privateRoomChat.Available)
+        {
+            chat.Print("[HavenNative] Cannot start the private session: a game patch changed a packet signature.");
+            chat.Print("[HavenNative] Loading now would expose you to the real server. This needs a plugin update to fix the signature.");
+            return false;
+        }
+        if (HousingEntryBlocked is {} blocked)
+        {
+            toast.ShowError(blocked);
+            return false;
+        }
+        ClearTargetsOnStart();   // S327f: prevent focus-target interaction softlock behind the filter
+        packetFilter.Enable();
+        sayFilter.Active = false; // PrivateRoomChatService owns isolated room chat; no world-chat restamping.
+        packetFilter.RelearnArmed = false;
+        packetFilter.PassSayChat = packetFilter.PassSayChatOut = false;
+        // D-16: arm the read-only room roster. Resolve PlayerSpawn/DespawnCharacter by NAME from the opcode map (the
+        // durable identity - numbers rotate per patch) and push them in. A name absent from the loaded map yields an
+        // empty set → tracking is inert for that packet (fail-closed). The register only READS the spawn/despawn keys to
+        // know who's physically in the firewalled room; it never passes a packet through, so nothing is instantiated.
+        packetFilter.RoomTrackingEnabled = true;
+        // D-16.2/.3: also PASS validated player spawn/despawn through (inbound only) so the object table stays truthful -
+        // a real walk-in is instantiated (hidden by ActorVisibility until they join) and a leaver is removed (no
+        // phantom). Enables live late-join binding + phantom cleanup with no new render code. Torn down at session end.
+        packetFilter.RoomPassthrough = true;
+        packetFilter.ConfigureRosterOpcodes(
+            opcodeMap.InboundOpcodesForNames("PlayerSpawn"),
+            opcodeMap.InboundOpcodesForNames("DespawnCharacter"),
+            opcodeMap.InboundOpcodesForNames("ActorMove", "ActorSetPos"));   // b255: mirror a tracked walk-in's movement so they're at their true spot on session end, not frozen at the door
+        // Cache our own entity id for the network-thread despawn re-learn correlation (a despawn's a2 == local player).
+        // Framework thread here; read as an atomic uint off-thread. Stable for the session, so a one-shot cache is enough.
+        packetFilter.LocalPlayerEntityId = objectTable.LocalPlayer?.EntityId ?? 0u;
+        stateCapture.Start();
+        stateApply.Start();
+        detector.Reset();   // baselines from the LIVE actor (v0.7.413) - must precede the stand-up below
+
+        // v0.7.419 - capture the origin posture BEFORE SanitiseLocalPosture clears it. If the player
+        // entered seated, the server still thinks they're in InPositionLoop for the whole session. On
+        // exit, we need to tell the server via a native standup emote. Capture here; act in post-settle.
+        // v0.7.420: also capture the emote ID for origin restore (50=chair-sit, 52=ground-sit, 203=lean).
+        {
+            var lp = objectTable.LocalPlayer;
+            if (lp != null)
+            {
+                var ch = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)lp.Address;
+                originMode = ch->Mode;
+                originModeParam = ch->ModeParam;
+                originEmoteId = ch->EmoteController.EmoteId;
+                log.Debug("[HavenNative] [POSE] origin captured: Mode=" + originMode + "/" + originModeParam +
+                    " EmoteId=" + originEmoteId);
+            }
+            else
+            {
+                originMode = CharacterModes.Normal;
+                originModeParam = 0;
+                originEmoteId = 0;
+            }
+        }
+
+        SanitiseLocalPosture("engage");
+        actorVisibility.Start();
+        // Bridge peers that bound during the LOBBY (before actorVisibility was running) into its visible set.
+        // actorVisibility.Start() hides all non-self players, and the OnPeerBound→RegisterPeer path only fires for
+        // peers that bind via the apply loop (which wasn't running in the lobby) - so without this the co-located
+        // peers stay hidden after we go synthetic. The apply loop re-registers them on their next transform (idempotent).
+        foreach (var idx in stateApply.GetPeerObjectIndices())
+            actorVisibility.RegisterPeer(idx);
+        // (v0.7.261: dropped the "Private session active" line - redundant with "Solo/Lobby ready" + the zone-load line.)
+        return true;
+    }
+
+    // v0.7.348: extract the short stage tag from a cutscene bg path - "ffxiv/ocn_o1/evt/o1e1/level/o1e1" → "o1e1"
+    // (the last '/'-segment). Used to label a cutscene load by its stage tag instead of the donor territory id.
+    private static string StageTagFromBg(string bg)
+    {
+        if (string.IsNullOrEmpty(bg)) return "";
+        int i = bg.LastIndexOf('/');
+        return i >= 0 && i < bg.Length - 1 ? bg.Substring(i + 1) : bg;
+    }
+
+    private void DoLoad(uint territoryId)
+    {
+        if (!zoneLoad.CanLoad) { chat.PrintError("[Haven] Native zone signatures are unavailable."); return; }
+        if (!relay.IsSessionActive) { chat.Print("[HavenNative] Not in a session."); return; }
+        if (!relay.HasMapAuthority) { chat.Print("[HavenNative] Only the host can load zones."); return; }
+        if (!zoneLoad.IsValidTerritory(territoryId)) { chat.Print("[HavenNative] Invalid territory ID."); return; }
+
+        // NB-20: NPC hides are per-map (durable store: config.MapNpcHide). Restore the OUTGOING map's NPCs at load start;
+        // the INCOMING map's saved prefs (hide-all / hide-markers / granular set) are re-applied from config once the load
+        // settles - LoadNpcHideCache runs in the post-load reassert block, then PushMapState broadcasts + engages them.
+        npcVisibility.Stop();
+
+        // v0.7.227: resolve the active swap-stage bg. LoadStage sets BOTH PendingStageBg and ActiveStageBg together for
+        // a swap; a plain zone load sets neither. So PendingStageBg==null at entry means this is a plain load → clear
+        // any stale ActiveStageBg from a prior swap. ActiveStageBg is otherwise PERSISTENT (survives the load) so a
+        // later "Set spawn" capture keys by the same bg. When set, spawns key by STAGE BG (unique) instead of the
+        // shared donor territoryId - the fix for the "custom spawn applies to every map" leak.
+        if (zoneLoad.PendingStageBg == null)
+            zoneLoad.ActiveStageBg = null;
+        var stageBg = zoneLoad.ActiveStageBg;
+
+        // v0.7.340: name the CUTSCENE stage, not the donor territory. For a swap stage the territoryId is the donor
+        // (e.g. the apartment), so GetZoneName(territoryId) printed "Ingleside Apartment" instead of the stage. Prefer
+        // the stage name when this is a swap load; fall back to the territory name for a plain zone load.
+        var zoneName = (stageBg != null ? cutscene.GetStageName(stageBg) : null) ?? zoneLoad.GetZoneName(territoryId);
+
+        // Spawn resolution. Order of preference:
+        //   swap stage  : user-captured-for-this-bg  →  baked curated stage spawn  →  ResolveSpawnPoint(donor) fallback
+        //   plain load  : user-captured-for-territory →  ResolveSpawnPoint(territoryId)   (unchanged S326m behaviour)
+        // The user spawn stores facing at [3] (carried through so you spawn oriented the way you set it).
+        System.Numerics.Vector3 spawn;
+        float? spawnFacing = null;
+        if (stageBg != null)
+        {
+            if (config.UserStageSpawns.TryGetValue(stageBg, out var uss) && uss.Length >= 3)
+            {
+                spawn = new System.Numerics.Vector3(uss[0], uss[1], uss[2]);
+                if (uss.Length >= 4) spawnFacing = uss[3];
+            }
+            else if (cutscene.TryGetCuratedStageSpawn(stageBg, out var curatedStage, out var curatedFacing))
+            {
+                spawn = curatedStage;
+                if (curatedFacing.HasValue) spawnFacing = curatedFacing;
+            }
+            else
+            {
+                spawn = zoneLoad.ResolveSpawnPoint(territoryId);
+            }
+        }
+        else if (config.UserSpawns.TryGetValue(territoryId, out var us) && us.Length >= 3)
+        {
+            spawn = new System.Numerics.Vector3(us[0], us[1], us[2]);
+            if (us.Length >= 4) spawnFacing = us[3];
+        }
+        else
+            spawn = zoneLoad.ResolveSpawnPoint(territoryId);
+
+        // v0.7.348: for a cutscene swap stage the parenthetical should read the STAGE tag (e.g. "o1e1"), not the donor
+        // territory id (999). Derive the tag from the stage bg's last path segment; fall back to the territory id for a
+        // plain zone load.
+        string loadTag = stageBg != null ? StageTagFromBg(stageBg) : territoryId.ToString();
+        chat.Print("[HavenNative] Loading " + zoneName + " (" + loadTag + ").");
+
+        // Go synthetic BEFORE the zone changes - the filter must be up before we leave the real map, or the server
+        // sees us at the synthetic coordinates. Idempotent (no-op if already synthetic on a subsequent load); aborts
+        // the load if the filter can't engage.
+        if (!EngageSyntheticSession()) return;
+
+        // NB-32: CLEAN-SPAWN ON HOP (host). Stand THIS client up BEFORE the zone changes - the same relative timing
+        // as the first-engage standup inside EngageSyntheticSession, which is exactly what makes peers spawn upright
+        // on initial session load. EngageSyntheticSession does this once then early-returns on every subsequent hop,
+        // so a mid-session hop needs the explicit call here. By stopping the seated broadcast BEFORE LoadZone, the
+        // idle state propagates during peers' own load window, so they rebuild this body clean by construction rather
+        // than squatting mid-air then being swept to idle post-settle (the old NB-31 approach). Mount-safe:
+        // SanitiseLocalPosture no-ops on Mounted (not InPositionLoop/EmoteLoop). Purely local/behind the filter, so
+        // the origin posture captured at first engage - and thus exit-time server reconciliation - is untouched.
+        SanitiseLocalPosture("map-hop");
+
+        var peerIndices = stateApply.GetPeerObjectIndices();
+        zoneLoad.LoadZone(territoryId, peerIndices, spawn, spawnFacing);
+        actorVisibility.Refresh();
+        config.PushRecentZone(territoryId);   // legacy list (kept for migration)
+        // v0.7.231: unified recent - a swap cutscene stage records by its bg (stageBg), a plain zone by territoryId.
+        // This is why "I just visited the Correction Chamber" now shows up in Recent instead of the donor zone.
+        config.PushRecentPlace(territoryId, stageBg);
+
+        // v0.7.475 (was v0.7.429, supersedes S326u): reset the WEATHER pick per load, exactly like BGM below.
+        // The reset is still right but the REASON changed and the old wording is now false - PushMapState no
+        // longer resolves a pick, it broadcasts the LIVE sky. Which is what makes the reset safe: on a fresh
+        // load the live sky IS the new zone's native weather, so clearing the pick and reading reality agree.
+        // (Under the old resolver the justification was "pick if legal, else native"; that ladder is gone.)
+        // pick=0 is safe and correct:
+        // it means "follow the new zone's own sky". Without this reset, a pick from map A (e.g. Snow) rode
+        // into map B's broadcast; the host legality-gated it locally in Reassert (fell back to native - sunny),
+        // but peers mirrored the illegal id verbatim → invalid render → the "peers stuck on none/atmospheric
+        // while the host sees sunny skies" desync. Map load resets everyone to the zone default; subsequent
+        // host picks sync as before.
+        config.MapWeatherId = 0;    // pick does not carry across loads
+        config.MapWeatherDonor = 0; // b183: the day/night graft donor is per-scene too — don't ride into the new zone
+        config.MapWeatherForced = false;   // NB-44: a fresh load carries NO explicit pick → the load reassert ships forced=false → peers keep their own native sky
+        mapSettings.WeatherId = 0;  // service copy too, so post-load Reassert resolves the NEW zone's default
+        mapSettings.WeatherDonor = 0;
+        // WEATHER-CRAM (2026-08-16): a crammed foreign sky (WeatherCramService restamp) must NOT ride across a map
+        // change. The restamp hook keeps stamping the captured donor block every frame regardless of zone, so without
+        // this the new map loads under the old zone's crammed sky (user report: "not cleared by map change"). Stop the
+        // replay on load; the new zone's native recompute then owns the sky. (No-op if nothing was replaying.)
+        mapSettings.ClearPreset();
+        // b171: the b170 keyframe day-night GRAFT is a SEPARATE per-frame override from the static cram above — ClearPreset
+        // only stops ReplayActive (the static restamp), not kfActive (the day-night graft). Like the static cram, the graft
+        // restamps EnvState every frame regardless of zone, so without this a chip-tapped travelling-sun sky rode into the
+        // next virtual map (operator report: "weather doesn't reset between weathers on a map hop"). Stop the graft here
+        // exactly as the native zone-change poll does (StopKfGraftForZoneChange) — it KEEPS the captured set so the
+        // donor→target travel flow (wxkfload → hop → wxkfreplay) still works; only the live graft stops. Once the override
+        // is gone the pick-reset above + post-load reassert resolve the NEW zone's own default sky, which IS the "cycle to
+        // the map's default weather on a map hop" behaviour the operator asked for.
+        mapSettings.StopKfGraftForZoneChange();
+        // NB-39: hand the reassert the active cutscene stage bg so it resolves the load-time native weather from the
+        // STAGE's own authored .lvb, not the borrowed donor territory (interior donor = weather 0 = the "cutscenes all
+        // pop as None/atmospheric" bug). null on a plain zone load → unchanged donor/TT resolution.
+        mapSettings.ActiveStageBgForWeather = stageBg;
+
+        ArmMapReassert();   // S326: re-apply host map-state once the load settles (load clobbers weather/time)
+        ArmMapReveal();     // v0.7.448: reveal this map's HUD fog once the load settles (local; restored on exit)
+
+        // S327l: reset BGM to the NEW zone's default on load - a pick from the previous map must not carry over (it
+        // would show/play the wrong zone's track). The display reads live, but resetting the stored pick keeps the
+        // picker/broadcast honest. lastAppliedPeerBgm reset so guests re-apply cleanly.
+        config.MapBgmId = 0;   // 0 = follow the zone's natural/default music (no forced override)
+        mapSettings.BgmId = 0; // S327v: reset the service copy too so post-load Reassert resolves the NEW zone default
+        lastAppliedPeerBgm = 0;
+        lastAppliedPeerWeather = -1; lastAppliedPeerDonor = uint.MaxValue;   // b184: clear the graft-engage latch so the NEW zone re-applies its (weather,donor) fresh
+
+        // v0.7.332: if this load is a cutscene stage (ActiveStageBg set by CutsceneStageService.LoadStage), carry the
+        // stage bg path + name so peers run the same donor-load-with-bg-swap instead of loading only the donor territory.
+        string bcastStageBg = zoneLoad.ActiveStageBg ?? "";
+        string bcastStageName = "";
+        if (bcastStageBg.Length > 0)
+            foreach (var st in cutscene.Stages) if (st.Bg == bcastStageBg) { bcastStageName = st.Name; break; }
+
+        _ = relay.SendZoneLoad(new ZoneLoadData
+        {
+            TerritoryId = territoryId,
+            SpawnX = spawn.X, SpawnY = spawn.Y, SpawnZ = spawn.Z,
+            StageBg = bcastStageBg,
+            StageName = bcastStageName,
+        });
+
+        ui.SetStatus("Zone: " + zoneName);
+        // Only mention peers when there actually are some (solo sessions have none - "broadcast sent to peers" was a lie).
+        chat.Print(stateApply.Peers.Count > 0 ? "[HavenNative] Loaded. Synced to peers." : "[HavenNative] Loaded.");
+    }
+
+    private void DoTeardownHousing()
+    {
+        chat.Print("[HavenNative] Attempting IndoorTerritory teardown (Dtor) - watch for furniture removal or crash.");
+        zoneLoad.TeardownHousing();
+    }
+
+
+    private void DoReload()
+    {
+        if (!zoneLoad.IsZoneLoaded) { chat.Print("[HavenNative] No zone loaded."); return; }
+        var peerIndices = stateApply.GetPeerObjectIndices();
+        zoneLoad.ReloadZone(peerIndices);
+        actorVisibility.Refresh();
+        chat.Print("[HavenNative] Zone reloaded.");
+    }
+
+    private void DoLeave()
+    {
+        if (!relay.IsSessionActive) { chat.Print("[HavenNative] Not in a session."); return; }
+        DoLeaveInternal(silent: false);
+    }
+
+    private void DoLeaveInternal(bool silent)
+    {
+        // S289: AIRBORNE-STOP FIX. Do NOT revoke flight while still airborne over the foreign zone -
+        // the moment IsFlightProhibited flips back to prohibited, the GAME force-relocates the airborne
+        // actor to a "valid" position, which over flyable-but-not-walkable space (e.g. the Clyteum)
+        // resolves to a point ~1000 yalms out. That was the air-stop-only OOB (ground stop never hit it
+        // because there's no airborne actor to relocate). So we keep flight state intact through the
+        // reload; Revert dismounts cleanly, and the deferred home-restore (S288) is the final authority
+        // on position. Movement state is fully sanitized via noclip.Disable() BEFORE the reload (S292).
+        // v0.7.328: snapshot peer origin positions before SanitizePeerStates clears the roster, so we can write them
+        // back onto the frozen actors once the return settles (undoing the synthetic-coord freeze).
+        retPeerOrigins = stateApply.SnapshotPeerOrigins();
+        retPeerIndices = stateApply.SnapshotPeerIndices();
+        // b211: revert every own-body HDM disguise we applied to a peer's REAL body BEFORE the roster is cleared below.
+        // Whole-session teardown (host SessionEnd / our stop-leave / disconnect) all land here rather than the per-peer
+        // OnPeerLeft path, and disguiseSync.Reset() (later, after the roster clear) only despawns MIRROR PUPPETS — the
+        // peer's real co-located body keeps the stale scene disguise until this explicit revert. Must precede
+        // SanitizePeerStates (which clears the roster ResolveObjectIndex needs) and zoneLoad.Revert (peer object still live).
+        // b212: capture the reverted indices so OnHomeRestoreComplete can RE-REVERT them after the reload settles — the
+        // reload rebuilds each peer's real body and HDM re-asserts the disguise on that rebuild, stomping this pre-clear
+        // revert (the "needs a manual HDM revert tap" residual). Indices survive the reload (firewall-pinned real peers).
+        retDisguisedIndices = disguiseSync.RevertAllPeerDisguises();
+        stateApply.SanitizePeerStates();
+        sayFilter.Active = false;            // S328v: chat returns fully to normal once the session ends (stop/leave/crash all route here)
+        packetFilter.RoomTrackingEnabled = false; packetFilter.RoomPassthrough = false; packetFilter.ClearRoster();   // D-16: stop tracking + pass-through, drop the register on session end
+
+        // S328u - reset the host's per-session map overrides to neutral so nothing (experimental weather especially)
+        // leaks into a LATER session. These are only ever SET by the map* handlers and were never reset, so a value
+        // chosen in one session would persist in config and get re-broadcast to the next session's peers even after
+        // the host's live state reset on zone load. Reset regardless of whether it was the weather-bug cause - a
+        // set-but-never-reset value is a latent cross-session leak. Neutral defaults mirror the config initializers.
+        config.MapWeatherId = 0;         // 0 = default/atmospheric
+        config.MapWeatherDonor = 0;      // b183: clear the day/night graft donor (cross-session leak guard)
+        config.MapWeatherForced = false; // NB-44: no explicit pick carries into a later session (cross-session leak guard)
+        config.MapTimeForced = false;
+        config.MapEorzeaHour = 12;       // config default is noon, not 0
+        config.MapEorzeaMinute = 0;
+        config.MapBgmId = 0;             // 0 = none/default
+        config.MapRemoveNpcs = false;
+        config.MapHideQuestSigns = false;   // S328aa
+        config.MapHiddenNpcDataIds.Clear();  // NB-20: reset the effective granular cache (durable per-map store is kept)
+        npcVisibility.Stop();               // S328aa: restore all NPCs on session end
+        config.Save();
+        packetFilter.PassSayChat = false;    // S328i: stop passing spatial-chat packets once the session ends
+        packetFilter.PassSayChatOut = false; // S328k: stop passing outbound chat once the session ends
+        relay.SoloMode = false;              // S328f: clear solo flag on any teardown (stop/leave/crash all route here)
+        mapSettings.DisableTimeOverride();   // S326v: never leave the player's clock frozen after a session ends
+        mapSettings.ToggleWxReplay(false);   // WEATHER-CRAM b97: never leave a crammed foreign sky replaying after a session ends
+        // b156 AMBIENT-BLEED FIX: the handle-swap crams (wxcyclecram/wxskyswap/wxambswap/wxstarforce, incl. wxcity) are held
+        // per-frame by their Tick* holders and are NOT covered by ToggleWxReplay above (that's the OLD b97 restamp cram, a
+        // different mechanism). If not torn down HERE — before zoneLoad.Revert() below reloads the origin zone — ambActive
+        // stays true across the return, so TickAmbientSwap crams the donor ambient into the returning apartment's fresh
+        // EnvLocation, stranding it there (the "apt immersed in new ambient light" bleed). The per-frame territory poll only
+        // catches this a few frames too late. Tear all four down now, in reverse-arm order (mirror of the zone-change poll).
+        if (weatherCram.StarForceActive) weatherCram.StopStarForce();
+        if (weatherCram.AmbientActive)  weatherCram.RestoreAmbientSet();
+        if (weatherCram.SkyActive)      weatherCram.RestoreSkyCubemap();
+        if (weatherCram.CycleActive)    weatherCram.StopCycleCram();
+        // b171: the b170 keyframe day-night GRAFT is covered by NONE of the teardowns above — ToggleWxReplay(false) stops
+        // the static restamp cram, and the four Stop*/Restore* calls handle the handle-swap crams; the graft (kfActive) is
+        // a third, independent per-frame override. Left active, it keeps restamping EnvState and bleeds the grafted sky into
+        // the RETURNING apartment the moment Revert() (below) reloads the origin zone — the exact "sanitise on exit
+        // regardless of what it is" gap the operator flagged. Full-reset it here (mirrors the logout sanitise): stop the
+        // graft, cancel any in-flight sweep, and drop the in-memory set. The saved keyframe LIBRARY persists on disk, so a
+        // re-host re-grafts instantly via a chip tap / wxkfload — nothing durable is lost.
+        mapSettings.ResetKeyframeGraftForSession();
+        mapSettings.RestoreBgm();            // S327s: release our forced BGM so the real zone's music resumes (not a stuck synthetic track)
+        config.MapBgmId = 0;                 // S327v: clear the stored pick so a re-host starts from the zone default, not a stale custom track
+        lastAppliedPeerBgm = 0;              // S327s: clear the latch so a re-join re-engages BGM cleanly
+        lastAppliedPeerWeather = -1; lastAppliedPeerDonor = uint.MaxValue;   // b184: same for the graft-engage latch
+
+        stateCapture.Stop();
+        stateApply.Stop();
+        detector.Stop();
+        actorVisibility.Stop();
+        disguiseSync.Reset();   // FEAT-R2: despawn every mirror puppet we spawned + clear the disguise caches on teardown
+        lobbyNameplate.Reset();   // b195: revert any lobby-applied nameplates + forget cached peer names on session teardown
+        lightsOut.RestoreAll();   // Q-0010: restore any suppressed dungeon lights/flames + clear intent on session teardown
+
+        bool announceMovement = noclip.IsActive;
+
+        // S292: clear ALL movement state (flight, noclip, flat) BEFORE Revert. The flying mount's
+        // movement controller writes the actor position EVERY frame while flight is active - it was
+        // overwriting our restore SetPosition each tick (drift frozen at 72.4 for 30 frames). Flight
+        // MUST be off before the restore poll runs, or the restore can never land. The S289 concern
+        // (revoking flight while airborne triggers the game's relocate) is moot here: we reload the zone
+        // immediately, and the held packet filter + deferred restore own the landing.
+        noclip.Disable();
+        // v0.7.259: no notification on auto-disable - movement modes dropping on leave is expected, not news.
+
+        // S320: carpet is a session/map convenience - drop it on stop|leave too (notifies via its own
+        // StatusReport; idempotent, so the ZoneWillChange fired by Revert's reload won't double-notify).
+        carpet.Disable();
+
+        // v0.7.419 - POSTURE SANITISE ON EXIT. Same pattern as the mount/minion/ornament teardown:
+        // clear any posture the player is in (whether inherited from origin or acquired during the
+        // session) so it doesn't leak through Revert. Without this, a chair-sit acquired during HMS
+        // persists → actor at origin in InPositionLoop with no furniture anchor → sunk into floor,
+        // MoveController locked by mode → frozen for peers.
+        // Covers both InPositionLoop (sit/groundsit/sleep) and EmoteLoop (lean/dance/cheers).
+        SanitiseLocalPosture("exit");
+
+        // v0.7.448 - MAP-REVEAL SANITISE ON EXIT. Restore every map we auto-revealed this session to its
+        // recorded original discovery bytes (restore-to-snapshot, never to zero - genuine progress is
+        // preserved), and delete the crash-recovery file. All stop/leave paths funnel here, so a clean exit
+        // always sanitises; only a hard crash bypasses it, which the on-load crash-recovery sweep handles.
+        SanitiseRevealedMaps();
+
+        // v0.7.419 - release any locked gaze. DriveGazeSlot's release path (LookMode=0) fires in the
+        // per-frame loop, but Stop() killed that loop above - so a Locked gaze that was on at Stop()
+        // never gets its release call. ClearAll resets the static flags so the next session starts clean
+        // and the zone reload's DrawObject rebuild doesn't inherit a stale look-at target.
+        FaceControlState.ClearAll();
+
+        // Q-0007b (b201): HDM OWN-BODY SANITISE ON SESSION TEARDOWN. disguiseSync.Reset() above dropped PEER mirror
+        // puppets, but the DM's OWN-body HDM disguise — Scale + a vertical DrawOffset on our GameObject, plus any
+        // in-progress possession pin — is HDM-owned and untouched by it. Those are plain GameObject fields that SURVIVE
+        // the zone reload below (Revert rebuilds the DRAW object, not the logical GameObject), so on a session STOP (the
+        // edge a DM hits constantly, which the b200 logout-only wiring missed) a wisp's downscale + raised elevation
+        // stranded the DM mini + floating at origin. "Fine on relog" is NOT acceptable — baseline must return on session
+        // end. Every stop/leave/host-end/disconnect funnels through DoLeaveInternal, so this is the right chokepoint.
+        // Share IsZoneLoaded with the Revert on the next line so both read the same flag: pass restoreVisual=FALSE when a
+        // zone is loaded (the reload reverts the MODEL, so we need only the cheap leak-field zeroing and must NOT queue a
+        // redraw that races the reload); pass TRUE when no zone is loaded (Revert is skipped, so HDM reverts the model
+        // itself via its own redraw — safe: HDM excludes the local index from model re-assertion, GuiseService.cs:1027).
+        // Sub-ms field writes on the common (zone-loaded) path → no exit stutter. Additive + HDM-optional (guarded).
+        if (hdm.SanitizeSelfSupported)
+        {
+            bool restoreVisual = !zoneLoad.IsZoneLoaded;
+            hdm.SanitizeSelf(restoreVisual);
+            log.Information("[HavenNative] HDM own-body sanitised on session teardown (restoreVisual=" + restoreVisual + ").");
+        }
+
+        if (zoneLoad.IsZoneLoaded) zoneLoad.Revert();
+
+        // S301: filter must end OFF after any stop/leave, via exactly one owner: the deferred restore poll
+        // (OnHomeRestoreComplete → Disable once settled) OR an inline disable here. Skip inline ONLY when
+        // the poll is armed and will own it. Idempotent (IsActive-gated), safe from any entry path.
+        if (packetFilter.IsActive && !zoneLoad.HomeRestoreArmed && !zoneLoad.ReturnUnsafe)
+        {
+            packetFilter.Disable();
+            ClearReturnGuard();
+            if (!silent) chat.Print("[HavenNative] Packet filter OFF.");
+        }
+        else if (zoneLoad.ReturnUnsafe)
+        {
+            toast.ShowError("Haven could not confirm your real position. Please close the game.");
+            chat.PrintError("[Haven] Haven could not determine your real position, so your movement stays hidden from the server. Please close the game: you will log back in where you started.");
+        }
+
+        _ = relay.Disconnect();
+
+        if (!silent)
+        {
+            ui.SetStatus("Disconnected");
+            chat.Print("[HavenNative] Left session.");
+        }
+    }
+
+    // /havenengine stop - slash-command ONLY (never wired to the GUI), so it's always a deliberate keystroke. For the HOST
+    // this now TERMINATES the session for EVERYONE: it emits the SessionEnd control frame (every peer receives it and
+    // runs DoLeaveInternal → "Host ended the session"), then tears down locally. For a non-host (or solo) it's just a
+    // leave - same as the GUI button and /havenengine leave. The GUI's leave/stop button stays DoLeave (you leave, session
+    // lives on; if you were host, relay auto-transfers to the next peer). This gives the host a deliberate, explicit
+    // "end it for all" lever that a stray button-tap can't trigger.
+    private void DoStop()
+    {
+        if (!relay.IsSessionActive) { chat.Print("[HavenNative] Not in a session."); return; }
+        if (relay.IsConnected && relay.IsHost)
+        {
+            chat.Print("[HavenNative] Ending the session for everyone…");
+            // Send SessionEnd and let it flush BEFORE local teardown - DoLeaveInternal calls Disconnect(), which
+            // closes the socket, so a fire-and-forget SessionEnd could be dropped before peers receive it. Chain the
+            // teardown onto the send's completion (back on the main thread). Bounded: SendSessionEnd is best-effort.
+            _ = System.Threading.Tasks.Task.WhenAny(relay.SendSessionEnd(), System.Threading.Tasks.Task.Delay(2000))
+                .ContinueWith(_ => RunOnMainThread(() => DoLeaveInternal(silent: false)));
+            return;
+        }
+        DoLeaveInternal(silent: false);   // non-host / solo → plain leave (same as the GUI button and /havenengine leave)
+    }
+
+    // Movement modes (fly / noclip / carpet) may only be ENABLED with a zone loaded (except in debug) - flying or
+    // noclipping on an un-loaded real map is the open anti-cheat exposure. Disabling is always allowed. Gated at the
+    // command layer so both the /havenengine commands and the UI pills (which route through it) hit the same gate.
+    // v0.7.262: movement (fly/noclip/carpet) is gated on an ACTIVE SESSION or debug - the packet filter that a session
+    // brings up is what makes movement safe; a merely-loaded zone outside a session is real-server exposure. Previously
+    // this was IsZoneLoaded||debug, and because each button re-implemented its own check, the carpet button added in the
+    // redesign inherited the weaker zone-loaded gate. Now there's ONE capability gate and every button routes through it.
+    private bool MovementEnableAllowed() => relay.IsSessionActive || config.ShowDebugCommands;
+
+    // v0.7.445: fly / noclip / carpet are all movement affordances that, on the LIVE real zone, amount
+    // to a teleport-to-target cheat (start any session - solo, host, or joined - and before loading a
+    // map you're standing on the real world; toggling movement then stopping lands you at the targeted
+    // position; carpet is the same, just slower). So all three gate together on whether HMS has actually
+    // loaded an environment. IsZoneLoaded is true for a loaded map AND for a cutscene swap stage (both
+    // go through the LoadZone path - a cutscene is an HMS environment via a donor territory), so
+    // cutscenes get movement freely, exactly like a loaded map. When NOT on an HMS environment (i.e. the
+    // live zone), movement is allowed only under the second-tier research mode (/havenengine debug, itself only
+    // reachable with the Config debug checkbox on) - so leaving the checkbox on isn't enough to stumble
+    // onto a movement cheat. Replaces the old "in a session OR debug checkbox" gate, which leaked because
+    // any session (including solo) satisfied it while still on the live map.
+    private bool MovementResearchAllowed() => zoneLoad.IsZoneLoaded || zoneLoad.ResearchMode;
+
+    private void DoToggleFly()
+    {
+        // v0.7.445: allowed on an HMS-loaded environment (map or cutscene) or under research mode -
+        // never on the bare live zone. Mirrors MovementResearchAllowed so command, button, and inner
+        // toggle all agree.
+        if (!MovementResearchAllowed())
+        {
+            chat.Print("[HavenNative] Flight is only available on a loaded map or cutscene.");
+            return;
+        }
+        noclip.ToggleFlight();
+        chat.Print("[HavenNative] Flight " + (noclip.FlightActive ? "ON - jump to fly" : "OFF"));
+    }
+
+    private void DoToggleNoclip()
+    {
+        // v0.7.445: allowed on an HMS-loaded environment (map or cutscene) or under research mode.
+        if (!MovementResearchAllowed())
+        {
+            chat.Print("[HavenNative] Noclip is only available on a loaded map or cutscene.");
+            return;
+        }
+        noclip.ToggleNoclip();
+        if (noclip.NoclipActive)
+            chat.Print("[HavenNative] Noclip ON.");
+        else
+            chat.Print("[HavenNative] Noclip OFF");
+    }
+
+    // /havenengine pktcap [opcodes] - toggle inbound-packet capture. With no arg, toggles logging ALL inbound packets (firehose;
+    // use in an inn). With a comma-list (e.g. "103,356"), logs ONLY those opcodes. Logs (opcode, timestamp, payload hex)
+    // to the plugin log; packets are still dropped (behavior unchanged). Lets us learn what specific opcodes carry.
+    // /havenengine senddiag - toggle the OUTBOUND opcode diagnostic. Logs every outbound opcode + pass/suppress. Reveals the
+    // /say outbound opcode (ChatHandler?) and confirms whether the sender's chat is being dropped before it leaves.
+    // /havenengine sayfind <text> - the content-correlation say-opcode finder. The standalone command is retired (S328ad), but
+    // this method is KEPT because the Config-tab re-learn auto-capture calls it (RelearnSayOpcodes → DoSayFind("RELEARN")).
+    // /havenengine saydiag - toggle the chat diagnostic. Logs every chat message's kind/sender/text via IChatGui (the display
+    // layer), to learn where /say actually arrives and whether the firewall drops it. (S328h: repointed from the wrong
+    // HandleSocialPacket hook - that's the friends-list handler, not chat.)
+    // S328ab: map-reveal investigation. Logs the AgentMap current/selected view + the MapDiscoveryManager persistent
+    // discovery state for the current map. Run it (a) standing in a real, visited zone, and (b) inside a synthetic HMS
+    // session on an unvisited map - compare. This reveals whether the big-map "blank+blinking" gate reads the TRANSIENT
+    // agent fields (safe to drive) or the PERSISTENT discovery bitmap (contamination risk - must never write). No writes.
+    // S328ag: relay bandwidth diagnostic. Shows live in/out rates, session totals, and the per-message-type
+    // breakdown so we can see whether transforms dominate (they will). Sub: "/havenengine netdiag reset" zeroes the counters
+    // to start a clean measurement window. (The old "dirty on|off" A/B toggle was removed at release hardening -
+    // change-detection is always on now.)
+    private void DoNetDiag(string? arg)
+    {
+        var a = (arg ?? "").Trim().ToLowerInvariant();
+        if (a == "reset") { netStats.Reset(); chat.Print("[HavenNative] Net stats reset - measurement window restarted."); return; }
+
+        var (outBps, inBps) = netStats.LiveRates();
+        var el = netStats.Elapsed.TotalSeconds;
+        double avgOut = el > 0 ? netStats.TotalBytesOut / el : 0;
+        double avgIn = el > 0 ? netStats.TotalBytesIn / el : 0;
+        chat.Print("[HavenNative] === Net diag ===");
+        chat.Print(string.Format("[HavenNative] LIVE:  out {0:F1} KB/s ({1:F0} kbps) | in {2:F1} KB/s ({3:F0} kbps)",
+            outBps / 1024, outBps * 8 / 1000, inBps / 1024, inBps * 8 / 1000));
+        chat.Print(string.Format("[HavenNative] AVG:   out {0:F1} KB/s | in {1:F1} KB/s  over {2:F0}s",
+            avgOut / 1024, avgIn / 1024, el));
+        chat.Print(string.Format("[HavenNative] TOTAL: out {0:F2} MB ({1} msgs) | in {2:F2} MB ({3} msgs)",
+            netStats.TotalBytesOut / 1048576.0, netStats.TotalMsgsOut, netStats.TotalBytesIn / 1048576.0, netStats.TotalMsgsIn));
+        // Per-type outbound breakdown (which channel dominates).
+        foreach (var kvp in netStats.BytesOutByType)
+        {
+            netStats.MsgsOutByType.TryGetValue(kvp.Key, out var mc);
+            double avgMsg = mc > 0 ? (double)kvp.Value / mc : 0;
+            chat.Print(string.Format("[HavenNative]   {0}: {1:F2} MB, {2} msgs, {3:F0} B/msg", kvp.Key, kvp.Value / 1048576.0, mc, avgMsg));
+        }
+    }
+
+    private unsafe void DoMapDiag()
+    {
+        try
+        {
+            var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMap.Instance();
+            if (agent == null) { chat.Print("[HavenNative] [MAPDIAG] AgentMap null."); return; }
+            log.Information("[HavenNative] [MAPDIAG] === AgentMap ===");
+            log.Information("[HavenNative] [MAPDIAG] CurrentTerritoryId=" + agent->CurrentTerritoryId
+                + " CurrentMapId=" + agent->CurrentMapId
+                + " CurrentMapDiscoveryFlag=0x" + agent->CurrentMapDiscoveryFlag.ToString("X"));
+            log.Information("[HavenNative] [MAPDIAG] SelectedTerritoryId=" + agent->SelectedTerritoryId
+                + " SelectedMapId=" + agent->SelectedMapId
+                + " SelectedMapDiscoveryFlag=0x" + agent->SelectedMapDiscoveryFlag.ToString("X"));
+
+            var disc = FFXIVClientStructs.FFXIV.Client.Game.MapDiscoveryManager.Instance();
+            if (disc == null) { chat.Print("[HavenNative] [MAPDIAG] MapDiscoveryManager null (see log for AgentMap)."); return; }
+            uint mapId = agent->CurrentMapId;
+            log.Information("[HavenNative] [MAPDIAG] === MapDiscoveryManager (map " + mapId + ") ===");
+            log.Information("[HavenNative] [MAPDIAG] IsDiscoveryEnabledForMap(" + mapId + ")=" + disc->IsDiscoveryEnabledForMap(mapId));
+            // Probe the first several region indices - the persistent per-region reveal bits. All-false on an unvisited
+            // map; some-true once explored. If the HUD shows the map while these stay false, the gate is TRANSIENT (safe).
+            var sb = new System.Text.StringBuilder("[HavenNative] [MAPDIAG] IsMapRegionDiscovered region0..15: ");
+            for (byte r = 0; r < 16; r++) sb.Append(disc->IsMapRegionDiscovered(mapId, r) ? '1' : '0');
+            log.Information(sb.ToString());
+
+            // v0.7.447: also dump the RAW discovery-table bytes for this map, resolved by DiscoveryIndex +
+            // DiscoveryArrayByte from the Map sheet. This confirms our indexing before any write: the raw
+            // bytes should agree with IsMapRegionDiscovered above (1 where discovered). Layout (from CS):
+            //   16-region table: base + 0x000, stride 0x10, DiscoveryIndex-indexed, 16 bytes of bool
+            //   32-region table: base + 0xA20, stride 0x20, DiscoveryIndex-indexed, 32 bytes of bool
+            var dr = ResolveDiscoveryTable(mapId, out var tablePtr, out int regionCount, out int discoveryIndex, out bool use16);
+            if (dr == DiscResolve.Ok)
+            {
+                var raw = new System.Text.StringBuilder();
+                for (int i = 0; i < regionCount; i++) raw.Append(((byte*)tablePtr)[i] != 0 ? '1' : '0');
+                log.Information("[HavenNative] [MAPDIAG] RAW table (DiscoveryIndex=" + discoveryIndex + " use16=" + use16
+                    + " regions=" + regionCount + " @0x" + ((nint)tablePtr).ToString("X") + "): " + raw);
+            }
+            else
+            {
+                log.Information("[HavenNative] [MAPDIAG] RAW table: " + DescribeDiscResolve(dr, discoveryIndex, use16) + ".");
+            }
+            chat.Print("[HavenNative] [MAPDIAG] logged AgentMap + discovery state for map " + mapId + ". See the log. Run in a real zone AND in a private session to compare.");
+        }
+        catch (Exception ex)
+        {
+            log.Error("[HavenNative] [MAPDIAG] failed: " + ex);
+            chat.Print("[HavenNative] [MAPDIAG] error - see log.");
+        }
+    }
+
+    // Result of ResolveDiscoveryTable. Was a bool, which collapsed five distinct exits into one caller message
+    // ("DiscoveryIndex -1") - misleading when the real cause is a STALE BUILD (the game's discovery array grew
+    // past our measured bound after a patch). IndexOutOfRange is the case worth naming: reveal would otherwise
+    // write nowhere and the fog would silently stay. See DescribeDiscResolve + HMapSync's docs/mapdiscovery-remeasure.md.
+    private enum DiscResolve
+    {
+        Ok,              // resolved: tablePtr / regionCount / discoveryIndex / use16 are valid
+        ManagerNull,     // MapDiscoveryManager isn't live yet
+        SheetNull,       // the Map sheet is unavailable
+        RowMissing,      // mapId isn't in the Map sheet
+        NoTable,         // DiscoveryIndex == -1: this map legitimately has no fog table
+        IndexOutOfRange, // DiscoveryIndex >= this build's measured array bound: STALE BUILD, re-measure
+    }
+
+    // MapDiscoveryManager array bounds, MEASURED from ffxiv_dx11.exe (recipe: HMapSync's docs/mapdiscovery-remeasure.md).
+    // These are NOT taken from FFXIVClientStructs: as of 7.55 CS still declares Size 0x1024 / FixedSizeArray48,
+    // stale for the current game. Ground truth is the disassembly of MapDiscoveryManager.IsRegionDiscovered.
+    //   _mapsWithUpTo16Regions @0x000, stride 0x10, each = 16 bool
+    //   _mapsWithUpTo32Regions @0xA20, stride 0x20, each = 32 bool
+    private const int Disc16Base = 0x000;
+    private const int Disc16Stride = 0x10;
+    private const int Disc16Count = 162;    // 0xA2 (mov eax, imm32) in 7.55; the Map sheet's max 16-region DiscoveryIndex is 159
+    private const int Disc32Base = 0xA20;   // 0x51 * 0x20
+    private const int Disc32Stride = 0x20;
+    private const int Disc32Count = 49;     // 0x31 (cmp dx, imm8) in 7.55; was 48 - The North Horn (map 1346) uses DiscoveryIndex 48, the 49th slot
+
+    // v0.7.447: resolve the raw discovery-table pointer + region count for a map, from the Map sheet's
+    // DiscoveryIndex (which row in the table) and DiscoveryArrayByte (16- vs 32-region table). Raw byte access
+    // (not the generated FixedSizeArray accessor) per the "prefer offset reads for unproven bindings" rule - the
+    // offsets are measured and stable. Returns a DiscResolve describing success or the specific failure class.
+    private unsafe DiscResolve ResolveDiscoveryTable(uint mapId, out void* tablePtr, out int regionCount, out int discoveryIndex, out bool use16)
+    {
+        tablePtr = null; regionCount = 0; discoveryIndex = -1; use16 = true;
+        var disc = FFXIVClientStructs.FFXIV.Client.Game.MapDiscoveryManager.Instance();
+        if (disc == null) return DiscResolve.ManagerNull;
+        var mapSheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+        if (mapSheet == null) return DiscResolve.SheetNull;
+        var row = mapSheet.GetRowOrDefault(mapId);
+        if (row == null) return DiscResolve.RowMissing;
+        discoveryIndex = row.Value.DiscoveryIndex;
+        if (discoveryIndex < 0) return DiscResolve.NoTable;   // map legitimately has no discovery table
+        use16 = row.Value.DiscoveryArrayByte;
+        byte* baseP = (byte*)disc;
+        if (use16)
+        {
+            if (discoveryIndex >= Disc16Count) return DiscResolve.IndexOutOfRange;
+            tablePtr = baseP + Disc16Base + (discoveryIndex * Disc16Stride);
+            regionCount = 16;
+        }
+        else
+        {
+            if (discoveryIndex >= Disc32Count) return DiscResolve.IndexOutOfRange;
+            tablePtr = baseP + Disc32Base + (discoveryIndex * Disc32Stride);
+            regionCount = 32;
+        }
+        return DiscResolve.Ok;
+    }
+
+    // Human-readable reason for a non-Ok ResolveDiscoveryTable result, for a log/chat line. IndexOutOfRange is the
+    // load-bearing one: it means a game patch grew the discovery array past this build's measured bound, so a
+    // reveal write would land nowhere and the fog would silently persist - we say so and point at the fix.
+    private static string DescribeDiscResolve(DiscResolve r, int discoveryIndex, bool use16)
+    {
+        switch (r)
+        {
+            case DiscResolve.ManagerNull: return "the map-discovery manager isn't live yet";
+            case DiscResolve.SheetNull:   return "the Map sheet is unavailable";
+            case DiscResolve.RowMissing:  return "the map isn't in the Map sheet";
+            case DiscResolve.NoTable:     return "it has no discovery table (DiscoveryIndex -1)";
+            case DiscResolve.IndexOutOfRange:
+                return "it uses DiscoveryIndex " + discoveryIndex + ", but this build measured the "
+                    + (use16 ? "16" : "32") + "-region array as holding only " + (use16 ? Disc16Count : Disc32Count)
+                    + " entries - this build is stale for the current game version; re-measure MapDiscoveryManager";
+            default: return "resolved";
+        }
+    }
+
+    // v0.7.447: snapshot of the current map's discovery table, captured by DoMapReveal so DoMapRestore
+    // (and, later, an automatic sanitise-on-exit) can write it back byte-for-byte. Null = nothing captured.
+    private byte[]? mapRevealSnapshot;
+    private uint mapRevealSnapshotMapId;
+
+    // v0.7.447: STEP-2 TEST. Snapshot the current map's raw discovery table, then set every region byte to
+    // 1 (discovered) and log before/after. You then eyeball whether the HUD map reveals. Undo with
+    // /havenengine maprestore. Research-mode gated (writes memory). The persistence question (does this survive a
+    // relog?) is answered by NOT restoring and relogging - see the test plan.
+    private unsafe void DoMapReveal()
+    {
+        if (!zoneLoad.ResearchMode)
+        {
+            chat.Print("[HavenNative] /havenengine mapreveal is not available.");
+            return;
+        }
+        try
+        {
+            var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMap.Instance();
+            if (agent == null) { chat.Print("[HavenNative] [MAPREVEAL] AgentMap null."); return; }
+            uint mapId = agent->CurrentMapId;
+            var dr = ResolveDiscoveryTable(mapId, out var tablePtr, out int regionCount, out int discoveryIndex, out bool use16);
+            if (dr != DiscResolve.Ok)
+            {
+                chat.Print("[HavenNative] [MAPREVEAL] map " + mapId + " not revealed: " + DescribeDiscResolve(dr, discoveryIndex, use16) + ".");
+                return;
+            }
+            // Snapshot BEFORE writing.
+            var snap = new byte[regionCount];
+            for (int i = 0; i < regionCount; i++) snap[i] = ((byte*)tablePtr)[i];
+            mapRevealSnapshot = snap;
+            mapRevealSnapshotMapId = mapId;
+
+            var before = new System.Text.StringBuilder();
+            for (int i = 0; i < regionCount; i++) before.Append(snap[i] != 0 ? '1' : '0');
+
+            // Reveal: set every region byte to 1.
+            for (int i = 0; i < regionCount; i++) ((byte*)tablePtr)[i] = 1;
+
+            var after = new System.Text.StringBuilder();
+            for (int i = 0; i < regionCount; i++) after.Append(((byte*)tablePtr)[i] != 0 ? '1' : '0');
+
+            // v0.7.479: post-write confirmation. We wrote through a pointer computed from measured constants; this asks
+            // the GAME (via its own mapId->slot resolution) whether a region we just set now reads as discovered. It
+            // prevents nothing and gates nothing - if the base offset ever drifts, reveal would write to the wrong slot
+            // and the fog would simply stay with no error, and this line is the difference between "wrong address" and
+            // "render didn't refresh" without an investigation.
+            // v0.7.480: probe region 1, not region 0. DiscoveryFlag bit 0 is clear on every one of the 501 discovery
+            // maps in the 7.55 sheet - region numbering starts at 1 (North Horn 0x1FFFFFFE, South Horn 0x7FFFFFFE), so
+            // slot 0 is dead space no map owns. It only reads back today because the write loop above is unconditional;
+            // if that ever masks to DiscoveryFlag, a region-0 probe would cry "UNDISCOVERED" on every successful reveal.
+            // Bit 1 is the lowest set region on every discovery map, so it is always written and always a valid slot.
+            const byte probeRegion = 1;
+            bool agrees = false;
+            try { var d = FFXIVClientStructs.FFXIV.Client.Game.MapDiscoveryManager.Instance(); if (d != null) agrees = d->IsMapRegionDiscovered(mapId, probeRegion); } catch { }
+            log.Information("[HavenNative] [MAPREVEAL] game reads region " + probeRegion + " as "
+                + (agrees ? "discovered - address confirmed" : "UNDISCOVERED - our address may not be the game's slot"));
+
+            log.Information("[HavenNative] [MAPREVEAL] map=" + mapId + " DiscoveryIndex=" + discoveryIndex + " use16=" + use16
+                + " regions=" + regionCount + " @0x" + ((nint)tablePtr).ToString("X"));
+            log.Information("[HavenNative] [MAPREVEAL] before: " + before);
+            log.Information("[HavenNative] [MAPREVEAL] after:  " + after);
+            chat.Print("[HavenNative] [MAPREVEAL] set " + regionCount + " regions on map " + mapId
+                + ". Check the HUD map. /havenengine maprestore to undo. (Snapshot saved.)");
+        }
+        catch (Exception ex)
+        {
+            log.Error("[HavenNative] [MAPREVEAL] failed: " + ex);
+            chat.Print("[HavenNative] [MAPREVEAL] error - see log.");
+        }
+    }
+
+    // v0.7.447: STEP-2 TEST. Write the snapshot captured by DoMapReveal back to the same map's table,
+    // restoring the original fog state. Confirms the reveal→restore round trip is clean before we wire
+    // any automatic sanitise-on-exit.
+    private unsafe void DoMapRestore()
+    {
+        if (mapRevealSnapshot == null)
+        {
+            chat.Print("[HavenNative] [MAPRESTORE] no snapshot - run /havenengine mapreveal first.");
+            return;
+        }
+        try
+        {
+            if (ResolveDiscoveryTable(mapRevealSnapshotMapId, out var tablePtr, out int regionCount, out _, out _) != DiscResolve.Ok)
+            {
+                chat.Print("[HavenNative] [MAPRESTORE] could not resolve the table for the snapshotted map " + mapRevealSnapshotMapId + ".");
+                return;
+            }
+            int n = Math.Min(regionCount, mapRevealSnapshot.Length);
+            for (int i = 0; i < n; i++) ((byte*)tablePtr)[i] = mapRevealSnapshot[i];
+
+            var restored = new System.Text.StringBuilder();
+            for (int i = 0; i < regionCount; i++) restored.Append(((byte*)tablePtr)[i] != 0 ? '1' : '0');
+            log.Information("[HavenNative] [MAPRESTORE] map=" + mapRevealSnapshotMapId + " restored: " + restored);
+            chat.Print("[HavenNative] [MAPRESTORE] restored " + n + " regions on map " + mapRevealSnapshotMapId + ". Check the HUD map re-fogged.");
+            mapRevealSnapshot = null;
+        }
+        catch (Exception ex)
+        {
+            log.Error("[HavenNative] [MAPRESTORE] failed: " + ex);
+            chat.Print("[HavenNative] [MAPRESTORE] error - see log.");
+        }
+    }
+
+    // ============================================================================================
+    // v0.7.448: AUTOMATIC MAP REVEAL (session-scoped, with crash recovery).
+    //
+    // On an HMS map load we reveal that map's HUD fog, recording its ORIGINAL discovery bytes first.
+    // On session end (DoLeaveInternal - the stop/leave/crash-cleanup chokepoint) we write those originals
+    // back, so nothing artificial persists past the session. Because a hard game CRASH bypasses that
+    // chokepoint, the same original bytes are mirrored to a small JSON file on each reveal; on the next
+    // plugin load we replay any pending restores (deferred until MapDiscoveryManager is live), cleaning up
+    // a crashed session's leaked reveals.
+    //
+    // SAFETY: we snapshot-before-reveal and restore-to-SNAPSHOT, never restore-to-zero. A map the player
+    // genuinely explored either is never revealed by us (so untouched) or, if revealed, its snapshot
+    // already holds the real bits - so restore preserves genuine progress. First-snapshot-wins: re-revealing
+    // a map already recorded this session does NOT overwrite its original snapshot with revealed bytes.
+    // ============================================================================================
+
+    // ── Return guard ─────────────────────────────────────────────────────────────────────────────────────────────
+    // Haven is a sandbox: the server must only ever see the pre-visit position. The origin is persisted on entry and
+    // removed once the actor is held there with the filter released. If this plugin is unloaded mid-visit and a new
+    // instance loads in the same game process, it re-enables the filter and completes the return before releasing.
+    // A different process means the game restarted, so the server's own (pre-visit) position is authoritative.
+    private string ReturnGuardPath => System.IO.Path.Combine(pluginInterface.ConfigDirectory.FullName, Haven.Core.ReturnGuard.FileName);
+    private static (int Id, long StartTicks) CurrentProcess()
+    {
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        return (process.Id, process.StartTime.ToUniversalTime().Ticks);
+    }
+    private void SaveReturnGuard(uint zone, System.Numerics.Vector3 position, float rotation)
+    {
+        try
+        {
+            var (id, start) = CurrentProcess();
+            Haven.Core.ReturnGuard.Save(ReturnGuardPath, Haven.Core.ReturnGuard.Create(zone, position, rotation, id, start));
+        }
+        catch (Exception ex) { log.Error("[HavenNative] [RETURN-GUARD] could not save the origin: " + ex.Message); }
+    }
+    private void MarkReturnGuardUnloaded()
+    {
+        try
+        {
+            if (Haven.Core.ReturnGuard.Load(ReturnGuardPath) is {} guard)
+                Haven.Core.ReturnGuard.Save(ReturnGuardPath, guard with { UnloadedAt = DateTimeOffset.UtcNow });
+        }
+        catch (Exception ex) { log.Error("[HavenNative] [RETURN-GUARD] could not mark the unload: " + ex.Message); }
+    }
+    private void ClearReturnGuard()
+    {
+        try { Haven.Core.ReturnGuard.Clear(ReturnGuardPath); }
+        catch (Exception ex) { log.Warning("[HavenNative] [RETURN-GUARD] could not clear the origin: " + ex.Message); }
+    }
+    private void RecoverInterruptedReturn()
+    {
+        Haven.Core.ReturnGuard? guard;
+        try { guard = Haven.Core.ReturnGuard.Load(ReturnGuardPath); }
+        catch (Exception ex) { log.Error("[HavenNative] [RETURN-GUARD] unreadable record discarded: " + ex.Message); ClearReturnGuard(); return; }
+        if (guard == null) return;
+        var (id, start) = CurrentProcess();
+        if (!guard.Recoverable(id, start, DateTimeOffset.UtcNow))
+        {
+            log.Information("[HavenNative] [RETURN-GUARD] record is from another game session or an earlier unload; the server position stands. Discarded.");
+            ClearReturnGuard(); return;
+        }
+        if (!packetFilter.CanEnable)
+        {
+            log.Error("[HavenNative] [RETURN-GUARD] cannot re-arm the packet filter; origin kept for the next attempt.");
+            chat.PrintError("[Haven] Haven was reloaded during a visit and could not finish returning you safely. Please close the game: you will log back in where you started.");
+            return;
+        }
+        packetFilter.Enable();
+        log.Warning("[HavenNative] [RETURN-GUARD] Haven was unloaded during a visit; filter re-armed, returning to zone " + guard.Zone + ".");
+        chat.Print("[Haven] Finishing your return from the last visit. Please wait a moment before moving.");
+        zoneLoad.ArmRecovery(guard.Zone, guard.Position, guard.Rotation);
+    }
+
+    private readonly Dictionary<uint, byte[]> revealSnapshots = new();   // mapId -> original bytes, this session
+    private string MapRevealPendingPath => System.IO.Path.Combine(pluginInterface.ConfigDirectory.FullName, "map-reveal-pending.json");
+
+    // Reveal the given map (default: the current map), recording its original bytes first. Idempotent per
+    // map per session. Persists the pending record to disk so a crash can be recovered on next load.
+    private unsafe void AutoRevealMap(uint mapId)
+    {
+        try
+        {
+            if (mapId == 0) return;
+            var dr = ResolveDiscoveryTable(mapId, out var tablePtr, out int regionCount, out int discoveryIndex, out bool use16);
+            if (dr != DiscResolve.Ok)
+            {
+                // The stale-build case (the game's discovery array outgrew our measured bound) is the one worth
+                // shouting about: auto-reveal would otherwise fail silently and the fog would just stay. Everything
+                // else (no table / manager not live yet) is an ordinary "nothing to do".
+                if (dr == DiscResolve.IndexOutOfRange)
+                    log.Warning("[HavenNative] [MAPREVEAL] auto-reveal SKIPPED for map " + mapId + ": " + DescribeDiscResolve(dr, discoveryIndex, use16));
+                return;
+            }
+
+            // First-snapshot-wins: only record the original if we haven't already touched this map.
+            if (!revealSnapshots.ContainsKey(mapId))
+            {
+                var snap = new byte[regionCount];
+                bool anyUnrevealed = false;
+                for (int i = 0; i < regionCount; i++) { snap[i] = ((byte*)tablePtr)[i]; if (snap[i] == 0) anyUnrevealed = true; }
+                // If the map is already fully discovered, there's nothing to reveal and nothing to clean up
+                // later - skip recording it so we don't carry no-op entries (and never risk a needless write).
+                if (!anyUnrevealed) return;
+                revealSnapshots[mapId] = snap;
+                PersistPendingReveals();
+            }
+
+            // Reveal: set every region byte to 1.
+            for (int i = 0; i < regionCount; i++) ((byte*)tablePtr)[i] = 1;
+            if (zoneLoad.ResearchMode) log.Information("[HavenNative] [MAPREVEAL] auto-revealed map " + mapId + " (" + regionCount + " regions).");
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] auto-reveal failed for map " + mapId + ": " + ex.Message); }
+    }
+
+    // Session-end sanitise: restore every revealed map to its recorded original bytes, clear the record,
+    // and delete the disk file. Called from DoLeaveInternal (stop/leave). Safe to call with nothing pending.
+    private unsafe void SanitiseRevealedMaps()
+    {
+        if (revealSnapshots.Count == 0) { DeletePendingFile(); return; }
+        int restored = 0;
+        foreach (var kv in revealSnapshots)
+        {
+            try
+            {
+                if (ResolveDiscoveryTable(kv.Key, out var tablePtr, out int regionCount, out _, out _) != DiscResolve.Ok) continue;
+                int n = Math.Min(regionCount, kv.Value.Length);
+                for (int i = 0; i < n; i++) ((byte*)tablePtr)[i] = kv.Value[i];
+                restored++;
+            }
+            catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] sanitise failed for map " + kv.Key + ": " + ex.Message); }
+        }
+        if (zoneLoad.ResearchMode) log.Information("[HavenNative] [MAPREVEAL] sanitised " + restored + " revealed map(s) on session end.");
+        revealSnapshots.Clear();
+        DeletePendingFile();
+    }
+
+    // Write the current pending records to disk (map id -> original bytes, base64). Overwrites. Called on
+    // each new reveal so a crash always has an up-to-date record to recover from.
+    private void PersistPendingReveals()
+    {
+        try
+        {
+            var payload = new Dictionary<string, string>();
+            foreach (var kv in revealSnapshots)
+                payload[kv.Key.ToString()] = Convert.ToBase64String(kv.Value);
+            var json = System.Text.Json.JsonSerializer.Serialize(payload);
+            System.IO.File.WriteAllText(MapRevealPendingPath, json);
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] failed to persist pending reveals: " + ex.Message); }
+    }
+
+    private void DeletePendingFile()
+    {
+        try { if (System.IO.File.Exists(MapRevealPendingPath)) System.IO.File.Delete(MapRevealPendingPath); }
+        catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] failed to delete pending file: " + ex.Message); }
+    }
+
+    // Crash recovery: if a pending file exists at load, a prior session crashed with reveals still applied.
+    // Read it and restore each recorded map to its original bytes, then delete the file. DEFERRED until the
+    // discovery manager is live (a load-time write could race the save load or hit an uninitialised struct),
+    // via a short framework poll. No-op if the file is absent.
+    private void ArmRevealCrashRecovery()
+    {
+        try
+        {
+            if (!System.IO.File.Exists(MapRevealPendingPath)) return;
+        }
+        catch { return; }
+
+        int ticks = 0;
+        void Poll(IFramework fw)
+        {
+            ticks++;
+            bool done = false;
+            try
+            {
+                unsafe
+                {
+                    var disc = FFXIVClientStructs.FFXIV.Client.Game.MapDiscoveryManager.Instance();
+                    if (disc != null)
+                    {
+                        RecoverPendingReveals();
+                        done = true;
+                    }
+                }
+            }
+            catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] crash-recovery poll error: " + ex.Message); done = true; }
+
+            if (done || ticks > 600)   // give up after ~10s; the file stays for the next attempt if we never settled
+            {
+                framework.Update -= Poll;
+                if (!done) log.Warning("[HavenNative] [MAPREVEAL] crash-recovery timed out waiting for the discovery manager.");
+            }
+        }
+        framework.Update += Poll;
+    }
+
+    private unsafe void RecoverPendingReveals()
+    {
+        int restored = 0;
+        try
+        {
+            var json = System.IO.File.ReadAllText(MapRevealPendingPath);
+            var payload = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+            if (payload != null)
+            {
+                foreach (var kv in payload)
+                {
+                    if (!uint.TryParse(kv.Key, out var mapId)) continue;
+                    byte[] orig;
+                    try { orig = Convert.FromBase64String(kv.Value); } catch { continue; }
+                    if (ResolveDiscoveryTable(mapId, out var tablePtr, out int regionCount, out _, out _) != DiscResolve.Ok) continue;
+                    int n = Math.Min(regionCount, orig.Length);
+                    for (int i = 0; i < n; i++) ((byte*)tablePtr)[i] = orig[i];
+                    restored++;
+                }
+            }
+            log.Information("[HavenNative] [MAPREVEAL] crash recovery: restored " + restored + " map(s) from a prior session.");
+        }
+        catch (Exception ex) { log.Warning("[HavenNative] [MAPREVEAL] crash recovery read failed: " + ex.Message); }
+        DeletePendingFile();
+    }
+
+    private void DoPktCap(string? arg)
+    {
+        if (packetFilter.CaptureInbound)
+        {
+            packetFilter.CaptureInbound = false;
+            packetFilter.CaptureOpcodes = null;
+            packetFilter.DisableCaptureOnly();
+            chat.Print("[HavenNative] Packet capture OFF.");
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(arg))
+        {
+            var set = new HashSet<ushort>();
+            foreach (var part in arg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                if (ushort.TryParse(part, out var op)) set.Add(op);
+            packetFilter.CaptureOpcodes = set.Count > 0 ? set : null;
+            chat.Print("[HavenNative] Packet capture ON (opcodes: " + (set.Count > 0 ? string.Join(",", set) : "ALL") + "). Check the log.");
+        }
+        else
+        {
+            packetFilter.CaptureOpcodes = null;
+            chat.Print("[HavenNative] Packet capture ON (ALL inbound - firehose; use in an inn). Check the log.");
+        }
+        packetFilter.CaptureInbound = true;
+        packetFilter.EnableCaptureOnly();   // enable the receive hook for capture if the full filter isn't already running
+    }
+
+    private void DoStatus()
+    {
+        chat.Print("[HavenNative] === Status ===");
+        chat.Print("[HavenNative] Connected: " + relay.IsConnected);
+        chat.Print("[HavenNative] Room: " + (relay.RoomId.Length > 0 ? relay.RoomId : "none"));
+        chat.Print("[HavenNative] Host: " + relay.IsHost);
+        chat.Print("[HavenNative] Packet filter: " + (packetFilter.IsActive ? "ON" : "OFF"));
+        chat.Print("[HavenNative] Noclip: " + (noclip.IsActive ? "ON" : "OFF"));
+        // NB-37: name/id-tag a loaded cutscene by ITS stage (Doma castle finale / e3e4), not the donor territory it swapped
+        // into — uniform with the Zone: header and the "Loading …" notice. Plain zone loads keep territory name + id.
+        string statusZone;
+        if (!zoneLoad.IsZoneLoaded) statusZone = "none";
+        else if (zoneLoad.ActiveStageBg != null)
+            statusZone = (cutscene.GetStageName(zoneLoad.ActiveStageBg) ?? zoneLoad.GetZoneName(zoneLoad.CurrentLoadedZone))
+                + " (" + StageTagFromBg(zoneLoad.ActiveStageBg) + ")";
+        else
+            statusZone = zoneLoad.GetZoneName(zoneLoad.CurrentLoadedZone) + " (" + zoneLoad.CurrentLoadedZone + ")";
+        chat.Print("[HavenNative] Zone: " + statusZone);
+        chat.Print("[HavenNative] Peers: " + stateApply.Peers.Count);
+    }
+
+    // S205: print the local player's exact world position (entity space) + territory ID. The in-game
+    // ── S326m: spawn management (UI-facing) ──────────────────────────────────────────────────────────────────────
+    // Read the local player's live position + facing as a compact string (for the Room-options "Here" button). Uses
+    // the same authoritative native GameObject.Position as /havenengine here. Returns null if no player.
+    private unsafe string? ReadHereCoords()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return null;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var p = go->Position;
+        return "X " + p.X.ToString("F1") + "   Y " + p.Y.ToString("F1") + "   Z " + p.Z.ToString("F1") +
+               "   (facing " + player.Rotation.ToString("F2") + ")";
+    }
+
+    // Raw live player position for the teleport fields (same native GameObject.Position as /havenengine here). Null if none.
+    private unsafe System.Numerics.Vector3? ReadLivePosition()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return null;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var p = go->Position;
+        return new System.Numerics.Vector3(p.X, p.Y, p.Z);
+    }
+
+    // Teleport the local player to an XYZ target (the Show-coordinates Teleport button). Same SetPosition write the
+    // spawn/noclip paths use; only invoked from a loaded-zone context (the UI gates it there).
+    private unsafe void DoTeleport(System.Numerics.Vector3 pos)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        go->SetPosition(pos.X, pos.Y, pos.Z);          // immediate...
+        teleportHoldTarget = pos; teleportHoldFrames = 12;   // ...and hold, so the engine doesn't re-ground/revert it
+    }
+
+    // Teleport the local player N units along their current facing (the "Teleport forward" button). Reads the live
+    // rotation (yaw, radians) and current position, then offsets along the FFXIV forward vector (sin(r), 0, cos(r)) -
+    // r=0 faces +Z (south), the game's convention. Y (elevation) is preserved, so this slides along the ground plane.
+    // Reuses DoTeleport's SetPosition + hold so the engine doesn't re-ground/revert the jump.
+    private unsafe void DoTeleportForward(float units)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var p = go->Position;
+        float r = player.Rotation;
+        var target = new System.Numerics.Vector3(
+            p.X + (float)System.Math.Sin(r) * units,
+            p.Y,
+            p.Z + (float)System.Math.Cos(r) * units);
+        DoTeleport(target);
+    }
+
+    private unsafe void ApplyTeleportHold()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { teleportHoldFrames = 0; return; }
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var t = teleportHoldTarget!.Value;
+        go->SetPosition(t.X, t.Y, t.Z);
+    }
+
+    // Capture the local player's current position as the user spawn for a territory (persisted). Territory 0 = the
+    // currently-loaded zone. Returns true if captured.
+    private unsafe bool CaptureSpawn(uint territoryId)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { chat.Print("[HavenNative] Capture spawn: no local player."); return false; }
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var p = go->Position;
+
+        // v0.7.227: if we're standing in a SWAP cutscene stage, key the capture by its bg path (unique) - NOT by the
+        // donor territoryId, which is shared across co-donor stages and would leak this spawn to all of them (the bug).
+        var stageBg = zoneLoad.ActiveStageBg;
+        if (stageBg != null)
+        {
+            config.UserStageSpawns[stageBg] = new[] { p.X, p.Y, p.Z, player.Rotation };
+            config.Save();
+            chat.Print("[HavenNative] Spawn captured for stage " + stageBg + " at X=" + p.X.ToString("F1") +
+                " Y=" + p.Y.ToString("F1") + " Z=" + p.Z.ToString("F1") + ".");
+            return true;
+        }
+
+        if (territoryId == 0) territoryId = zoneLoad.IsZoneLoaded ? zoneLoad.CurrentLoadedZone : 0;
+        if (territoryId == 0) { chat.Print("[HavenNative] Capture spawn: no territory (load a map or select one)."); return false; }
+        config.UserSpawns[territoryId] = new[] { p.X, p.Y, p.Z, player.Rotation };
+        config.Save();
+        chat.Print("[HavenNative] Spawn captured for territory " + territoryId + " at X=" + p.X.ToString("F1") +
+            " Y=" + p.Y.ToString("F1") + " Z=" + p.Z.ToString("F1") + ".");
+        return true;
+    }
+
+    // Clear the user spawn for a territory (revert to curated/LGB resolution). Territory 0 = currently-loaded.
+    private void RevertSpawn(uint territoryId)
+    {
+        // v0.7.227: swap-stage capture clears by bg (parallels CaptureSpawn's bg keying).
+        var stageBg = zoneLoad.ActiveStageBg;
+        if (stageBg != null)
+        {
+            if (config.UserStageSpawns.Remove(stageBg))
+            {
+                config.Save();
+                chat.Print("[HavenNative] Spawn override cleared for stage " + stageBg + " (using curated/default spawn).");
+            }
+            else chat.Print("[HavenNative] No spawn override to clear for this stage.");
+            return;
+        }
+        if (territoryId == 0) territoryId = zoneLoad.IsZoneLoaded ? zoneLoad.CurrentLoadedZone : 0;
+        if (territoryId != 0 && config.UserSpawns.Remove(territoryId))
+        {
+            config.Save();
+            chat.Print("[HavenNative] Spawn override cleared for territory " + territoryId + " (using default spawn).");
+        }
+        else chat.Print("[HavenNative] No spawn override to clear for that territory.");
+    }
+
+    // map only shows XY display coords; spawns need the full XYZ vector for SetPosition. Use this to
+    // capture verified spawn points (stand where you want the spawn, /havenengine here, record the vector).
+    private unsafe void DoPrintHere()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { chat.Print("[HavenNative] /havenengine here: no local player."); return; }
+        var terr = zoneLoad.IsZoneLoaded ? zoneLoad.CurrentLoadedZone : 0;
+
+        // Read THREE sources to diagnose the (0,0,0) wrapper result:
+        //  - Dalamud wrapper (player.Position) - what /havenengine here used before; can read stale/zero
+        //  - native GameObject.Position @0xB0 - the authoritative live position
+        //  - native GameObject.DefaultPosition @0x10 - the game's assigned spawn for this territory
+        var wrap = player.Position;
+        var go = (FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address;
+        var nat = go->Position;
+        var def = go->DefaultPosition;
+
+        chat.Print("[HavenNative] === here ===");
+        chat.Print("[HavenNative] Territory: " + terr +
+            (terr != 0 ? " (" + zoneLoad.GetZoneName(terr) + ")" : ""));
+        chat.Print("[HavenNative] Native Pos:   X=" + nat.X.ToString("F4") +
+            " Y=" + nat.Y.ToString("F4") + " Z=" + nat.Z.ToString("F4"));
+        chat.Print("[HavenNative] DefaultPos:   X=" + def.X.ToString("F4") +
+            " Y=" + def.Y.ToString("F4") + " Z=" + def.Z.ToString("F4"));
+        chat.Print("[HavenNative] Wrapper Pos:  X=" + wrap.X.ToString("F4") +
+            " Y=" + wrap.Y.ToString("F4") + " Z=" + wrap.Z.ToString("F4"));
+        chat.Print("[HavenNative] Facing (yaw): " + player.Rotation.ToString("F4"));
+        log.Information("[HavenNative] /havenengine here - terr=" + terr +
+            " NATIVE X=" + nat.X.ToString("R") + " Y=" + nat.Y.ToString("R") + " Z=" + nat.Z.ToString("R") +
+            " | DEFAULT X=" + def.X.ToString("R") + " Y=" + def.Y.ToString("R") + " Z=" + def.Z.ToString("R") +
+            " | WRAPPER X=" + wrap.X.ToString("R") + " Y=" + wrap.Y.ToString("R") + " Z=" + wrap.Z.ToString("R"));
+    }
+
+    // ── Cosmetic toggles (client-side, bypass packet filter) ──
+
+    private unsafe void DoToggleDisplayArms()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+
+        // S248: when Glamourer is authoritative, flip from ITS current state (so the click always
+        // matches the badge - no HMS-tracked bool to desync). WeaponState is VISIBILITY (true=shown).
+        if (glamourer.Available && glamourer.TryGetMeta(0, out var curWpnVis, out _, out _))
+        {
+            glamourer.SetMeta(0, MetaFlag.WeaponState, !curWpnVis);
+            weaponHidden = curWpnVis; // keep the fallback bool in step for if Glamourer drops later
+            chat.Print("[HavenNative] Weapons " + (curWpnVis ? "hidden" : "shown") + " when sheathed.");
+        }
+        else
+        {
+            // Fallback: no Glamourer - flip OUR tracked intent and write DrawData.
+            weaponHidden = !weaponHidden;
+            character->DrawData.HideWeapons(weaponHidden);
+            chat.Print("[HavenNative] Weapons " + (weaponHidden ? "hidden" : "shown") + " when sheathed.");
+        }
+        glamourerBadgesDirty = true;
+    }
+
+    private unsafe void DoToggleDisplayHead()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+
+        // S248: flip from Glamourer's current state when authoritative (HatState = visibility).
+        if (glamourer.Available && glamourer.TryGetMeta(0, out _, out var curHatVis, out _))
+        {
+            glamourer.SetMeta(0, MetaFlag.HatState, !curHatVis);
+            headgearHidden = curHatVis;
+            chat.Print("[HavenNative] Headgear " + (curHatVis ? "hidden" : "shown") + ".");
+        }
+        else
+        {
+            // Fallback: method ONLY - HideHeadgear owns the bit; pre-setting no-ops the redraw (S245).
+            headgearHidden = !headgearHidden;
+            character->DrawData.HideHeadgear(0, headgearHidden);
+            chat.Print("[HavenNative] Headgear " + (headgearHidden ? "hidden" : "shown") + ".");
+        }
+        glamourerBadgesDirty = true;
+    }
+
+    // [FACECAMDUMP] byte-diff the LookAt region to see EXACTLY what /facecamera changes on the self-actor.
+    // First call: capture BEFORE. Toggle /facecamera on. Second call: capture AFTER + log every changed byte.
+    // Ends the guessing about which field/offset is the real switch. LookAt @ Character+0xD80, region 0xB80..0x1980.
+    private byte[]? faceCamDumpBefore;
+    private unsafe void DoFaceCamDump()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { chat.Print("[HavenNative] no player"); return; }
+        byte* baseP = (byte*)player.Address;
+        const int start = 0xB80, end = 0x1980;   // covers container header, controller, _params, CameraVector, flag
+        int len = end - start;
+        var snap = new byte[len];
+        for (int i = 0; i < len; i++) snap[i] = baseP[start + i];
+
+        if (faceCamDumpBefore == null)
+        {
+            faceCamDumpBefore = snap;
+            chat.Print("[HavenNative] facecamdump: BEFORE captured. Now toggle /facecamera ON, then run /havenengine facecamdump again.");
+            return;
+        }
+
+        // diff
+        int changes = 0;
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < len; i++)
+        {
+            if (faceCamDumpBefore[i] != snap[i])
+            {
+                changes++;
+                int off = start + i;
+                sb.Append("  char+0x" + off.ToString("X") + " (LookAt+0x" + (off - 0xD80).ToString("X") + "): " +
+                    faceCamDumpBefore[i].ToString("X2") + " -> " + snap[i].ToString("X2") + "\n");
+            }
+        }
+        log.Information("[HavenNative] [FACECAMDUMP] " + changes + " bytes changed:\n" + sb.ToString());
+        chat.Print("[HavenNative] facecamdump: " + changes + " changed bytes logged. (run again to reset BEFORE)");
+        faceCamDumpBefore = null;   // reset for next round
+    }
+
+    private unsafe void DoToggleVisor()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+
+        // S248: flip from Glamourer's current state when authoritative (VisorState = toggled sense).
+        if (glamourer.Available && glamourer.TryGetMeta(0, out _, out _, out var curVisor))
+        {
+            glamourer.SetMeta(0, MetaFlag.VisorState, !curVisor);
+            visorToggled = !curVisor;
+            chat.Print("[HavenNative] Visor " + (!curVisor ? "on" : "off") + ".");
+        }
+        else
+        {
+            // Fallback: native SetVisor + bit.
+            visorToggled = !visorToggled;
+            character->DrawData.SetVisor(visorToggled);
+            character->DrawData.IsVisorToggled = visorToggled;
+            chat.Print("[HavenNative] Visor " + (visorToggled ? "on" : "off") + ".");
+        }
+        glamourerBadgesDirty = true;
+    }
+
+    // /havenengine emote <id|name> - play an emote on the local player and sync it to peers.
+    //   • Usable now → AgentEmote.ExecuteEmote - the same agent the in-game emote menu drives, so it owns
+    //     the full lifecycle (stance, loop mode, movement-cancel) AND natively cancels whatever was already
+    //     playing. The resulting state is read by LocalStateDetector → the existing capture→
+    //     ApplyEmoteFromSheet pipeline syncs it. (S322a–e tried the lower-level EmoteManager.ExecuteEmote +
+    //     a manual mode-clear; the agent path is what finally makes emote→emote transitions clean.)
+    //   • Locked / gated (the RP point - unowned or item-gated emotes the agent won't play) → bypass by
+    //     driving the emote's ActionTimeline / mode directly (the SAME mechanism the peer side uses on
+    //     puppets), first cancelling any active loop so it doesn't dominate the forced animation.
+    // Either path is client-side only (no server roundtrip - correct, peers are in other instances).
+    // Validated against the Emote sheet first (a bad ID must never reach the game).
+    private unsafe void DoEmote(string? arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            chat.Print("[HavenNative] Usage: /havenengine emote <id|name|stop>  (e.g. /havenengine emote 21, /havenengine emote dance, /havenengine emote stop). Plays it on you (and syncs to peers in a session). Locked emotes only play inside a session.");
+            return;
+        }
+
+        // S322: stop/cancel the current emote → idle (and sync the stop to peers). Mirrors the mount Dismount
+        // and minion Dismiss. Checked before the sheet lookup so it never collides with an emote name.
+        var trimmed = arg.Trim();
+        if (trimmed.Equals("stop", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("cancel", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("off", StringComparison.OrdinalIgnoreCase))
+        {
+            StopEmoteSelf();
+            return;
+        }
+
+        var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+        if (sheet == null) { chat.Print("[HavenNative] Emote sheet unavailable."); return; }
+
+        var q = arg.Trim();
+        bool numeric = ushort.TryParse(q, out var parsed);
+        ushort emoteId = 0, introTl = 0, loopTl = 0;
+        string label = q;
+
+        // Resolve by ID or exact name, capturing the intro (AT[1]) + loop (AT[0]) timelines for the bypass.
+        foreach (var row in sheet)
+        {
+            if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+            bool match = numeric
+                ? row.RowId == parsed
+                : string.Equals(row.Name.ToString(), q, StringComparison.OrdinalIgnoreCase);
+            if (match)
+            {
+                emoteId = (ushort)row.RowId;
+                introTl = (ushort)row.ActionTimeline[1].RowId;
+                loopTl = (ushort)row.ActionTimeline[0].RowId;
+                if (!numeric) label = row.Name.ToString();
+                break;
+            }
+        }
+        if (emoteId == 0 && !numeric) // contains-fallback (e.g. "battle" → "Battle Stance")
+        {
+            foreach (var row in sheet)
+            {
+                if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+                var nm = row.Name.ToString();
+                if (!string.IsNullOrEmpty(nm) && nm.Contains(q, StringComparison.OrdinalIgnoreCase))
+                {
+                    emoteId = (ushort)row.RowId;
+                    introTl = (ushort)row.ActionTimeline[1].RowId;
+                    loopTl = (ushort)row.ActionTimeline[0].RowId;
+                    label = nm;
+                    break;
+                }
+            }
+        }
+        if (emoteId == 0)
+        { chat.Print("[HavenNative] No emote " + (numeric ? "with ID " + q : "matching \"" + q + "\"") + "."); return; }
+        if (numeric) label = "#" + emoteId;
+
+        // S322: locked emotes only play INSIDE a session, where peers actually see them. Outside one, forcing
+        // a locked emote would just fool the local player into thinking they'd unlocked it (HaselDebug-style
+        // gating). Unlocked emotes play normally anywhere. The Emotes tab greys locked rows out of session to
+        // match; this guard also covers the typed command.
+        if (!CanUseEmoteSafe(emoteId) && !relay.IsSessionActive)
+        {
+            chat.Print("[HavenNative] \"" + label + "\" isn't unlocked. Locked emotes only play inside an HMS session.");
+            return;
+        }
+
+        config.PushRecentEmote(emoteId);
+        PlayResolvedEmote(emoteId, introTl, loopTl, label);
+    }
+
+    // S322: does the local player have this emote unlocked? UI uses this (via the CanUseEmote hook) to grey
+    // locked rows; DoEmote uses it to gate forcing outside a session. Mirrors HaselDebug's CanUseEmote check.
+    private unsafe bool CanUseEmoteSafe(ushort emoteId)
+    {
+        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentEmote.Instance();
+        return agent != null && agent->CanUseEmote(emoteId);
+    }
+
+    // S322: cancel the current emote on the local player → idle, letting the change sync to peers. This is the
+    // breaker block from PlayResolvedEmote in isolation: clear the emote owner so the game stops re-stamping a
+    // loop, force Mode=Normal (the field the detector reads), release the base override. The detector then sees
+    // Normal + idle and broadcasts a standup (emoteId=0) so peers drop the emote too. Idempotent when already
+    // idle. Mirrors the mount line's Dismount and the minion Dismiss.
+    // ── v0.7.415: clear the local posture at session engage. QUIETLY. ─────────────────────────────
+    //
+    // v0.7.413/414 played the get-up timeline (644/655) to make the transition observable to the
+    // detector, so it would emit a StandupEpoch. That worked - the detector saw it - but it was the
+    // wrong shape twice over:
+    //   • it played a visible stand-up animation nobody asked for, and
+    //   • the receiver could not act on the standup anyway: its gate is
+    //         if (data.StandupTimelineId > 0 && info.EmoteActive)
+    //     and EmoteActive is set in exactly ONE place - when HMS itself applies an emote. A peer whose
+    //     puppet is seated because the player GENUINELY WAS seated has EmoteActive false, so the
+    //     standup is received, the epoch is consumed, and nothing happens.
+    //
+    // The real situation: A is not standing up. A is ALREADY STANDING - B just does not know, because
+    // B's puppet inherited a true seated state from before the session and HMS has no path to clear a
+    // pose it did not create. That is a RECEIVER problem, fixed at bind (see
+    // StateApplyService.ReconcileInheritedPose), so the sender does not need to perform anything.
+    //
+    // So this is now the minimum: drop the posture locally, no animation, no broadcast theatre.
+    // v0.7.419 - sanitise the local player's posture to standing/idle. Used at BOTH engage (clear
+    // origin posture before loading the synthetic zone) and exit (clear any posture acquired during
+    // the session before Revert). Covers both posture families:
+    //   • InPositionLoop (ConditionMode 11): Sit, Sit on Ground, Sleep, Stand Up - 15 rows
+    //   • EmoteLoop (ConditionMode 3): dances, cheers, /lean, persistent emotes - 97 rows
+    // Do NOT widen to "any non-Normal mode." Mounted, Crafting, Gathering have their own tested
+    // teardown paths (mount sanitise, noclip.Disable). The two loop families are the posture families.
+    //
+    // When force=true (post-settle), clear Mode/EmoteId/DrawOffset/BaseOverride UNCONDITIONALLY.
+    // The zone reload in Revert rebuilds the actor from the client's internal character cache, which
+    // may hold the PRE-SESSION state (seated) even though the entry sanitise cleared it - the entry
+    // sanitise wrote Mode=Normal onto the live object, but the cache was never updated. So after the
+    // reload, Mode can be InPositionLoop again even though the player was standing throughout the
+    // session. The post-settle call fires after the rebuild, on the settled actor, and must clear
+    // regardless of what the isPosture guard thinks.
+    // v0.7.449 - evictBaseLane: whether to stomp the base lane to idle (PlayTimeline(3)) to evict a
+    // lingering seated/emote pose clip. null = follow isPosture (the default: a real seated/emote posture
+    // needs the evict; a plain standing state does not). Callers pass false to force-clear mode/emote/
+    // draw-offset over a STANDING cpose without the idle stomp that would flicker folded-arms on exit.
+    private unsafe void SanitiseLocalPosture(string context, bool force = false, bool? evictBaseLane = null)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { log.Debug("[HavenNative] [POSE] " + context + ": no local player"); return; }
+        var ch = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+        if (ch == null) { log.Debug("[HavenNative] [POSE] " + context + ": null character"); return; }
+
+        var currentMode = ch->Mode;
+        var currentParam = ch->ModeParam;
+
+        bool isPosture = currentMode == CharacterModes.InPositionLoop
+                      || currentMode == CharacterModes.EmoteLoop;
+
+        if (!isPosture && !force)
+        {
+            log.Debug("[HavenNative] [POSE] " + context + ": no posture to clear (Mode=" + currentMode + "/" + currentParam + ")");
+            return;
+        }
+
+        ch->EmoteController.EmoteId = 0;
+        ch->SetMode(CharacterModes.Normal, 0);
+        ch->Timeline.BaseOverride = 0;
+        ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address)->SetDrawOffset(0f, 0f, 0f);
+
+        // v0.7.417 - CLEAR THE BASE LANE TOO, or we broadcast a seated emote one frame later.
+        //
+        // Clearing Mode is instant; the base-lane CLIP is not. TimelineIds[0] keeps holding 3132
+        // (emote/s_pose01_loop - the chair-sit POSE variant) for a frame or two. detector.Reset() has
+        // just baselined lastTimelineId to that same 3132, so on the next tick:
+        //   • timelineChanged is FALSE  -> the standup branch cannot fire, and
+        //   • the modeChanged branch finds 3132 in emoteTimelineIds (it belongs to emote 95) and
+        //     broadcasts emote 95. Its EmoteMode's ConditionMode is InPositionLoop, so the receiver
+        //     does SetMode(InPositionLoop) - a visible SIT-DOWN animation, and the puppet sticks.
+        // That is the "loads standing, then sits back down" symptom exactly.
+        //
+        // PlayTimeline(3) = normal/idle. Verified against the sheet: NO emote lists timeline 3 among
+        // its ActionTimelines, so it cannot be misread as an emote - the detector falls through to
+        // emoteId = 0. Base-lane eviction is correct here; we are deliberately dropping the pose, and
+        // idle is what the game settles on by itself a frame later anyway. No visible animation.
+        //
+        // v0.7.449 - but the eviction is only wanted when there's a SEATED/EMOTE clip to evict. When
+        // force-clearing on exit while the player is merely STANDING in a cpose (e.g. folded arms),
+        // PlayTimeline(3) pushes neutral idle for one cycle and the game's cpose reasserts folded-arms
+        // the next cycle - a one-cycle arms-drop flicker. A numeric timeline-id gate does NOT work: the
+        // standing cpose clips (idle_sp/*, ids 210…11271) and the seated emote-pose clips (emote/*_pose,
+        // ids 1065+) overlap in id space with no clean boundary. So the caller decides: evictBaseLane is
+        // passed true only when the posture being cleared is genuinely seated/emote (a real posture, or
+        // the forced exit case where the ORIGIN was seated), and false when force-clearing over a plain
+        // standing cpose. When not forced, isPosture already implies a real seated/emote posture, so the
+        // default follows isPosture.
+        if (evictBaseLane ?? isPosture)
+            ch->Timeline.TimelineSequencer.PlayTimeline(3);
+
+        log.Debug("[HavenNative] [POSE] " + context + ": cleared posture (was " + currentMode + "/" + currentParam +
+            (force ? ", forced" : "") + ")");
+    }
+
+    // v0.7.420 - SERVER-ACK + ORIGIN RESTORE. Two jobs in one:
+    // 1. Tell the server we left the origin posture (the filter prevented it hearing the standup).
+    // 2. Re-enter the origin posture so the player returns to exactly where they started.
+    //
+    // For InPositionLoop (sit/groundsit/sleep): two-step via AgentEmote.
+    //   Step 1: re-enter the posture client-side → execute emote 50 (/sit toggle) → from
+    //           InPositionLoop this is a standup → server clears InPositionLoop → both agree standing.
+    //   Step 2: re-execute the origin emote (50/52/88) → normal sit-down → server processes it →
+    //           both agree seated → player is back where they started.
+    // For EmoteLoop (lean/dance): server doesn't track these - just re-execute the origin emote.
+    private unsafe void ServerAckStandup()
+    {
+        try
+        {
+            var lp = objectTable.LocalPlayer;
+            if (lp == null) return;
+            var ch = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)lp.Address;
+            var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentEmote.Instance();
+            if (agent == null) return;
+
+            if (originMode == CharacterModes.InPositionLoop)
+            {
+                // Step 1: re-enter the posture the server thinks we're in, then toggle to standup.
+                ch->SetMode(originMode, originModeParam);
+                log.Debug("[HavenNative] [POSE] server-ack: re-entered " + originMode + "/" + originModeParam);
+
+                agent->ExecuteEmote(50, addToHistory: false);
+                log.Debug("[HavenNative] [POSE] server-ack: step 1 - standup (emote 50 toggle)");
+
+                // Step 2: re-execute the origin emote to restore the pose.
+                // Both sides now agree we're standing, so this is a normal sit-down.
+                if (originEmoteId > 0)
+                {
+                    agent->ExecuteEmote(originEmoteId, addToHistory: false);
+                    log.Debug("[HavenNative] [POSE] server-ack: step 2 - restore (emote " + originEmoteId + ")");
+                }
+            }
+            else if (originMode == CharacterModes.EmoteLoop)
+            {
+                // EmoteLoop (lean, dance) - server doesn't track these. Just re-execute.
+                if (originEmoteId > 0)
+                {
+                    agent->ExecuteEmote(originEmoteId, addToHistory: false);
+                    log.Debug("[HavenNative] [POSE] server-ack: restored EmoteLoop (emote " + originEmoteId + ")");
+                }
+                else
+                {
+                    ch->SetMode(CharacterModes.Normal, 0);
+                    log.Debug("[HavenNative] [POSE] server-ack: cleared EmoteLoop (no emote ID)");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Warning("[HavenNative] [POSE] server-ack failed: " + ex.Message);
+        }
+    }
+
+    private unsafe void StopEmoteSelf()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { chat.Print("[HavenNative] No local player."); return; }
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+
+        // Only cancel when an emote is actually running - a loop (EmoteLoop/InPositionLoop) or a persistent/
+        // one-shot with a live EmoteController.EmoteId. Without this guard, Stop would force Mode=Normal out of
+        // an unrelated mode (e.g. mounted) and glitch it. No emote ⇒ no-op.
+        bool emoteActive = character->Mode == CharacterModes.EmoteLoop
+            || character->Mode == CharacterModes.InPositionLoop
+            || character->EmoteController.EmoteId != 0;
+        if (!emoteActive)
+            return;
+
+        character->EmoteController.EmoteId = 0;
+        character->SetMode(CharacterModes.Normal, 0);
+        character->Mode = CharacterModes.Normal;
+        character->ModeParam = 0;
+        character->Timeline.BaseOverride = 0;
+    }
+
+    // S322: /havenengine minion <id|name> - summon a minion on yourself (synced to peers in a session). Mirror of
+    // DoEmote. Locked minions only summon INSIDE a session (otherwise it just fakes a local unlock); unlocked
+    // minions summon anywhere. "0" / "off" / "dismiss" clears it. The detector captures the summon + broadcasts.
+    private unsafe void DoMinion(string? arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            chat.Print("[HavenNative] Usage: /havenengine minion <id|name>  (e.g. /havenengine minion 52, /havenengine minion wind-up). Summons it on you (and syncs to peers in a session). 0 dismisses. Locked minions only summon inside a session.");
+            return;
+        }
+
+        var q = arg.Trim();
+        if (q == "0" || q.Equals("off", StringComparison.OrdinalIgnoreCase) || q.Equals("dismiss", StringComparison.OrdinalIgnoreCase))
+        {
+            stateApply.SummonMinionSelf(0);
+            return;
+        }
+
+        var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Companion>();
+        if (sheet == null) { chat.Print("[HavenNative] Companion sheet unavailable."); return; }
+
+        bool numeric = ushort.TryParse(q, out var parsed);
+        ushort minionId = 0;
+        string label = q;
+
+        foreach (var row in sheet)
+        {
+            if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+            bool match = numeric ? row.RowId == parsed
+                : string.Equals(row.Singular.ToString(), q, StringComparison.OrdinalIgnoreCase);
+            if (match) { minionId = (ushort)row.RowId; if (!numeric) label = row.Singular.ToString(); break; }
+        }
+        if (minionId == 0 && !numeric) // contains-fallback
+        {
+            foreach (var row in sheet)
+            {
+                if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+                var nm = row.Singular.ToString();
+                if (!string.IsNullOrEmpty(nm) && nm.Contains(q, StringComparison.OrdinalIgnoreCase))
+                { minionId = (ushort)row.RowId; label = nm; break; }
+            }
+        }
+        if (minionId == 0)
+        { chat.Print("[HavenNative] No minion " + (numeric ? "with ID " + q : "matching \"" + q + "\"") + "."); return; }
+        if (numeric) label = "#" + minionId;
+
+        if (!CanUseMinionSafe(minionId) && !relay.IsSessionActive)
+        {
+            chat.Print("[HavenNative] \"" + label + "\" isn't unlocked. Locked minions only summon inside an HMS session.");
+            return;
+        }
+
+        // S322: a repeated click/command on the already-summoned minion DISMISSES it (toggle). A DIFFERENT
+        // minion replaces the current one (SetupCompanion handles the swap). The live minion is read from the
+        // spawned companion object (CompanionData.CompanionId is not the live id).
+        if (CurrentMinionId() == minionId)
+        {
+            stateApply.SummonMinionSelf(0);
+            return;
+        }
+
+        if (stateApply.SummonMinionSelf((short)minionId))
+            config.PushRecentMinion(minionId);
+    }
+
+    // S322: the live summoned minion id (Companion sheet row), or 0 if none is out. Read from the spawned
+    // companion object's BaseId - the same field HaselDebug uses; CompanionData.CompanionId is not the live id.
+    private unsafe ushort CurrentMinionId()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return 0;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+        return character->CompanionData.CompanionObject != null
+            ? (ushort)character->CompanionData.CompanionObject->BaseId : (ushort)0;
+    }
+
+    // Haven: the minion window, hotbars and /minion all summon through UseAction. Inside a home the filter drops the
+    // request, so the server never announces the minion; set it up here as that announcement would. The detector then
+    // shares it with the gathering, and the exit sweep puts it away. Null lets the game send the request as usual.
+    private unsafe bool? UseMinionInHome(uint minionId)
+    {
+        bool inRange = minionId is > 0 and <= ushort.MaxValue;
+        var choice = Haven.Core.Minions.Decide(packetFilter.IsActive, minionId, CurrentMinionId(),
+            inRange && dataManager.GetExcelSheet<Lumina.Excel.Sheets.Companion>().HasRow(minionId),
+            inRange && CanUseMinionSafe((ushort)minionId));
+        switch (choice)
+        {
+            case Haven.Core.MinionSummon.PassThrough: return null;
+            case Haven.Core.MinionSummon.Summon: return stateApply.SummonMinionSelf((short)minionId);
+            case Haven.Core.MinionSummon.Dismiss: return stateApply.SummonMinionSelf(0);
+            default:
+                log.Warning($"[HavenNative] Minion {minionId} not summoned in the home: {choice}.");
+                return false;
+        }
+    }
+
+    // S322k: does the local player have this minion unlocked? UI uses this (via CanUseMinion) to grey locked
+    // rows; DoMinion uses it to gate forcing outside a session. UIState.IsCompanionUnlocked is the analog.
+    private unsafe bool CanUseMinionSafe(ushort minionId)
+    {
+        var ui = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
+        return ui != null && ui->IsCompanionUnlocked(minionId);
+    }
+
+    private unsafe bool CanUseMountSafe(ushort mountId)
+    {
+        var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
+        return ps != null && ps->IsMountUnlocked(mountId);
+    }
+
+    // S322k: /havenengine accessory <id|name> - equip + sync a fashion accessory (ornament). Direct mirror of DoMinion:
+    // numeric or name match against the Ornament sheet, repeated-same toggles off, locked ones gated to a
+    // session. Ornaments are skeletally attached so they ride the puppet natively once SetupOrnament seats them.
+    private unsafe void DoAccessory(string? arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            chat.Print("[HavenNative] Usage: /havenengine accessory <id|name>  (e.g. /havenengine accessory 3 for a parasol). Equips it on you (and syncs to peers in a session). 0 removes. Locked accessories only equip inside a session.");
+            return;
+        }
+
+        var q = arg.Trim();
+        if (q == "0" || q.Equals("off", StringComparison.OrdinalIgnoreCase) || q.Equals("remove", StringComparison.OrdinalIgnoreCase))
+        {
+            stateApply.SummonOrnamentSelf(0);
+            return;
+        }
+
+        var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Ornament>();
+        if (sheet == null) { chat.Print("[HavenNative] Ornament sheet unavailable."); return; }
+
+        bool numeric = ushort.TryParse(q, out var parsed);
+        ushort ornamentId = 0;
+        string label = q;
+
+        foreach (var row in sheet)
+        {
+            if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+            bool match = numeric ? row.RowId == parsed
+                : string.Equals(row.Singular.ToString(), q, StringComparison.OrdinalIgnoreCase);
+            if (match) { ornamentId = (ushort)row.RowId; if (!numeric) label = row.Singular.ToString(); break; }
+        }
+        if (ornamentId == 0 && !numeric) // contains-fallback
+        {
+            foreach (var row in sheet)
+            {
+                if (row.RowId == 0 || row.RowId > ushort.MaxValue) continue;
+                var nm = row.Singular.ToString();
+                if (!string.IsNullOrEmpty(nm) && nm.Contains(q, StringComparison.OrdinalIgnoreCase))
+                { ornamentId = (ushort)row.RowId; label = nm; break; }
+            }
+        }
+        if (ornamentId == 0)
+        { chat.Print("[HavenNative] No fashion accessory " + (numeric ? "with ID " + q : "matching \"" + q + "\"") + "."); return; }
+        if (numeric) label = "#" + ornamentId;
+
+        if (!CanUseOrnamentSafe(ornamentId) && !relay.IsSessionActive)
+        {
+            chat.Print("[HavenNative] \"" + label + "\" isn't unlocked. Locked accessories only equip inside an HMS session.");
+            return;
+        }
+
+        // Repeated command on the already-equipped ornament REMOVES it (toggle); a different one swaps. The live
+        // ornament is read from the spawned object (OrnamentData.OrnamentId reads 0, the CompanionId trap).
+        if (CurrentOrnamentId() == ornamentId)
+        {
+            stateApply.SummonOrnamentSelf(0);
+            return;
+        }
+
+        if (stateApply.SummonOrnamentSelf((short)ornamentId))
+            config.PushRecentOrnament(ornamentId);
+    }
+
+    // ── S326: map-state handlers (host-only). Each sets the persisted config, mirrors into the capture holder so the
+    // value rides the outbound stream (broadcast to peers), bumps the shared epoch (so peers apply once per change),
+    // applies locally on the host so the host sees it immediately, and saves. Peers apply on receipt (StateApplyService).
+    /// <param name="weatherOverride">The weather the host JUST picked, passed verbatim. See the note below on why
+    /// an explicit pick must not be read back from the engine.</param>
+    private void PushMapState(byte? weatherOverride = null, uint? donorOverride = null, bool? weatherForcedOverride = null)
+    {
+        // Mirror config → capture holder and bump the epoch. Called by every map* handler after it updates config.
+        // SINGLE-AUTHORITY WEATHER - v0.7.475: BROADCAST REALITY, NOT INTENT.
+        //
+        // History, because this reversed twice. Originally the host's raw pick went on the wire; the host's own
+        // Reassert legality-gated locally (falling back to native) while peers applied the raw id, so host and peer
+        // diverged - "peers stuck on none/atmospheric while the host sees sunny". v0.7.429 fixed that by resolving
+        // the wire value to a legal, non-zero id. That killed two real features, because it cannot tell
+        // `MapWeatherId == 0` = "host picked nothing" from `== 0` = "host explicitly picked None - Atmospheric",
+        // and it discards any id not in the map's legal set - which is precisely the debug-weather case (Fog on
+        // 1345, and the cinematic blank the invalid ones fall through to).
+        //
+        // The real defect was never the wire value: it was host and peer resolving INDEPENDENTLY. So resolve once,
+        // on the host, by reading what the engine is actually rendering (EnvManager displayed weather) and shipping
+        // that. Live weather is post-fallback truth - it is whatever the host can SEE:
+        //   • host never picked        → live = the map's native sky   → peers match the host
+        //   • host picked None (0)     → live = 0                      → peers render the same cinematic blank
+        //   • host picked Fog on 1345  → live = that id                → peers render the same stunning sky
+        //   • host picked a dud        → live = whatever it fell to    → peers fall to the same place
+        // In every case peers mirror the host because there is nothing left to re-derive. Same principle the BGM
+        // path already states: mirror VERBATIM, never resolve independently on both sides.
+        //
+        // ⚠ 0 IS NOW A LEGITIMATE WIRE VALUE. The old "peers must never receive 0" invariant is deleted, not
+        // relaxed - and the receiver's matching 0-substitution in ApplyMapState had to go with it. Changing one
+        // end alone is a no-op; that is why this looked like a wire bug and was a pair of independent guards.
+        // ⚠ v0.7.476 - REALITY LAGS THE WRITE. GetActiveWeather reads EnvManager+0x26, the DISPLAYED weather: the
+        // value the engine is rendering, which does not update until at least the next frame. So reading it
+        // immediately after ApplyWeather returns the PREVIOUS sky, and every pick reached peers one weather late -
+        // cycling the dropdown left peers permanently one behind, and a second click on the same entry "fixed" it
+        // only because by then the engine had caught up. Live-read is the right source for a SETTLED state and the
+        // wrong one for a state we just changed.
+        //
+        // So: an explicit pick is passed in and shipped VERBATIM (including 0 = None - Atmospheric, including any
+        // debug id) - we already know the intent, there is nothing to read back. Every other caller (map load,
+        // time, BGM, host succession) pushes state that has been settled for many frames, where the live read is
+        // both accurate and the thing that keeps host and peer from resolving independently.
+        // b183: day/night sky-graft donor. Explicit pick passed verbatim (a city sky-variant chip); else the stored donor.
+        // 0 = static weather (no graft), the default for every plain weather pick. Peers re-engage the SAME embedded graft.
+        // b184: resolve the donor BEFORE the weather — a live graft changes how "reality" must be read (see below).
+        uint effectiveDonor = donorOverride ?? config.MapWeatherDonor;
+        byte effectiveWeather;
+        if (weatherOverride.HasValue)
+        {
+            effectiveWeather = weatherOverride.Value;
+        }
+        else if (effectiveDonor != 0)
+        {
+            // b184 FIX — a day/night graft is active. The "broadcast reality" rule (read GetActiveWeather) is WRONG here:
+            // SetWeatherOrGraft's marching branch only LoadKeyframeSet+SetKfReplay — it NEVER writes the displayed weather
+            // byte (EnvManager+0x26), so GetActiveWeather() returns the NATIVE byte, not the crammed intent. On a
+            // non-override re-push (every host time-slider drag / freeze / unfreeze routes through SetHostTime→PushMapState()
+            // with no override), shipping that native byte made the peer re-apply SetWeatherOrGraft(nativeByte, donor);
+            // IsTimeMarching(nativeByte, donor) fails → StopKfGraft → the peer's sky freezes while the host keeps marching.
+            // For a graft the truth is the (weather, donor) INTENT, so broadcast the stored crammed id.
+            effectiveWeather = config.MapWeatherId;
+        }
+        else if (zoneLoad.IsZoneLoaded)
+        {
+            effectiveWeather = mapSettings.GetActiveWeather();
+        }
+        else
+        {
+            // No synthetic map loaded, so live weather is the open world's and irrelevant to peers. Fall back to
+            // the stored pick, resolved to the zone's native only when nothing is stored.
+            effectiveWeather = config.MapWeatherId;
+            if (effectiveWeather == 0)
+                effectiveWeather = mapSettings.GetDefaultWeather(zoneLoad.CurrentLoadedZone);
+        }
+        // NB-44: is this weather an EXPLICIT host pick (imposed on peers) or the zone's native baseline (peers keep their
+        // own natively-loaded sky)? The pick funnels (DoMapWeather/setweather) pass true; every other push (map load
+        // reassert, time/BGM/NPC changes) reads the sticky config flag, which is set true on a pick and reset false on
+        // each zone load. This is the whole "don't broadcast first weather on map load" fix — a load ships forced=false,
+        // so the peer resolves its OWN deterministic native weather instead of re-routing the host's byte (the 1010
+        // Magna Glacies desync: the peer grafted a marching city "Fair Skies" over the host's fixed dungeon one).
+        bool effectiveForced = weatherForcedOverride ?? config.MapWeatherForced;
+        stateCapture.MapState.WeatherId = effectiveWeather;
+        stateCapture.MapState.WeatherDonor = effectiveDonor;
+        stateCapture.MapState.WeatherForced = effectiveForced;
+        stateCapture.MapState.TimeForced = config.MapTimeForced;
+        stateCapture.MapState.EorzeaHour = config.MapEorzeaHour;
+        stateCapture.MapState.EorzeaMinute = config.MapEorzeaMinute;
+        // SINGLE-AUTHORITY BGM: broadcast the RESOLVED effective track, never 0. The host owns "what plays here" and the
+        // peer mirrors this concrete id VERBATIM (no peer-side GetDefaultBgm / live read - that independent resolution
+        // was the desync: host broadcast 0=follow-default, peer re-resolved and drifted). Explicit pick if set, else the
+        // loaded zone's resolved default (incl. CFC→InstanceContent for instanced zones).
+        uint effectiveBgm = config.MapBgmId != 0 ? config.MapBgmId : mapSettings.GetDefaultBgm(zoneLoad.CurrentLoadedZone);
+        stateCapture.MapState.BgmId = effectiveBgm;
+        stateCapture.MapState.RemoveNpcs = config.MapRemoveNpcs;
+        stateCapture.MapState.HideQuestSigns = config.MapHideQuestSigns;
+        // NB-20: broadcast the current map's granular hidden-DataId set (a fresh array snapshot; null when empty so the
+        // wire stays compact and older peers see nothing new). Peers apply it host-authoritatively via ApplyMapState.
+        stateCapture.MapState.HiddenNpcDataIds = config.MapHiddenNpcDataIds.Count > 0
+            ? System.Linq.Enumerable.ToArray(config.MapHiddenNpcDataIds) : null;
+        stateCapture.MapState.Epoch++;
+        // Keep the service's own copy in sync (used by Reassert after a load).
+        mapSettings.WeatherId = effectiveWeather;
+        mapSettings.WeatherDonor = effectiveDonor;
+        mapSettings.TimeForced = config.MapTimeForced;
+        mapSettings.EorzeaHour = config.MapEorzeaHour;
+        mapSettings.EorzeaMinute = config.MapEorzeaMinute;
+        mapSettings.BgmId = effectiveBgm;
+        mapSettings.RemoveNpcs = config.MapRemoveNpcs;
+        mapSettings.HideQuestSigns = config.MapHideQuestSigns;
+        mapSettings.MarkStateSet();
+        // S328aa: engage NPC cleanup live on the host when a map is loaded (peers get it via ApplyMapState).
+        if (MapApplyLive) DriveNpcVisibility(config.MapRemoveNpcs, config.MapHideQuestSigns, stateCapture.MapState.HiddenNpcDataIds);
+        config.Save();
+    }
+
+    // S327r: map settings apply LIVE when hosting AND a synthetic zone is loaded. (The old gate also required
+    // config.MapSettingsTerritory == the loaded zone - but that field belonged to the REMOVED "pick a territory in a
+    // dropdown to pre-configure it" model and is NEVER assigned, so it was permanently 0 → MapApplyLive permanently
+    // FALSE → the host's BGM/weather buttons never applied locally. Under the current "configure the map you're standing
+    // on, live" model there's no separate edit-target: the loaded map IS the edit target, so the check is just
+    // "hosting + zone loaded".)
+    private bool MapApplyLive => relay.HasMapAuthority && zoneLoad.IsZoneLoaded;
+
+    private void DoMapWeather(string? arg)
+    {
+        // Weather is a purely-local cinematic write (EnvManager for the zone you're standing in), so it needs neither a
+        // session nor a loaded synthetic map. OUT of a session with Debug mode on, treat it as a standalone local scene
+        // tweak: apply live but don't persist it as the saved map weather and don't broadcast (there are no peers).
+        bool localCinematic = !relay.IsSessionActive && config.ShowDebugCommands;
+        if (!relay.HasMapAuthority && !localCinematic) { chat.Print("[HavenNative] Only the host can set map weather."); return; }
+        // b183: optional second token = day/night sky-graft donor tt ("mapweather <id> <donor>"). Absent/0 = static weather
+        // (the plain manual case). The UI's city sky-variant chip passes the donor so the graft engages + broadcasts.
+        var toks = (arg ?? "").Trim().Split(new[] { ' ' }, System.StringSplitOptions.RemoveEmptyEntries);
+        if (toks.Length == 0 || !byte.TryParse(toks[0], out var wid))
+        { chat.Print("[HavenNative] Usage: /havenengine mapweather <id> [donor] (0 = None/atmospheric)."); return; }
+        uint donor = 0;
+        if (toks.Length > 1) uint.TryParse(toks[1], out donor);
+        if (localCinematic)
+        {
+            // Local-only: apply live via the crash-safe route, no config write, no PushMapState/ArmMapNudge (no peers).
+            mapSettings.SetWeatherOrGraft(wid, donor);
+            chat.Print("[HavenNative] Weather set to " + mapSettings.WeatherName(wid) + " (local).");
+            return;
+        }
+        config.MapWeatherId = wid;
+        config.MapWeatherDonor = donor;
+        config.MapWeatherForced = true;   // NB-44: this is an EXPLICIT host pick — peers must apply it (incl. an explicit None=0). Reset to false on the next zone load.
+        // v0.7.475: apply BEFORE PushMapState. PushMapState now broadcasts the LIVE sky, so pushing first would
+        // ship the PREVIOUS weather and every change would land on peers exactly one pick late. (The UI's Pick()
+        // already applied-then-broadcast; this path was the odd one out.)
+        // b183: route the live host apply through the donor-aware graft lever so the host sees the same day/night sky it ships.
+        if (MapApplyLive) mapSettings.SetWeatherOrGraft(wid, donor);   // apply live only in-session on a loaded map
+        PushMapState(wid, donor, weatherForcedOverride: true);   // verbatim: the pick is intent, not something to read back off a lagging engine field; NB-44 force it on peers
+        ArmMapNudge(wid, donor);    // NB-40: re-broadcast the pick a couple more times so a dropped/not-ready first emit still lands on peers
+        if (config.ShowDebugCommands) chat.Print("[HavenNative] Map weather set to " + mapSettings.WeatherName(wid) + (MapApplyLive ? "." : " (saved, applies on map load)."));
+    }
+
+    private void DoMapTime(string? arg)
+    {
+        // Local cinematic (Debug mode, no session): the time freeze is a purely-local Brio hook, so drive it on the real
+        // zone directly - no config persist, no epoch push (no peers). Mirrors DoMapWeather's localCinematic branch.
+        bool localCinematic = !relay.IsSessionActive && config.ShowDebugCommands;
+        if (!relay.HasMapAuthority && !localCinematic) { chat.Print("[HavenNative] Only the host can set map time."); return; }
+        var a = arg?.Trim() ?? "";
+        if (a.Equals("off", StringComparison.OrdinalIgnoreCase))
+        {
+            if (localCinematic) { mapSettings.DisableTimeOverride(); chat.Print("[HavenNative] Time hold off (local)."); return; }
+            config.MapTimeForced = false;
+            PushMapState();
+            if (config.ShowDebugCommands) chat.Print("[HavenNative] Map time hold off (time flows normally).");
+            return;
+        }
+        // Parse "H" or "H:M".
+        int hour, minute = 0;
+        var parts = a.Split(':');
+        if (parts.Length == 0 || !int.TryParse(parts[0], out hour))
+        { chat.Print("[HavenNative] Usage: /havenengine maptime <hour 0-23>[:minute] | off"); return; }
+        if (parts.Length > 1) int.TryParse(parts[1], out minute);
+        if (localCinematic)
+        {
+            ushort lh = (ushort)Math.Clamp(hour, 0, 23); byte lm = (byte)Math.Clamp(minute, 0, 59);
+            mapSettings.ApplyTime(lh, lm);
+            chat.Print("[HavenNative] Time → " + lh + ":" + lm.ToString("D2") + " (local, held).");
+            return;
+        }
+        config.MapTimeForced = true;
+        config.MapEorzeaHour = (ushort)Math.Clamp(hour, 0, 23);
+        config.MapEorzeaMinute = (byte)Math.Clamp(minute, 0, 59);
+        PushMapState();
+        if (MapApplyLive) mapSettings.ApplyTime(config.MapEorzeaHour, config.MapEorzeaMinute);   // live only in-session
+        chat.Print("[HavenNative] Map time → " + config.MapEorzeaHour + ":" + config.MapEorzeaMinute.ToString("D2") +
+            (MapApplyLive ? " (held)." : " (saved; applies on map load)."));
+    }
+
+    private void DoMapBgm(string? arg)
+    {
+        // Local cinematic (Debug mode, no session): BGM playback is a purely-local scene-0 write, so play/silence on the
+        // real zone directly - no config persist, no epoch push (no peers). Mirrors DoMapWeather's localCinematic branch.
+        bool localCinematic = !relay.IsSessionActive && config.ShowDebugCommands;
+        if (!relay.HasMapAuthority && !localCinematic) { chat.Print("[HavenNative] Only the host can set map BGM."); return; }
+        var a = arg?.Trim() ?? "";
+        // Support "stop" as an explicit silence + a numeric id.
+        if (a.Equals("stop", StringComparison.OrdinalIgnoreCase)) a = "0";
+        if (!uint.TryParse(a, out var bid)) { chat.Print("[HavenNative] Usage: /havenengine mapbgm <id> | stop  (0/stop = none)."); return; }
+        if (localCinematic)
+        {
+            if (bid == 0) mapSettings.StopBgm(); else mapSettings.PlayBgm(bid);
+            chat.Print("[HavenNative] BGM " + (bid == 0 ? "stopped" : "→ " + mapSettings.BgmName(bid)) + " (local).");
+            return;
+        }
+        config.MapBgmId = bid;
+        PushMapState();
+        if (MapApplyLive) mapSettings.PlayBgm(bid);   // real playback (scene-0 write) - in-session only
+        // No chat notification on BGM change - the Music tab shows the current track; per-change chat lines are noise.
+    }
+
+    // NB-20: the map these NPC-hide prefs belong to (the loaded virtual zone, 0 = none). Per-map persistence keys on it.
+    private uint NpcHideZone() => zoneLoad.IsZoneLoaded ? zoneLoad.CurrentLoadedZone : 0u;
+
+    private void DoMapNpc(string? arg)
+    {
+        if (!relay.HasMapAuthority) { chat.Print("[HavenNative] Only the host can set NPC removal."); return; }
+        var a = arg?.Trim() ?? "";
+        config.MapRemoveNpcs = a.Equals("on", StringComparison.OrdinalIgnoreCase);
+        var z = NpcHideZone(); if (z != 0) config.SaveNpcHideCache(z);   // record per-map (also Saves)
+        PushMapState();
+        if (config.ShowDebugCommands) chat.Print("[HavenNative] Remove NPCs " + (config.MapRemoveNpcs ? "on (event NPCs hidden, striking dummies kept)." : "off (NPCs restored).")
+            + (MapApplyLive ? "" : " (saved; applies on map load)."));
+    }
+
+    private void DoMapQuestSigns(string? arg)
+    {
+        if (!relay.HasMapAuthority) { chat.Print("[HavenNative] Only the host can set quest-sign hiding."); return; }
+        var a = arg?.Trim() ?? "";
+        config.MapHideQuestSigns = a.Equals("on", StringComparison.OrdinalIgnoreCase);
+        var z = NpcHideZone(); if (z != 0) config.SaveNpcHideCache(z);   // record per-map (also Saves)
+        PushMapState();
+        if (config.ShowDebugCommands) chat.Print("[HavenNative] Hide quest signs " + (config.MapHideQuestSigns ? "on (over-head quest markers hidden, NPCs kept)." : "off (quest markers restored).")
+            + (MapApplyLive ? "" : " (saved; applies on map load)."));
+    }
+
+    /// <summary>NB-20: host toggles one ENpc DataId in the current map's granular hidden set (add if absent, remove if
+    /// present). Persists per-map and re-broadcasts. Called from the dot-lens picker (via HideNpcDataId) and any command.</summary>
+    private void ToggleHiddenNpc(uint dataId)
+    {
+        if (!relay.HasMapAuthority || dataId == 0) return;
+        if (!config.MapHiddenNpcDataIds.Add(dataId)) config.MapHiddenNpcDataIds.Remove(dataId);
+        var z = NpcHideZone(); if (z != 0) config.SaveNpcHideCache(z);
+        PushMapState();
+    }
+
+    /// <summary>NB-20: is this ENpc DataId currently hidden on the loaded map? (dot-lens colouring.)</summary>
+    private bool IsNpcDataIdHidden(uint dataId) => config.MapHiddenNpcDataIds.Contains(dataId);
+
+    /// <summary>NB-20: clear ALL granular hides for the current map (leaves hide-all / hide-markers alone). "restore".</summary>
+    private void RestoreHiddenNpcs()
+    {
+        if (!relay.HasMapAuthority) return;
+        if (config.MapHiddenNpcDataIds.Count == 0) return;
+        config.MapHiddenNpcDataIds.Clear();
+        var z = NpcHideZone(); if (z != 0) config.SaveNpcHideCache(z);
+        PushMapState();
+    }
+
+    // ── S326f: session participants (Wholist-style) + host per-peer actions ──────────────────────────────────────
+    // Resolves each registered peer to its live PlayerObject for name/world/FC/distance. Runs per-frame from the UI;
+    // kept cheap (object-table lookups, no allocation beyond the list). Unresolved peers (not yet streamed in) show
+    // their last-known name with blank world/FC and distance -1.
+    private System.Collections.Generic.List<HavenNative.UI.HavenNativeUI.ParticipantRow> BuildParticipantList()
+    {
+        var rows = new System.Collections.Generic.List<HavenNative.UI.HavenNativeUI.ParticipantRow>();
+        var local = objectTable.LocalPlayer;
+
+        // Entry #1 is always the local player (the host, or yourself if you joined) - full designator, no actions on
+        // self. This replaces the old "just you so far" placeholder text with a real first row.
+        if (local != null)
+        {
+            var selfRow = new HavenNative.UI.HavenNativeUI.ParticipantRow
+            {
+                PeerId = "",                       // empty = self, UI shows no action buttons
+                Name = local.Name.TextValue,
+                World = WorldName(local.HomeWorld.RowId),
+                Fc = "",
+                Distance = 0f,
+                Resolved = true,
+                IsSelf = true,
+            };
+            unsafe
+            {
+                var lc = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)local.Address;
+                selfRow.Fc = lc->FreeCompanyTagString;
+            }
+            rows.Add(selfRow);
+        }
+
+        // Remote peers, in join order (stable per peer via JoinSequence).
+        var ordered = new System.Collections.Generic.List<PeerInfo>(stateApply.Peers.Values);
+        ordered.Sort((a, b) => a.JoinSequence.CompareTo(b.JoinSequence));
+        foreach (var info in ordered)
+        {
+            var row = new HavenNative.UI.HavenNativeUI.ParticipantRow
+            {
+                PeerId = info.PeerId,
+                Name = info.CharacterName,
+                World = "",
+                Fc = "",
+                Distance = -1f,
+                Resolved = false,
+                IsSelf = false,
+            };
+            if (info.ObjectIndex.HasValue)
+            {
+                var obj = objectTable[info.ObjectIndex.Value];
+                if (obj is Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter pc)
+                {
+                    row.Name = pc.Name.TextValue;
+                    row.World = WorldName(pc.HomeWorld.RowId);
+                    unsafe
+                    {
+                        var chara = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)pc.Address;
+                        row.Fc = chara->FreeCompanyTagString;
+                    }
+                    if (local != null)
+                        row.Distance = (local.Position - pc.Position).Length();
+                    // v0.7.430 - camera-relative bearing for the compass arrow (Wholist's formula,
+                    // DataStructures/PlayerInfoSlim.cs CameraRelativeDirection): the vector FROM the peer
+                    // TO the local player, atan2(Δz,Δx), rotated into screen space by the active camera's
+                    // horizontal angle + π. Camera-relative (not player-facing) so the arrow points the way
+                    // you'd turn the screen to look at them - the intuitive "which way is my friend" readout.
+                    // Works on synthetic maps because peer bodies carry real positions under the firewall.
+                    unsafe
+                    {
+                        try
+                        {
+                            var cam = FFXIVClientStructs.FFXIV.Client.Game.Control.CameraManager.Instance();
+                            var active = cam != null ? cam->GetActiveCamera() : null;
+                            if (active != null && local != null)
+                            {
+                                var d = local.Position - pc.Position;
+                                row.Bearing = Math.Atan2(d.Z, d.X) + active->DirH + Math.PI;
+                            }
+                        }
+                        catch { row.Bearing = null; }
+                    }
+                    row.Resolved = true;
+                }
+            }
+            rows.Add(row);
+        }
+
+        // Mark the host and pin them to #1. Host is self when we hold it; otherwise the transfer-tracked host, falling
+        // back to the earliest peer by join order (covers succession and fresh joins before any transfer is seen).
+        int hostIdx = -1;
+        if (relay.IsHost) hostIdx = rows.FindIndex(r => r.IsSelf);
+        else if (!string.IsNullOrEmpty(currentHostPeerId)) hostIdx = rows.FindIndex(r => r.PeerId == currentHostPeerId);
+        if (hostIdx < 0) hostIdx = rows.FindIndex(r => !r.IsSelf);
+        if (hostIdx >= 0)
+        {
+            var hr = rows[hostIdx]; hr.IsHost = true; rows[hostIdx] = hr;
+            if (hostIdx != 0) { rows.RemoveAt(hostIdx); rows.Insert(0, hr); }
+        }
+        return rows;
+    }
+
+    // World-name cache (RowId → name), built lazily from the World sheet.
+    private System.Collections.Generic.Dictionary<uint, string>? worldNames;
+    private string WorldName(uint worldRowId)
+    {
+        if (worldNames == null)
+        {
+            worldNames = new System.Collections.Generic.Dictionary<uint, string>();
+            try
+            {
+                var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.World>();
+                if (sheet != null)
+                    foreach (var w in sheet)
+                    {
+                        var n = w.Name.ToString();
+                        if (!string.IsNullOrWhiteSpace(n)) worldNames[w.RowId] = n;
+                    }
+            }
+            catch { /* fall through */ }
+        }
+        return worldNames.TryGetValue(worldRowId, out var name) ? name : "";
+    }
+
+    // Host summons a peer to their position. NOTE: requires a relay message the peer acts on (teleport-to-coords via
+    // the same SetPosition path). The relay wire for this is NOT yet implemented - this is a stub that reports the
+    // intent so the UI is present; the actual summon lands with the relay-side command. (§E session-management.)
+    private void DoSummonPeer(string peerId)
+    {
+        if (!relay.IsHost) { chat.Print("[HavenNative] Only the host can summon."); return; }
+        if (config.ShowDebugCommands)
+            chat.Print("[HavenNative] Summon requested (peer " + peerId + "). Relay summon message not yet implemented.");
+        // TODO(§E): relay.SendSummon(peerId, hostPosition); peer applies via SetPosition on receipt.
+    }
+
+    // Host removes + bans a peer. The relay drops their connection, bans the ContentId for the room's life, and
+    // broadcasts PeerLeft; the kicked client receives Error code 5 and tears down.
+    private void DoKickPeer(string peerId)
+    {
+        if (!relay.IsHost) { chat.Print("[HavenNative] Only the host can remove peers."); return; }
+        chat.Print("[HavenNative] Removing " + PeerName(peerId) + " from the room.");
+        _ = relay.SendKick(peerId);
+    }
+
+    private void DoRoomPassword(string? arg)
+    {
+        if (!relay.IsHost) { chat.Print("[HavenNative] Only the host can set a room password."); return; }
+        var pw = arg?.Trim() ?? "";
+        chat.Print("[HavenNative] Room password " + (pw.Length == 0 ? "cleared" : "set") +
+            " - enforcement needs relay support (not yet active).");
+        // TODO(§E): relay.SetRoomPassword(pw); server rejects joins without the matching password.
+    }
+
+    private void DoRoomLock(string? arg)
+    {
+        if (!relay.IsHost) { chat.Print("[HavenNative] Only the host can lock the room."); return; }
+        var on = (arg?.Trim() ?? "").Equals("on", StringComparison.OrdinalIgnoreCase);
+        chat.Print("[HavenNative] Room lock " + (on ? "ON" : "OFF") +
+            " - enforcement needs relay support (not yet active).");
+        // TODO(§E): relay.SetRoomLocked(on); server refuses new joiners while locked.
+    }
+
+    // Host hands the session to a specific peer. The relay reassigns the host role and broadcasts HostTransfer; we
+    // drop IsHost when that broadcast returns. (Explicit pick - distinct from leave-driven auto-succession.)
+    private void DoTransferHost(string peerId)
+    {
+        if (!relay.IsHost) { chat.Print("[HavenNative] Only the host can transfer host."); return; }
+        chat.Print("[HavenNative] Transferring host to " + PeerName(peerId) + ".");
+        _ = relay.SendHostTransfer(peerId);
+    }
+
+    // Teleport the local player to a lobby participant's live position. Purely local: it reuses DoTeleport (SetPosition
+    // + the 12-frame hold), no host authority and no relay traffic - so any member can jump to any other member. We read
+    // the peer's CURRENT rendered object position (not a stored/synthetic coord) so the landing spot is where the body
+    // actually is this frame. If the peer isn't bound to a live object yet, there's nothing to jump to - tell the user.
+    private void DoTeleportToPeer(string peerId)
+    {
+        // Gate identical to fly/noclip/carpet (MovementResearchAllowed = a loaded HMS map/cutscene OR research mode):
+        // teleporting to a peer is a legit convenience inside a loaded map (sandboxed behind the packet filter), but on
+        // the bare live server zone it's a real-server teleport cheat. Blocked there unless research mode is on - the
+        // /havenengine debug magic, itself reachable only with the Config debug checkbox. Authoritative re-check so the backend
+        // agrees with the UI gate even if a future caller bypasses the greyed menu item.
+        if (!MovementResearchAllowed())
+        {
+            chat.Print("[HavenNative] Teleport to a member is only available on a loaded map or cutscene.");
+            return;
+        }
+        if (!stateApply.Peers.TryGetValue(peerId, out var info) || info.ObjectIndex is not { } idx
+            || objectTable[idx] is not Dalamud.Game.ClientState.Objects.SubKinds.IPlayerCharacter pc)
+        {
+            chat.Print("[HavenNative] Can't teleport - " + PeerName(peerId) + " isn't visible right now.");
+            return;
+        }
+        DoTeleport(pc.Position);
+    }
+
+    // Resolve a relay PeerId to a display name for notifications/menus; falls back to the id if not yet resolved.
+    private string PeerName(string peerId)
+        => stateApply.Peers.TryGetValue(peerId, out var pi) && !string.IsNullOrEmpty(pi.CharacterName) ? pi.CharacterName : peerId;
+
+    // S322k: the live equipped ornament id (Ornament sheet row), or 0 if none. Read from the spawned object's
+    // OrnamentId - the container-side OrnamentData.OrnamentId reads 0, the same trap as CompanionData.CompanionId.
+    private unsafe ushort CurrentOrnamentId()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return 0;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+        // S323b: the LIVE worn ornament is the CONTAINER's OrnamentId (@0x18). While equipped, the ornament OBJECT's
+        // own OrnamentId reads 0 (the opposite of intuition) - matching LocalStateDetector's proven read.
+        return character->OrnamentData.OrnamentId;
+    }
+
+    // S326p: the local player's current mount id (0 = not mounted). MountContainer @Character 0x670, MountId @+0x18.
+    // Powers the dynamic Mount/Dismount button.
+    private unsafe ushort CurrentMountId()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return 0;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+        return character->Mount.MountId;
+    }
+
+    // S326p: is an emote/pose currently playing on the local player (for the dynamic Play/Stop button).
+    private unsafe bool IsEmotePlaying()
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return false;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+        return character->EmoteController.EmoteId != 0;
+    }
+
+    // S322k: does the local player have this ornament unlocked? Gates forcing outside a session.
+    // PlayerState.IsOrnamentUnlocked is the analog of UIState.IsCompanionUnlocked.
+    private unsafe bool CanUseOrnamentSafe(ushort ornamentId)
+    {
+        var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
+        return ps != null && ps->IsOrnamentUnlocked(ornamentId);
+    }
+
+    // Plays the emote on the local player. Three paths, picked by emote kind and current state:
+    //   1. Usable emote from a clean (non-looping) state → AgentEmote.ExecuteEmote, the in-game menu path -
+    //      owns the full lifecycle and natively interrupts a prior one-shot (/wave → /point).
+    //   2. Anything interrupting a LOOP, or a genuinely locked emote → break the old loop (the receiver's
+    //      move-cancel, which also forces Mode=Normal so the detector observes the change) then drive the new
+    //      emote directly via SetMode + PlayTimeline. The agent is NOT usable for (2): clearing the loop's
+    //      emote state the same frame makes its execute silently no-op. Both persistent and one-shot use
+    //      PlayTimeline (not PlayActionTimeline) so the id lands in TimelineIds[0] where the detector reads it.
+    // All client-side only; the resulting state is read by LocalStateDetector and synced through the normal
+    // capture → ApplyEmoteFromSheet pipeline.
+    // NB-40 wrapper: HMS's own emote play must judge on GENUINE ownership, exactly as prod does - but
+    // EmoteUnlockService hooks UIState.IsEmoteUnlocked / EmoteManager.CanExecuteEmote to lie "unlocked/usable" in
+    // session so the game's NATIVE emote path (/confirm etc.) fires locked emotes. Those hooks honour a SelfCall
+    // flag: while it's set they return the truth. Setting it across this whole method makes the spoof invisible
+    // to HMS's own branch selection (so `hms emote <locked>` keeps taking its proven force-play path) while
+    // leaving the spoof active for the game's own reads. One flag, no per-read plumbing.
+    private unsafe bool PlayResolvedEmote(ushort emoteId, ushort introTl, ushort loopTl, string label, bool forceLocal = false)
+    {
+        emoteUnlock.SelfCall = true;
+        bool played;
+        try { played = PlayResolvedEmoteCore(emoteId, introTl, loopTl, label, forceLocal); }
+        finally { emoteUnlock.SelfCall = false; }
+        if (played && relay.IsSessionActive) emoteLog?.LocalEmoted(emoteId);
+        return played;
+    }
+
+    // NB-40: force-play a GENUINELY-LOCKED emote by id through HMS's own client-force path. Called from
+    // EmoteUnlockService's executor redirect when a native trigger (/confirm, emote menu, hotbar) fires a locked
+    // emote in-session - the game's own executor would refuse it silently, so we resolve its timelines (exactly as
+    // DoEmote does: intro = ActionTimeline[1], loop = ActionTimeline[0]) and drive PlayResolvedEmote, which takes
+    // the proven direct-play branch for locked emotes. Returns true when it dispatched a play (the redirect then
+    // suppresses the engine's refusing executor). Runs on the framework thread (the executor detour does).
+    // PlayResolvedEmote sets SelfCall, so this never re-enters the redirect.
+    private unsafe bool TryForcePlayLockedEmote(ushort emoteId)
+    {
+        try
+        {
+            var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+            var row = sheet?.GetRowOrDefault(emoteId);
+            if (row == null) return false;
+            ushort introTl = (ushort)row.Value.ActionTimeline[1].RowId;
+            ushort loopTl = (ushort)row.Value.ActionTimeline[0].RowId;
+            string label = row.Value.Name.ToString();
+            if (string.IsNullOrEmpty(label)) label = "#" + emoteId;
+            config.PushRecentEmote(emoteId);
+            if (!PlayResolvedEmote(emoteId, introTl, loopTl, label, forceLocal: true))
+                chat.PrintError("[Haven] " + label + " has no usable animation in your current posture.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Error("[HavenNative] [EMOTE-REDIR] force-play failed for id=" + emoteId + ": " + ex.Message);
+            return false;
+        }
+    }
+
+    // Haven: the object the local player's emote aims at inside a home (see EmoteTargets).
+    private unsafe ulong? LocalEmoteTarget()
+    {
+        var self = objectTable.LocalPlayer;
+        if (self == null) return null;
+        var target = EmoteTargets.LocalTarget((FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)self.Address);
+        return target == null ? null : (ulong)target->GetGameObjectId();
+    }
+
+    // Haven: aims a native emote at the player's target inside a home (see EmoteTargets).
+    private unsafe void PrepareLocalEmote(nint option)
+    {
+        var self = objectTable.LocalPlayer;
+        if (self == null) return;
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)self.Address;
+        EmoteTargets.PrepareLocal(character, option);
+        // Diagnostic for emote effects that still land on yourself: what was aimed, and what the game left after.
+        log.Information("[EMOTE-TARGET] aimed {Target}", EmoteTargets.Describe(character, option));
+        var address = self.Address;
+        framework.RunOnTick(() =>
+        {
+            if (objectTable.LocalPlayer?.Address != address) return;
+            log.Information("[EMOTE-TARGET] after {Target}", EmoteTargets.Describe((FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)address, 0));
+        }, delayTicks: 10);
+    }
+
+    private unsafe bool PlayResolvedEmoteCore(ushort emoteId, ushort introTl, ushort loopTl, string label, bool forceLocal)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) { chat.Print("[HavenNative] No local player."); return false; }
+        var character = (FFXIVClientStructs.FFXIV.Client.Game.Character.Character*)player.Address;
+
+        if (introTl == 0 && loopTl == 0) return false;
+        if (relay.IsSessionActive) EmoteTargets.PrepareLocal(character);
+        if (forceLocal) log.Debug("[Haven] Local locked emote request: id={Id}, timeline={Timeline}, mode={Mode}", emoteId, loopTl, character->Mode);
+
+        // Is a looped emote currently running that this new emote has to interrupt? Decided up front because
+        // it changes BOTH whether we break the old loop and how we play the new emote.
+        //
+        // v0.7.388 - POSTURES ARE NOT LOOPS TO BREAK. This used to include InPositionLoop, which is the mode
+        // the game uses for SITTING, GROUND-SITTING and SLEEPING (EmoteMode.ConditionMode = 11: Sit, Sit on
+        // Ground, Sleep, Stand Up - 15 rows). Treating a posture as an interruptible loop sent every emote
+        // played while seated down the breaker branch, and the breaker forces Mode=Normal - which STANDS THE
+        // CHARACTER UP before playing the standing variant. That is why `/havenengine emote airquotes` stood you up
+        // while the native `/airquotes` correctly played the seated version.
+        //
+        // Only ConditionMode = 3 (EmoteLoop - the 97 dances/cheers/persistent emotes) is a genuine loop that
+        // the agent cannot interrupt and that therefore needs the breaker. A posture must be PRESERVED: the
+        // game plays the emote's seated variant over it and returns to the pose afterwards, which is exactly
+        // what AgentEmote.ExecuteEmote does natively. Ruleset §5.2 - drive the engine's own path rather than
+        // reconstructing the presentation.
+        //
+        // (This also fixes the posture-variant problem generally: the agent picks the right
+        // ActionTimeline slot for the current posture - ground-sit [2], chair-sit [3], upper-body [4] -
+        // whereas the direct-play branch below only ever knows about slot 0/1.)
+        bool interruptingLoop = character->Mode == CharacterModes.EmoteLoop;
+
+        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentEmote.Instance();
+        bool usable = agent != null && agent->CanUseEmote(emoteId);
+
+        // ── ANIM: replicate the ENGINE's condition restrictions (v0.7.392) ────────────────────────
+        // The direct-play branch below is a deliberate bypass - it is how HMS lets you play emotes you
+        // have not unlocked, inside a session. But it bypassed EVERY refusal, not just the unlock one:
+        // when CanUseEmote said no for a STATE reason, HMS fell through and forced the emote anyway.
+        //
+        // That is the Gulp bug. Gridanian/Ul'dahn/Lominsan Gulp (301/302/303) do not fire in the real
+        // game while seated - the engine refuses. HMS forced them, and since those three carry no
+        // posture variants at all (ConditionMode 3, slots 0 and 1 only), the standing loop played
+        // wherever the body already was, i.e. on top of the chair. The visible symptom looked like a
+        // positioning bug; the actual fault was invoking something the game had declined.
+        //
+        // Fix: tell the two refusals apart, and let the ENGINE be the authority for the second - no
+        // hand-tuned condition table, no per-emote special cases.
+        //   UIState.IsEmoteUnlocked(id)        - do you own it
+        //   EmoteManager.CanExecuteEmote(id)   - can you do it RIGHT NOW (engine-level, not the UI agent)
+        // unlocked && !executable  ->  the game is refusing on state grounds. Refuse too.
+        // !unlocked                ->  HMS's in-session bypass stands, exactly as designed.
+        //
+        // (Restrictions we may WANT to lift later - mount actions in particular - are a separate case
+        // and should be lifted explicitly here, not by leaving the whole gate open.)
+        //
+        // NB-40: this whole method runs inside emoteUnlock.SelfCall (see the PlayResolvedEmote wrapper), so the
+        // two in-session emote-unlock hooks are INERT for these reads - HMS's own path judges on genuine
+        // ownership exactly as prod does. The hooks exist only to open the game's NATIVE emote path (/confirm).
+        var emoteMgr = FFXIVClientStructs.FFXIV.Client.Game.Control.EmoteManager.Instance();
+        bool unlocked = emoteUnlock.IsOwned(emoteId);
+        bool executable = emoteMgr == null || emoteMgr->CanExecuteEmote(emoteId);
+
+        log.Debug("[HavenNative] [EMOTEGATE] id=" + emoteId + " '" + label + "' unlocked=" + unlocked +
+            " canExecute=" + executable + " canUse=" + usable +
+            " mode=" + character->Mode + "/" + character->ModeParam);
+
+
+        // Usable emote from a clean (non-looping) state → AgentEmote.ExecuteEmote, the in-game menu path: it
+        // owns the full lifecycle and natively interrupts a prior one-shot (proven: /wave → /point). It is
+        // NOT used to interrupt a LOOP: force-clearing the loop's emote state the same frame makes the agent's
+        // execute silently no-op (the "looped → non-looped doesn't register" bug). Those go through the direct
+        // play below, which survives the breaker (proven: forced-loop → forced-loop interrupts cleanly).
+        // ── v0.7.395: congruency by default, better where we can ──────────────────────────────────
+        // The game's own emote window shows each emote's legal conditions, and it is right: Gridanian
+        // Gulp (301) is STANDING-ONLY. Its sheet row has slots 0 and 1 only - no posture variants at
+        // all - so refusing it while seated is correct behaviour, not a bug. Confirmed in the live
+        // game: it will not fire seated on a bench or on a chair, HMS session or not.
+        //
+        // But HMS can do better here, and it costs nothing. Both gulp timelines are
+        // ActionTimeline.Slot=3 - the ADD lane, not the base lane. An additive animation LAYERS OVER a
+        // held pose instead of replacing it, so direct-playing the standing drink while the sit pose
+        // holds underneath produces a genuine seated drink. SE authored the motion on a lane that
+        // composes; they simply never wired a seated entry point for it.
+        //
+        // The rule, derived from the sheet rather than hand-tuned per emote:
+        //   in a posture AND the emote has NO posture variant  ->  direct play (layer it over the pose)
+        //   otherwise                                          ->  the agent, which picks the right
+        //                                                          posture slot when one exists
+        // So 301 seated gains a seated drink, 301 standing is unchanged, and Drink Tea (239) - which
+        // DOES ship a seated form, u_sp39 in slots 2/3/4 - keeps going through the agent so the game's
+        // own stock variant is used rather than one we improvised.
+        // ── v0.7.397: congruency. `/havenengine emote X` behaves like `/X`. ───────────────────────────────
+        // The game's emote window publishes each emote's legal conditions and it is correct: Gridanian
+        // Gulp (301) is STANDING-ONLY. Its sheet row carries slots 0 and 1 only - no posture variant -
+        // and the live game refuses it from a bench or a chair, HMS session or not.
+        //
+        // Neither engine predicate detects this. CanUseEmote and CanExecuteEmote BOTH returned true for
+        // 301 while seated, and the agent then stood the character up to play it. So the authority here
+        // has to be the SHEET, which states the fact plainly: no variant in slots 2/3/4 means no seated
+        // form exists.
+        //
+        //   in a posture AND no posture variant  ->  refuse, exactly as the slash command does
+        //
+        // ⚠ WE CAN DO BETTER THAN THIS, and it is written up - see
+        // "Synthetic emotes via additive-lane compositing" (2026-07-23). These clips are
+        // ActionTimeline.Slot=3 (Add lane), so driving them through PlayActionTimeline with NO SetMode
+        // layers them over a held pose and yields a seated drink the game never shipped. That was built
+        // in v0.7.396 and REMOVED here on purpose: it is local-only, because LocalStateDetector reads
+        // TimelineIds[0] and Mode to recognise a one-shot and the layering path deliberately changes
+        // neither, so peers see nothing. A synthetic emote only the performer can see is worthless for
+        // RP. Re-landing it needs the emote id carried as an epoch event so the receiver can run the
+        // same PlayActionTimeline - a scoped wire change, post-release, tracked as peer visibility.
+        bool inPosture = character->Mode == CharacterModes.InPositionLoop;
+        bool hasPostureVariant = false;
+        {
+            var esheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+            var erow = esheet?.GetRowOrDefault(emoteId);
+            if (erow != null)
+            {
+                var baseTl = erow.Value.ActionTimeline[0].RowId;
+                for (int i = 2; i <= 4; i++)
+                {
+                    var v = erow.Value.ActionTimeline[i].RowId;
+                    if (v != 0 && v != baseTl) { hasPostureVariant = true; break; }
+                }
+            }
+        }
+
+        log.Debug("[HavenNative] [EMOTEGATE] id=" + emoteId + " mode=" + character->Mode + "/" +
+            character->ModeParam + " inPosture=" + inPosture +
+            " hasPostureVariant=" + hasPostureVariant);
+
+        if (inPosture && !hasPostureVariant)
+        {
+            // Silent, deliberately. The native slash command says nothing when it refuses either, so a
+            // chat line would be MORE noise than the behaviour we are replicating - and it would double
+            // up once the compositing blend lands. The debug line above records it.
+            return false;
+        }
+
+        // Congruency gate for everything the engine itself declines (unlock is exempt - playing locked
+        // emotes in-session is the deliberate RP bypass, per DoEmote's own note).
+        if (!forceLocal && unlocked && !executable)
+        {
+            chat.Print("[HavenNative] " + label + " can't be used right now.");
+            return false;
+        }
+
+        // CanUseEmote is a state/UI predicate, not proof of ownership (quest emotes such as
+        // Ear Wiggle can pass it while locked). SelfCall deliberately restores the real unlock
+        // checks below, so the native executor would silently refuse an unowned emote here.
+        if (!forceLocal && unlocked && usable && !interruptingLoop)
+        {
+            // addToHistory:false - scripted play, keep it out of the player's recent-emote history.
+            agent->ExecuteEmote(emoteId, addToHistory: false);
+        }
+        else
+        {
+            // BREAKER: dismiss the running loop before replacing it - the same state reset the game does on
+            // move. Clear the emote owner so the game stops re-stamping the mode from EmoteController, reset
+            // the mode, release the base override. This is the receiver's proven move-cancel (ApplyEmoteState);
+            // a bare SetMode(Normal) is overwritten next frame, leaving the old loop to resume.
+            if (interruptingLoop)
+            {
+                character->EmoteController.EmoteId = 0;
+                character->SetMode(CharacterModes.Normal, 0);
+                // Force the mode FIELD to Normal too. LocalStateDetector reads character->Mode directly, and a
+                // one-shot following this sets no mode of its own - so unless Mode reads Normal the detector
+                // treats the new timeline as a sustained pose and never broadcasts it (peer misses the
+                // interrupt). EmoteId=0 above stops the game re-stamping the loop, so this value holds.
+                character->Mode = CharacterModes.Normal;
+                character->ModeParam = 0;
+                character->Timeline.BaseOverride = 0;
+            }
+
+            // Direct play - genuinely locked emotes, AND any emote interrupting a loop. Mirrors the receiver's
+            // ApplyEmoteFromSheet.
+            var sheet = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+            var entry = sheet.GetRow(emoteId);
+
+            // 318 "divine arm" etc. auto-draw the weapon (native /bm); while sheathed the animation no-ops.
+            // Mirror the peer-side draw: flag + base-evict (34) + class-resolved draw flourish.
+            if (entry.DrawsWeapon && !character->Timeline.IsWeaponDrawn)
+            {
+                character->Timeline.IsWeaponDrawn = true;
+                character->Timeline.TimelineSequencer.PlayTimeline(34);
+                character->Timeline.TimelineSequencer.PlayTimeline(LocomotionData.WeaponDraw);
+            }
+
+            var conditionMode = (CharacterModes)entry.EmoteMode.Value.ConditionMode;
+            if (conditionMode != 0)
+            {
+                // Persistent emote → SetMode sustains the loop + drives mode-based sync + lets the game cancel
+                // on movement. (Proven for forced-loop → forced-loop.)
+                character->Timeline.BaseOverride = 0;
+                character->SetMode(conditionMode, (byte)entry.EmoteMode.RowId);
+                character->Timeline.IsWeaponDrawn = entry.DrawsWeapon;
+                character->Timeline.TimelineSequencer.PlayTimeline(introTl > 0 ? introTl : loopTl);
+            }
+            else
+            {
+                // One-shot - from idle OR interrupting a loop (the breaker above already returned us to a
+                // clean Normal state, so it's the same case either way).
+                //
+                // v0.7.398 - POSTURE-AWARE SLOT SELECTION.
+                // This branch used to play ActionTimeline[0] unconditionally: the STANDING clip. For an
+                // emote with a stock seated form that is simply wrong, and it is why `/havenengine emote 239`
+                // (Drink Tea) stood the character up - 239 ships 8058 `sp39` standing in slot 0 and 8064
+                // `u_sp39` seated in slots 2/3/4, and only slot 0 was ever read.
+                //
+                // Why this branch and not the agent: the agent refuses emotes the character has not
+                // unlocked, which is exactly the RP case HMS exists to serve. So the bypass has to do the
+                // posture selection itself - the agent is not available to do it for us.
+                //
+                //   ModeParam is the EmoteMode row: 1 = Sit on Ground -> slot 2 (j_)
+                //                                   2 = Sit (chair)   -> slot 3 (s_)
+                //   Mounted                                           -> slot 4 (u_)
+                // Slot 4 is the general upper-body fallback, so an emote carrying only that still resolves.
+                ushort postureTl = 0;
+                if (inPosture || character->Mode == CharacterModes.Mounted)
+                {
+                    int slot = character->Mode == CharacterModes.Mounted ? 4
+                             : character->ModeParam == 1 ? 2
+                             : character->ModeParam == 2 ? 3
+                             : 4;
+                    postureTl = (ushort)entry.ActionTimeline[slot].RowId;
+                    if (postureTl == 0) postureTl = (ushort)entry.ActionTimeline[4].RowId;
+                    if (postureTl == loopTl) postureTl = 0;   // no distinct variant - nothing gained
+                }
+
+                if (postureTl != 0)
+                {
+                    // The seated/mounted variants are authored to COMPOSE over the held pose, so they go
+                    // on the ACTION lane. PlayTimeline would land them in TimelineIds[0] and evict the
+                    // pose - the same base-lane mistake that produced the cpose regression in the visor
+                    // arc, and the same one standing the character up here.
+                    //
+                    // ⚠ TRADE-OFF, deliberate: LocalStateDetector recognises a one-shot by reading
+                    // TimelineIds[0], which this path does not touch, so the seated form is LOCAL-ONLY.
+                    // Before this change the emote synced - but synced the WRONG animation, having first
+                    // stood the character up. Correct-and-unsynced beats wrong-and-synced for a pose the
+                    // player is deliberately holding. Syncing it properly is the same epoch-carried
+                    // emote-id wire change already scoped post-release for the compositing work; both
+                    // land together.
+                    character->Timeline.PlayActionTimeline(postureTl);
+                    log.Debug("[HavenNative] [EMOTEGATE] posture variant tl=" + postureTl +
+                        " (base " + loopTl + ") mode=" + character->Mode + "/" + character->ModeParam);
+                }
+                else
+                {
+                    // The scheduler selects the sheet's animation lane. LocalStateDetector watches
+                    // both the base lane and known standing additive emotes so either route syncs.
+                    character->Timeline.TimelineSequencer.PlayTimeline(loopTl);
+                }
+            }
+        }
+        return true;
+    }
+
+    // ── Relay events (background thread → main thread) ──
+
+    private void OnPeerJoined(string peerId, ulong contentId, string characterName)
+    {
+        RunOnMainThread(() =>
+        {
+            if (stateApply.Peers.TryGetValue(peerId, out var retained) && retained.ContentId == contentId) return;
+            // Register in the roster immediately so the participant list reflects the peer in the LOBBY (pre-load) -
+            // the roster used to be built only from the transform stream, which no longer flows before zone-load. The
+            // relay now stamps identity (ContentId + CharacterName) on PeerJoined, so a co-located lobby peer resolves
+            // to their real character (name/world/FC) at once via RegisterPeer's ContentId bind. entityId is derived on
+            // resolve, so 0 here is fine; the transform path later updates this same entry in place (preserving order).
+            stateApply.RegisterPeer(peerId, contentId, 0, characterName);
+
+            // S327: binding is now driven by the transform stream (each peer's transforms carry their stable ContentId;
+            // StateApplyService creates the peerInfos entry and the per-frame resolve loop binds by ContentId once the
+            // character is in render range). So we no longer guess a body from the object table here - that was the
+            // fragile positional/name path (the residential-district misattribution). Just announce the connection; the
+            // participant list will fill in the name once the peer's identity resolves.
+            chat.Print("[HavenNative] " + (string.IsNullOrEmpty(characterName) ? "A peer" : characterName) + " connected to the session.");
+
+            // S331 (late-join signal fix): when a peer joins, re-send our FULL current state once so the newcomer
+            // catches up on everything set-once-static - our Moniker name, held emote/cpose stance, mount, minion,
+            // ornament, weapon-drawn, and (if we're the host) map-state. WARM/COLD are strictly change-gated (no
+            // heartbeat), so anything we set BEFORE they joined is invisible to them without this re-offer. EVERY peer
+            // does this (not just the host) - a guest's appearance/pose/mount matters to the newcomer too. Existing
+            // peers are unaffected (one-shots are epoch-gated, level-states are idempotent). Also re-send the zone
+            // (host only) so the newcomer loads the right map - see RequestZoneResend below.
+            // Protocol 9 replays cached lanes/zone only to the ready newcomer.
+            disguiseSync.BroadcastFullState();   // FEAT-R2: re-offer our current disguise + puppets so the newcomer catches up
+            lobbyNameplate.RequestRebroadcast();   // b195: re-offer our lobby nameplate so the newcomer sees our chosen name
+            lightsOut.BroadcastFullState();   // Q-0010: re-offer any active dungeon lights-out so the newcomer blacks out too
+        });
+    }
+
+    // S331 (late-join signal fix): the host re-broadcasts the CURRENT zone-load so a newcomer loads the right map.
+    // Zone-load is a one-shot EVENT (ZoneLoadExecute), not lane state, so it isn't caught by the WARM/COLD/HOST
+    // re-send - it needs its own re-offer. The receiver skip-guard (OnZoneLoadReceived) makes this safe to broadcast:
+    // a peer ALREADY in the target zone ignores it (no disruptive reload), while the newcomer (not yet there) loads it.
+    private void RequestZoneResend()
+    {
+        if (!relay.IsHost) return;
+        uint territory = zoneLoad.CurrentLoadedZone;
+        if (territory == 0 || !zoneLoad.IsZoneLoaded) return;   // no zone loaded → nothing to catch up
+
+        // Re-resolve the spawn the same way DoLoad did (user spawn for this territory, else curated/LGB spawn).
+        System.Numerics.Vector3 spawn;
+        if (config.UserSpawns.TryGetValue(territory, out var us) && us.Length >= 3)
+            spawn = new System.Numerics.Vector3(us[0], us[1], us[2]);
+        else
+            spawn = zoneLoad.ResolveSpawnPoint(territory);
+
+        // v0.7.332: carry the stage bg + name for a cutscene so a late-joiner runs the donor-load-with-bg-swap too.
+        string rsStageBg = zoneLoad.ActiveStageBg ?? "";
+        string rsStageName = "";
+        if (rsStageBg.Length > 0)
+            foreach (var st in cutscene.Stages) if (st.Bg == rsStageBg) { rsStageName = st.Name; break; }
+
+        _ = relay.SendZoneLoad(new ZoneLoadData
+        {
+            TerritoryId = territory,
+            SpawnX = spawn.X, SpawnY = spawn.Y, SpawnZ = spawn.Z,
+            StageBg = rsStageBg,
+            StageName = rsStageName,
+        });
+        log.Information("[HavenNative] Re-sent zone-load (territory " + territory + ") to catch up a joining peer.");
+    }
+
+    private void OnPeerLeft(string peerId) => RemovePeerFromSession(peerId, "left the session.");
+    private void OnHousingSceneReady() => RunOnMainThread(stateCapture.RequestFullResend);
+
+    // b248: shared departing-peer teardown. Both the relay's clean LeaveRoom (OnPeerLeft) AND the heartbeat-timeout
+    // reaper (below) funnel here, so a silent drop the relay never announced is cleaned up identically to a graceful
+    // leave. Early-returns if the peer is already gone, so a leave + a timeout for the same peer can't double-chat.
+    // `reason` is the chat tail.
+    private void RemovePeerFromSession(string peerId, string reason)
+    {
+        RunOnMainThread(() =>
+        {
+            // S322: announce by name (was a nameless "Peer disconnected."). Grab the name before unregister.
+            if (!stateApply.Peers.TryGetValue(peerId, out var info)) return;   // already removed - nothing to tear down
+            string who = string.IsNullOrEmpty(info.CharacterName) ? "A peer" : info.CharacterName;
+            if (info.ContentId != 0) disguiseSync.OnPeerDeparted(info.ContentId);   // FEAT-R2: revert disguise + despawn their mirror puppets (before unregister drops the roster entry)
+            if (info.ContentId != 0) lobbyNameplate.OnPeerDeparted(info.ContentId);   // b195: forget their cached lobby nameplate (ClearName below restores the real plate)
+            if (info.ObjectIndex.HasValue)
+            {
+                actorVisibility.UnregisterPeer(info.ObjectIndex.Value);
+                moniker.ClearName(info.ObjectIndex.Value);   // S328x: restore the departing peer's real nameplate
+            }
+            stateApply.UnregisterPeer(peerId);
+            chat.Print("[HavenNative] " + who + " " + reason);
+        });
+    }
+
+    // b248: heartbeat-timeout reaper cadence + threshold. A live peer sends a HOT frame at least every KeepaliveSecs (2s)
+    // during a session, so ~15s of silence (7.5 missed keepalives) means a genuine drop the relay never sent a leave
+    // for - NOT normal lag. Only run while a map is loaded (HOT flows only then); a bare lobby is legitimately silent.
+    // The current host's relay PeerId - tracked so the roster can pin + amber-tint the host on everyone's screen. Set
+    // to self when we hold host and updated on explicit HostTransfer; succession-on-leave and fresh joins fall back to
+    // first-by-join-order in BuildParticipantList.
+    private string currentHostPeerId = "";
+
+    private void OnHostTransfer(string newHostId)
+    {
+        RunOnMainThread(() =>
+        {
+            // PeerLeft embeds succession and the relay also sends HostTransfer. Apply it once.
+            if (currentHostPeerId == newHostId) return;
+            currentHostPeerId = newHostId;
+            if (newHostId == relay.LocalPeerId)
+            {
+                // S330c (Stage 2b): INHERIT map-state on promotion. Before becoming host, this client was a guest
+                // applying the old host's HostUpdates. If we now stamp our OWN MapState (which is default/empty - we
+                // never authored map-state as a guest), our first HostUpdate would wipe the scene's weather/time/BGM
+                // AND restart the epoch. So seed our MapState from the last map-state we APPLIED - same values, and
+                // the epoch continues from where the old host left off (our next change is inheritedEpoch+1).
+                var inherited = stateApply.LastAppliedMapState;
+                if (inherited != null)
+                {
+                    stateCapture.MapState.WeatherId = inherited.MapWeatherId;
+                    stateCapture.MapState.WeatherDonor = inherited.MapWeatherDonor;   // b183: inherit the day-night graft donor too
+                    stateCapture.MapState.WeatherForced = inherited.MapWeatherForced; // NB-44: inherit whether the weather is an explicit forced pick
+                    // NB-44: forced-ness is INTENT (not observable from the engine like the live weather byte is), so a
+                    // promoted host can't re-derive it by reading the sky — seed config from the inherited state so our
+                    // next PushMapState() (e.g. a time drag) keeps forcing the old host's pick instead of silently
+                    // dropping to forced=false and reverting every peer to native.
+                    config.MapWeatherId = inherited.MapWeatherId;
+                    config.MapWeatherDonor = inherited.MapWeatherDonor;
+                    config.MapWeatherForced = inherited.MapWeatherForced;
+                    stateCapture.MapState.TimeForced = inherited.MapTimeForced;
+                    stateCapture.MapState.EorzeaHour = inherited.MapEorzeaHour;
+                    stateCapture.MapState.EorzeaMinute = inherited.MapEorzeaMinute;
+                    stateCapture.MapState.BgmId = inherited.MapBgmId;
+                    stateCapture.MapState.RemoveNpcs = inherited.MapRemoveNpcs;
+                    stateCapture.MapState.HideQuestSigns = inherited.MapHideQuestSigns;
+                    stateCapture.MapState.Epoch = inherited.MapStateEpoch;   // continue the sequence, don't restart
+                    log.Information("[HavenNative] Inherited map-state on host promotion (epoch " + inherited.MapStateEpoch + ").");
+                }
+                relay.IsHost = true;
+                chat.Print("[Haven] You are now hosting this gathering.");
+            }
+            else
+            {
+                // v0.7.431 - DEMOTION: the missing half of the transfer. If we currently hold host and
+                // the role is moving to someone else, drop authority. Everything downstream (GUI host
+                // view, host-command guards, weather/BGM authority via HasMapAuthority, CanLoad) reads
+                // relay.IsHost live, so they revert to guest behaviour the instant this flips - no
+                // per-consumer plumbing. Pure authority swap: no map movement, we keep the zone we're on.
+                // Symmetric with the promotion branch above. Also reset the map-state apply gate: as the
+                // prior host our lastAppliedMapEpoch tracked our OWN outbound epoch, and the new host's
+                // epoch continues that sequence - so its next change could land at an epoch we already
+                // equal and get ignored, leaving our scene stale. ForceMapStateReapply() re-opens the
+                // gate so we mirror the new host's next broadcast.
+                if (relay.IsHost)
+                {
+                    relay.IsHost = false;
+                    stateApply.ForceMapStateReapply();
+                    // NB-45: RELINQUISH MAP-STATE AUTHORITY on demotion. The epoch gate (StateApplyService) has NO
+                    // host-identity check — it trusts the invariant "a nonzero epoch only comes from the host; peers
+                    // leave it 0". But our stateCapture kept stamping our epoch on every outbound frame, and demotion
+                    // never zeroed it, so after a transfer TWO senders carried a nonzero epoch: the new host, and us
+                    // frozen at our last epoch E_A (we stop bumping it once HasMapAuthority is false). When E_A collides
+                    // with — or sits above — the new host's inherited epoch, peers latch OUR stale map-state (usually the
+                    // forced=false native baseline → SetWeatherNativeOnly → zone default) and IGNORE the new host's
+                    // same-epoch frames: the scene "resets to default and won't change" until the new host bumps its
+                    // epoch clear past E_A (which is exactly why a city-preset / time-shift "kicks weather sync back
+                    // in"). Zero our epoch so peers see epoch 0 from us and ignore our map-state, like any other guest.
+                    stateCapture.MapState.Epoch = 0;
+                    // Also clear our own weather change-guard: ForceMapStateReapply only re-opens the epoch gate; the
+                    // (weather,donor) latch inside ApplyMapState is separate, so without this the new host's first
+                    // broadcast could be skipped if its (weather,donor) happens to match our stale latch.
+                    lastAppliedPeerWeather = -1;
+                    lastAppliedPeerDonor = uint.MaxValue;
+                    log.Information("[HavenNative] Demoted from host on transfer - now a guest, mirroring the new host (epoch relinquished).");
+                }
+
+                var shortId = newHostId.Length >= 6 ? newHostId[..6] : newHostId;
+                // Try to find peer name
+                string hostName = shortId;
+                foreach (var (id, info) in stateApply.Peers)
+                {
+                    if (id == newHostId)
+                    {
+                        hostName = info.CharacterName;
+                        break;
+                    }
+                }
+                chat.Print("[HavenNative] Host transferred to " + hostName + ".");
+            }
+        });
+    }
+
+    private void OnRoomJoined(RoomJoinedData data)
+    {
+        RunOnMainThread(() =>
+        {
+            log.Information("[HavenNative] Room joined. Zone=" + data.CurrentZoneId + " Peers=" + data.PeerIds.Length);
+            if (relay.ResumedAdmission)
+            {
+                stateCapture.RequestFullResend();
+                ui.SetStatus("Recovering gathering");
+                return; // Keep roster bindings, origin positions, actor state and the loaded scene.
+            }
+
+            // Fresh room → drop any roster that survived (e.g. an unclean disconnect that skipped teardown). The
+            // fanned PeerJoined frames that populate this room arrive AFTER RoomJoined, so clearing here is safe.
+            stateApply.ClearRoster();
+            currentHostPeerId = relay.IsHost ? relay.LocalPeerId : "";   // self if we host; else fall back to join order
+
+            // Admission confirmed by the relay (not just connect-ok) - announce the lobby HERE so a refusal
+            // (wrong password / no host nearby / already hosting) never prints a false "joined". Host vs peer per
+            // the relay's authoritative IsHost.
+            if (relay.IsHost)
+            {
+                ui.SetStatus("Hosting");
+                chat.Print("[HavenNative] Lobby open. Gather your party, then load a zone to start the scene.");
+            }
+            else
+            {
+                ui.SetStatus("Joined");
+                chat.Print("[HavenNative] Joined. Waiting for the host to load a zone.");
+            }
+
+            // S327: no positional pairing here anymore. The old code walked the object table and paired the Nth nearby
+            // player with the Nth relay PeerId - random (the orderings are unrelated), stranger-polluted, and it dropped
+            // unmatched PeerIds when fewer characters were loaded than peers (exactly the cross-map case). Binding is now
+            // driven by the transform stream: each peer's transforms carry their stable ContentId, StateApplyService
+            // creates the peerInfos entry, and the per-frame resolve loop binds by ContentId once the character is in
+            // render range. Visibility is registered at bind time in the resolve loop, not here.
+
+            // Auto-load zone if room has one active
+            if (data.CurrentZoneId > 0)
+            {
+                var zoneName = zoneLoad.GetZoneName(data.CurrentZoneId);
+                chat.Print("[HavenNative] Auto-loading zone: " + zoneName);
+
+                var peerIndices = stateApply.GetPeerObjectIndices();
+                zoneLoad.LoadZone(data.CurrentZoneId, peerIndices,
+                    new FFXIVClientStructs.FFXIV.Common.Math.Vector3(data.SpawnX, data.SpawnY, data.SpawnZ));
+                actorVisibility.Refresh();
+                // S328ab: force the host's map-state (weather/time/BGM) to re-apply once THIS join's zone finishes
+                // loading. Without this, the host's map-state epoch arrives while the joiner's zone is still loading -
+                // ApplyMapState stores the values but SKIPS the live write (gated on IsZoneLoaded) yet still marks the
+                // epoch consumed, so it never re-fires once loaded → the joiner is stuck on the real zone's weather
+                // (None/atmospheric) and clock. The mid-session host-load path already did this; the JOIN path didn't.
+                guestMapReapplyCountdown = 120;
+                lastAppliedPeerBgm = 0;   // new zone → let its BGM re-apply fresh, not stale
+                lastAppliedPeerWeather = -1; lastAppliedPeerDonor = uint.MaxValue;   // b184: and its graft (weather,donor)
+
+                ui.SetStatus("Zone: " + zoneName);
+            }
+        });
+    }
+
+    private void OnZoneLoadReceived(ZoneLoadData data)
+    {
+        RunOnMainThread(() =>
+        {
+            // Haven: the spawn point comes from the host and moves the local player; an impossible one is refused.
+            if (!float.IsFinite(data.SpawnX) || !float.IsFinite(data.SpawnY) || !float.IsFinite(data.SpawnZ)
+                || MathF.Abs(data.SpawnX) > 4096 || MathF.Abs(data.SpawnY) > 4096 || MathF.Abs(data.SpawnZ) > 4096)
+            { log.Warning("[Haven] Ignored a zone load with an impossible spawn point."); return; }
+            data.StageBg ??= "";
+            if (!zoneLoad.CanLoad || !IsHavenTerritory(data.TerritoryId) || !string.IsNullOrEmpty(data.StageBg))
+            {
+                log.Warning("[Haven] Rejected an unavailable or non-housing zone request.");
+                return;
+            }
+            // Haven: a home in a zone this install doesn't have (an Endwalker or Dawntrail inn on a free trial) would
+            // close the game as it loads; the guest leaves before anything is engaged, and is told why.
+            if (HousingTerritoryUnavailable(data.TerritoryId) is { } missing)
+            {
+                log.Warning("[Haven] Not loading territory {Territory}: its zone data isn't installed. {Reason}", data.TerritoryId, missing);
+                toast.ShowError(missing);
+                if (HousingTerritoryNeeds(data.TerritoryId) is { } needs) relay.LeavingFor(Haven.Core.GameDataPaths.LeaveReason(needs));
+                HousingZoneUnavailable?.Invoke(missing);
+                return;
+            }
+            // S331 (late-join signal fix): skip-guard. The host re-broadcasts zone-load when a peer joins (so a
+            // latecomer loads the right map). But that broadcast reaches EVERYONE - and a peer already in the target
+            // zone must NOT reload (a disruptive flash + re-spawn). If we're already loaded into this territory, this
+            // is a redundant catch-up re-send meant for the newcomer, not us - ignore it. The newcomer (not yet in the
+            // zone) falls through and loads it. This is what makes the join-time re-broadcast safe to fan to the room.
+            // v0.7.332: cutscene stages load via a DONOR territory with a bg-path swap. data.TerritoryId is the donor;
+            // data.StageBg (when set) is the actual stage. A stage-aware skip-guard: only skip as a redundant re-send if
+            // we're in the same territory AND the same stage (else a cutscene sharing the donor of our current zone, or a
+            // different stage on the same donor, would be wrongly skipped).
+            bool isStage = data.StageBg.Length > 0;
+            if (zoneLoad.IsZoneLoaded && zoneLoad.CurrentLoadedZone == data.TerritoryId
+                && (zoneLoad.ActiveStageBg ?? "") == (isStage ? data.StageBg : ""))
+            {
+                log.Information("[HavenNative] Ignoring zone-load for territory " + data.TerritoryId + " - already loaded (catch-up re-send for a newcomer).");
+                return;
+            }
+
+            // Print the REAL name - the stage name for a cutscene (the donor's GetZoneName was the "Ingleside Apartment"
+            // lie), the territory name otherwise.
+            string zoneName = isStage && data.StageName.Length > 0 ? data.StageName : zoneLoad.GetZoneName(data.TerritoryId);
+            chat.Print("[HavenNative] Host loading zone: " + zoneName);
+
+            // Guest goes synthetic before loading the host's zone - same filter-first-then-load invariant as the host.
+            if (!EngageSyntheticSession()) return;
+
+            // NB-32: CLEAN-SPAWN ON HOP (guest). Symmetric with the host DoLoad path - stand this client up BEFORE
+            // LoadZone so its idle state broadcasts during peers' load window and they rebuild it clean, mirroring the
+            // first-engage standup. Mount-safe; purely local/behind the filter (origin posture untouched).
+            SanitiseLocalPosture("map-hop");
+
+            // v0.7.332: for a cutscene, arm the same bg-swap the host used - set BOTH stage fields before the donor load
+            // so the guest's CreateScene detour substitutes the stage bg (mirrors CutsceneStageService.LoadStage).
+            if (isStage)
+            {
+                zoneLoad.ActiveStageBg = data.StageBg;
+                zoneLoad.PendingStageBg = data.StageBg;
+            }
+
+            var peerIndices = stateApply.GetPeerObjectIndices();
+            zoneLoad.LoadZone(data.TerritoryId, peerIndices,
+                new FFXIVClientStructs.FFXIV.Common.Math.Vector3(data.SpawnX, data.SpawnY, data.SpawnZ));
+            actorVisibility.Refresh();
+            // S327j: the guest just loaded a fresh map. Force the host's current map-state (esp. a HELD time) to
+            // re-apply on the next transform - otherwise the new map runs on the real clock until the host next edits
+            // time. Deferred a little so the apply lands after the load settles.
+            guestMapReapplyCountdown = 120;
+            lastAppliedPeerBgm = 0;   // S327l: new zone → clear BGM tracking so its music re-applies fresh (not stale)
+            lastAppliedPeerWeather = -1; lastAppliedPeerDonor = uint.MaxValue;   // b184: same for the graft-engage latch
+            ArmMapReveal();           // v0.7.448: guest reveals its own HUD fog for the loaded map (local; restored on exit)
+
+            ui.SetStatus("Zone: " + zoneName);
+        });
+    }
+
+    private void OnSessionEnded()
+    {
+        RunOnMainThread(() =>
+        {
+            chat.Print("[HavenNative] Host ended the session.");
+            DoLeaveInternal(silent: true);
+            ui.SetStatus("Session ended by host");
+        });
+    }
+
+    // v0.7.464: when OnRelayError announces a hard throttle, the close that follows must not print a second,
+    // vaguer line about the same event. This is a TIMESTAMP, not a bool latch, and that is deliberate:
+    // Error(9) → DoLeaveInternal → relay.Disconnect(), and Disconnect() clears IsConnected SYNCHRONOUSLY, so the
+    // receive loop's `if (IsConnected)` tail guard is already false and OnDisconnected NEVER FIRES on that path.
+    // A bool would therefore latch true forever and silently swallow the message for the next genuine drop. A
+    // timestamp self-expires whether or not the clearing path ever runs - harmless by construction, not by
+    // remembering to reset.
+    private DateTime throttleAnnouncedAt = DateTime.MinValue;
+    private bool ThrottleJustAnnounced => (DateTime.UtcNow - throttleAnnouncedAt).TotalSeconds < 10;
+
+    private void OnDisconnected()
+    {
+        RunOnMainThread(() =>
+        {
+            // The framework callback can be delayed while the transport already recovers.
+            if (relay.IsConnected) return;
+            if (relay.IsRecovering)
+            {
+                ui.SetStatus("Reconnecting · scene preserved");
+                chat.Print("[Haven] Connection interrupted. Keeping the house and characters in place while reconnecting.");
+                return;
+            }
+            // v0.7.464 (RMS QA F3, hard tier): a close carrying 4029 is a throttle disconnect, not a network drop -
+            // say so, because "lost connection" sends the user hunting a fault that isn't there. The close code is
+            // only present when the relay closed CLEANLY; an aborted socket leaves it null and we fall back to the
+            // generic line rather than guessing.
+            bool hardThrottle = relay.LastCloseCode == HavenNative.Wire.WireClose.RateLimitExceeded;
+            if (!ThrottleJustAnnounced)
+            {
+                if (hardThrottle)
+                    chat.PrintError("[HavenNative] Disconnected - the relay throttled this connection for excessive traffic. " +
+                                    "You can reconnect when ready.");
+                else
+                    chat.Print("[HavenNative] Lost connection to relay.");
+            }
+            // S193: a hard disconnect must still clear every imposed peer state, or mounts (and
+            // future transients) leak - the puppets are still in our local object table even
+            // though the relay connection dropped. This was the "mount persists through dc" gap:
+            // OnDisconnected printed a message but never ran the sweep. DoLeaveInternal handles
+            // the full teardown (sanitize + revert + filter-off + state services), idempotently.
+            DoLeaveInternal(silent: true);
+            ui.SetStatus("Disconnected");
+        });
+    }
+
+    private void OnRecoveryComplete() => RunOnMainThread(() =>
+    {
+        stateCapture.RequestFullResend();
+        ui.SetStatus(relay.IsHost ? "Hosting" : "Joined");
+        chat.Print("[Haven] Gathering connection restored.");
+    });
+    private void OnRecoveryNotice(string message) => RunOnMainThread(() => chat.PrintError("[Haven] " + message));
+
+    // v0.7.464 (RMS QA F3, soft tier). The relay is dropping our excess ingress but keeping the socket open, so this
+    // is advisory ONLY - no teardown, no state change, nothing the user must do. Two surfaces, deliberately:
+    //   • the status strip lights an amber line for 5 s (re-armed by each notice, so it stays lit through a burst);
+    //   • chat gets ONE line at most every 30 s, because the relay may emit up to ~1/3 s and a per-notice print
+    //     would bury the log - the sin the diagnostics-noise pass exists to prevent.
+    private DateTime lastThrottleChatPrint = DateTime.MinValue;
+
+    private void OnRelayRateLimited()
+    {
+        RunOnMainThread(() =>
+        {
+            ui.NoteThrottled();
+            if ((DateTime.UtcNow - lastThrottleChatPrint).TotalSeconds < 30) return;
+            lastThrottleChatPrint = DateTime.UtcNow;
+            chat.Print("[HavenNative] The relay is throttling this connection - some updates are being dropped. " +
+                       "The session continues; this clears on its own.");
+        });
+    }
+
+    // The engine's windows and overlays (NPC picker, carpet, face, movement, appearance, weather presets, BGM picker),
+    // none of them while Haven's cinematic mode hides everything but the chat.
+    private void DrawEngineUi()
+    {
+        if (Haven.CinematicMode.Hiding) return;
+        ui.Draw(); ui.DrawNpcPickerOverlay(); ui.DrawCarpetOverlay(); ui.DrawCarpetBar(); ui.DrawFaceControlBar();
+        ui.DrawMovementBar(); ui.DrawAppearanceBar(); ui.DrawWeatherPresetsWindow(); ui.DrawBgmPickerWindow();
+    }
+
+    private void OnRelayError(uint code, string relayMsg)
+    {
+        RunOnMainThread(() =>
+        {
+            // v0.7.464: switched from magic integers to the shared HavenNative.Wire.ErrCode constants. The codes used to
+            // live ONLY in the relay's Program.cs while this switch re-implemented them as bare literals - the one
+            // thing both sides must agree on was the one thing the compiler-enforced contract didn't cover. ErrCode
+            // now lives in HavenNativeWireTypes.cs alongside WireKind, so a code added on one side is visible on the other.
+            string msg = code switch
+            {
+                HavenNative.Wire.ErrCode.RoomNotFound   => "That room has ended.",
+                HavenNative.Wire.ErrCode.NotHosting     => "No one nearby is hosting a room - you must be in visual range of the host.",
+                HavenNative.Wire.ErrCode.RoomFull       => "That room is full.",
+                HavenNative.Wire.ErrCode.NotHost        => "Only the host can do that.",
+                HavenNative.Wire.ErrCode.Kicked         => "You were removed from the room.",
+                HavenNative.Wire.ErrCode.Banned         => "You have been removed from this room.",
+                HavenNative.Wire.ErrCode.WrongPassword  => "Incorrect room password.",
+                HavenNative.Wire.ErrCode.AlreadyHosting => string.IsNullOrEmpty(relayMsg) ? "A previous gathering still exists. Use Visits to stop hosting or reconnect." : relayMsg,
+                // HARD throttle: the relay closes the socket immediately after this. Distinct from the SOFT tier
+                // (WireKind.RateLimited 0x08), which is advisory and leaves the session running.
+                HavenNative.Wire.ErrCode.RateLimited    => "The relay is throttling this connection for excessive traffic - " +
+                                                     "the session has ended. You can reconnect when ready.",
+                _ => string.IsNullOrEmpty(relayMsg) ? "Relay error." : relayMsg,
+            };
+            chat.Print("[HavenNative] " + msg);
+            // A refused connection (code 0: an account refusal, an unreachable relay) or room ends what the player
+            // just asked for; a chat line alone is easy to miss, so it is also the game's red error.
+            if (code != HavenNative.Wire.ErrCode.NotHost) toast.ShowError(msg);
+
+            // The close frame arrives moments after this - and on this path DoLeaveInternal disconnects us first, so
+            // OnDisconnected may not run at all. Either way the user gets one message for one cause.
+            if (code == HavenNative.Wire.ErrCode.RateLimited) throttleAnnouncedAt = DateTime.UtcNow;
+
+            // NotHost is action-refused, NOT session-ending - stay connected. Everything else tears down to idle:
+            // a refused join leaves us connected-but-roomless on the relay, and Kicked is a hard close on their side.
+            // We never auto-retry - retrying into a ban would just bounce back as Banned.
+            //
+            // ⚠ NOTE FOR ANY FUTURE ERROR CODE: this fallthrough means an UNRECOGNISED code tears the session down.
+            // That is the right default for a refusal channel, but it makes ErrorPayload unusable for advisory
+            // signals - a new advisory must ride a new WireKind (which an older client ignores), not a new code.
+            if (code != HavenNative.Wire.ErrCode.NotHost)
+            {
+                DoLeaveInternal(silent: true);
+                ui.SetStatus("");
+            }
+        });
+    }
+
+    // ── Helpers ──
+
+    private static readonly System.Random pwRng = new System.Random();
+
+    // A short, shareable room password when the host leaves the field blank. 5 chars from an unambiguous alphabet
+    // (no 0/O/1/l/I) - easy to read out, and unique enough for a nearby lobby (presence is the real gate, not entropy).
+    private static string GenerateShortPassword()
+    {
+        const string alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
+        var sb = new System.Text.StringBuilder(5);
+        for (int i = 0; i < 5; i++) sb.Append(alphabet[pwRng.Next(alphabet.Length)]);
+        return sb.ToString();
+    }
+
+    public void Dispose()
+    {
+        // Haven: these come before the safety revert below, which must run whatever they do.
+        try { HousingReleaseAtmosphere(); } catch (Exception ex) { log.Warning(ex, "[Haven] Atmosphere release failed."); }
+        try { cameraTargetHook?.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Camera hook disposal failed."); }
+        try { cameraUpdateHook?.Dispose(); cameraCollideHook?.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Free camera hook disposal failed."); }
+        try { poseTransformHook?.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Pose hook disposal failed."); }
+        try { poseCanTurnHook?.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Pose turn hook disposal failed."); }
+        try { moveInputHook?.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Movement hook disposal failed."); }
+        try { dutyFinderGuard.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Duty finder guard disposal failed."); }
+        try { typingIndicators.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Typing indicator disposal failed."); }
+        try { privateRoomChat.Dispose(); } catch (Exception ex) { log.Warning(ex, "[Haven] Room chat disposal failed."); }
+        // Input edits update the in-memory config immediately; flush even if the text field
+        // still has focus when the game closes. Saving must not prevent native cleanup.
+        try { config.Save(); }
+        catch (Exception ex) { log.Warning(ex, "[Haven] Could not save settings during shutdown."); }
+        framework.Update -= OnFrameworkUpdate;
+#if HMS_TESTING
+        commands.RemoveHandler("/havenenginet");   // NB-22: testing build registers ONLY /havenenginet (see AddHandler)
+#else
+        commands.RemoveHandler("/havenengine");
+#endif
+        try { mountHudDismount.Dispose(); } catch { }   // v0.7.339: drop the mount-icon click handler + listeners
+        try { deckFloor.Clear(); } catch { }   // v0.7.351: remove any box floor patches
+        try { skillSync.Dispose(); } catch { }   // COSM_1_016: drop the UseAction hook
+        try { emoteWindow?.Dispose(); } catch { }
+        try { socialLists?.Dispose(); } catch { }
+        try { socialRequests?.Dispose(); } catch { }
+        try { emoteUnlock.Dispose(); } catch { }   // NB-40: drop the IsEmoteUnlocked hook
+        pluginInterface.UiBuilder.Draw -= DrawEngineUi;
+        pluginInterface.UiBuilder.OpenMainUi -= ui.OpenMain;        // paired with the += above
+        pluginInterface.UiBuilder.OpenConfigUi -= ui.OpenConfig;    // paired with the += above
+
+        try { mapSettings.DisableTimeOverride(); } catch { }   // S326v: don't leave the clock frozen on unload
+
+        // v0.7.448: restore any auto-revealed maps on plugin unload too (graceful disable mid-session). The
+        // crash-recovery file would catch this on next load regardless, but sanitising here cleans up now.
+        try { SanitiseRevealedMaps(); } catch (Exception ex) { log.Warning("[HavenNative] map-reveal sanitise on dispose failed: " + ex.Message); }
+
+        // Safety: revert zone if loaded to prevent character getting stuck. The deferred restore cannot run after
+        // unload, so write the origin synchronously first. The return guard stays on disk: a Haven instance loaded
+        // later in this game process (an update/reload) re-arms the filter and finishes the return.
+        if (zoneLoad.IsZoneLoaded)
+        {
+            try { zoneLoad.RevertForUnload(); }
+            catch (Exception ex) { log.Error("[HavenNative] Safety revert failed: " + ex.Message); }
+            MarkReturnGuardUnloaded();
+        }
+        else
+        {
+            // After Leave the zone is no longer "loaded" while the return settles; unloading then released the filter
+            // with nothing written and the guard unmarked, so a reload couldn't finish it.
+            bool returning = false;
+            try { returning = zoneLoad.FinishReturnForUnload(); }
+            catch (Exception ex) { log.Error("[HavenNative] Safety return write failed: " + ex.Message); returning = true; }
+            if (returning) MarkReturnGuardUnloaded();
+        }
+
+        if (packetFilter.IsActive)
+        {
+            try { packetFilter.Disable(); }
+            catch (Exception ex) { log.Debug("[HavenNative] Packet filter disable failed: " + ex.Message); }
+        }
+
+        relay.OnTransformReceived -= stateApply.OnTransformReceived;
+        relay.OnPeerJoined -= OnPeerJoined;
+        relay.OnHousingSceneReady -= OnHousingSceneReady;
+        relay.OnPeerLeft -= OnPeerLeft;
+        relay.OnHostTransfer -= OnHostTransfer;
+        relay.OnRoomJoined -= OnRoomJoined;
+        relay.OnZoneLoadReceived -= OnZoneLoadReceived;
+        relay.OnSessionEnded -= OnSessionEnded;
+        relay.OnDisconnected -= OnDisconnected;
+        relay.OnRecovered -= OnRecoveryComplete;
+        relay.OnRecoveryNotice -= OnRecoveryNotice;
+        relay.OnError -= OnRelayError;
+        relay.OnRateLimited -= OnRelayRateLimited;   // v0.7.464: symmetry (the DrawFaceControlBar leak's lesson)
+
+        stateCapture.Dispose();
+        stateApply.Dispose();
+        emoteDiag.Dispose();
+        actorVisibility.Dispose();
+        glamourer.Dispose();
+        afkSuppressor.Dispose();
+        packetFilter.Dispose();
+        sayFilter.Dispose();
+        cutscene.Dispose();
+        zoneLoad.Dispose();
+        try { questSpoof.Dispose(); } catch { }   // NB-19 Phase 1: unhook the three quest reads
+        relayHealth.Dispose();   // stop the background /health poll
+        noclip.Dispose();
+        timeFreeze.Dispose();   // S327f: unfreeze + dispose the time hook
+        try { mapSettings.SanitiseWeather(); } catch { }   // b113: clear any forced sky (cram + native override) on unload
+        try { weatherCram.Dispose(); } catch { }   // WEATHER-CRAM b96: drop the UpdateEnvironment restamp hook
+        carpet.Dispose();
+        moniker.Dispose();   // S328x
+        try { hmsProvider.Dispose(); } catch { }   // HavenNative.* provider: unregister the accent/version gates
+        try { disguiseSync.Dispose(); } catch { }   // FEAT-R2: unsubscribe HDM ⇄ relay bridge (before hdm, which owns the IPC gates)
+        try { lobbyNameplate.Dispose(); } catch { }   // b195: unsubscribe the lobby-nameplate lane + revert any applied names
+        try { lightsOut.Dispose(); } catch { }   // Q-0010: unsubscribe the lights-out lane + restore any suppressed lights/flames
+        try { weatherDtr.Dispose(); } catch { }  // b225: remove the server-info-bar weather entry
+        try { trackDtr.Dispose(); } catch { }    // b240: remove the server-info-bar music entry
+        try { hdm.Dispose(); } catch { }            // FEAT-R2: unsubscribe HDM IPC event gates
+        npcVisibility.Dispose();   // S328aa
+        relay.Dispose();
+
+        log.Information("[HavenNative] Plugin unloaded");
+    }
+}
+

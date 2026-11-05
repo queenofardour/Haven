@@ -1,0 +1,32 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Version>0.65.3</Version>
+    <AssemblyName>Haven</AssemblyName>
+    <Author>Haven contributors; Enceladeum (native engine)</Author>
+    <Name>Haven</Name>
+    <RepoUrl>https://github.com/queenofardour/Haven</RepoUrl>
+    <Punchline>Housing interiors of your own, to furnish and share for roleplay.</Punchline>
+    <Description>Personal housing interiors without owning a house: the full furnishing catalogue, lighting, music and atmosphere, saved on your PC. Host gatherings for friends to visit and decorate together. Everything is drawn on your own client; your character never leaves the spot you entered from. Invite-only alpha: gatherings need a Haven account and an access code. Requires Stagehand.</Description>
+    <Tags>housing;roleplay;stagehand</Tags>
+    <IconUrl>https://raw.githubusercontent.com/queenofardour/Haven/main/images/icon.png</IconUrl>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="StbImageSharp" Version="2.30.16" />
+    <PackageReference Include="StbImageWriteSharp" Version="1.16.7" />
+    <ProjectReference Include="../Haven.Core/Haven.Core.csproj" />
+    <PackageReference Include="Stagehand.Api" Version="0.5.5" />
+    <PackageReference Include="Stagehand.Definitions" Version="0.5.5" />
+    <PackageReference Include="Glamourer.Api" Version="2.8.2" />
+    <Compile Remove="Native/Upstream/Wire/HMSyncWireTypes.cs" />
+    <EmbeddedResource Include="Native/Data/*" />
+    <EmbeddedResource Include="Fonts/*.ttf" LogicalName="Haven.Fonts.%(Filename)%(Extension)" />
+    <!-- "What's new": the update notes, shown after an update (ChangelogWindow). -->
+    <EmbeddedResource Include="../../docs/updates/UPDATE-*.md" LogicalName="Haven.Updates.%(Filename)%(Extension)" />
+    <None Include="Fonts/Inter-LICENSE.txt" Link="Inter-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

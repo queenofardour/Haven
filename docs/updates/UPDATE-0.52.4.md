@@ -1,0 +1,5 @@
+# Haven 0.52.4: smoother Odyssey screens
+
+**The Crystal Odyssey's screens, and Triple Triad's own windows, no longer look broken the first time they open.** Each new screen (and a duel's "You win!" window, the first time) opened with missing or misplaced text, then snapped into place a moment later. Haven built its typeface at exactly the size each screen needed, the moment the screen asked for it. Every screen has its own zoom, so each new screen waited for fonts that were still being built, and in the meantime its text measured as nothing. Haven now builds a fixed set of sizes once, when the plugin starts, along with the game fonts used on the Triple Triad board and on the cards. Each text uses the nearest size and is scaled down slightly, so nothing is built while you play. If the fonts are somehow not ready yet, the screen shows its empty panel for that moment instead of a half-drawn one.
+
+A click that opens another screen now also resizes the panel in the same frame, rather than one frame later.

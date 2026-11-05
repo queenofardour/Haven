@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "haven-downloads",
+  "main": "src/downloads.ts",
+  "compatibility_date": "2026-10-24",
+  "workers_dev": true,
+  "kv_namespaces": [{ "binding": "HAVEN_DOWNLOADS", "id": "d35f499bf61e4e688823c0d6bde4f6a2" }],
+  "observability": { "enabled": false },
+  "limits": { "cpu_ms": 50 }
+}

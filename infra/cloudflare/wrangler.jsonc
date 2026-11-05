@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "haven-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-24",
+  "compatibility_flags": ["web_socket_manual_reply_to_close"],
+  "workers_dev": true,
+  "containers": [{
+    "class_name": "HavenRelay",
+    "image": "../../Dockerfile",
+    "image_build_context": "../..",
+    "instance_type": "lite",
+    "max_instances": 1
+  }],
+  "r2_buckets": [{ "binding": "HAVEN_CONTENT", "bucket_name": "haven-content" }],
+  "durable_objects": { "bindings": [{ "name": "HAVEN_RELAY", "class_name": "HavenRelay" }, { "name": "HAVEN_BUDGET", "class_name": "ContentBudget" }, { "name": "HAVEN_ACCOUNT_STORE", "class_name": "HavenAccounts" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["HavenRelay"] }, { "tag": "v2", "new_sqlite_classes": ["ContentBudget"] }, { "tag": "v3", "new_sqlite_classes": ["HavenAccounts"] }],
+  "vars": { "DISCORD_CLIENT_ID": "1564576728410759199", "HAVEN_ACCOUNTS": "required", "HAVEN_ACCESS_CODES": "required" },
+  "ratelimits": [{ "name": "HAVEN_CONTENT_RATE", "namespace_id": "4710", "simple": { "limit": 60, "period": 60 } }],
+  "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } }
+}

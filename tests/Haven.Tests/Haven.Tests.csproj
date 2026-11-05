@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Haven/Native/Upstream/Sync/SyncModels.cs" Link="Native/SyncModels.cs" />
+    <Compile Include="../../src/Haven/Native/Upstream/Sync/RelaySyncService*.cs" Link="Native/%(Filename)%(Extension)" />
+    <Compile Include="../../src/Haven/Native/Upstream/Sync/LanePayloads.cs" Link="Native/LanePayloads.cs" />
+    <Compile Include="../../src/Haven/Native/Upstream/Sync/WireDumpDecoder.cs" Link="Native/WireDumpDecoder.cs" />
+    <Compile Include="../../src/Haven/Native/Upstream/Services/NetStatsService.cs" Link="Native/NetStatsService.cs" />
+    <Compile Include="../../src/Haven/LockerUpload.cs" Link="LockerUpload.cs" />
+    <ProjectReference Include="../../src/Haven.Core/Haven.Core.csproj" />
+    <ProjectReference Include="../../src/Haven.Relay/Haven.Relay.csproj" />
+  </ItemGroup>
+</Project>
