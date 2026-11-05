@@ -1,0 +1,29 @@
+[
+  {
+    "Author": "Haven contributors; Enceladeum (native engine)",
+    "Name": "Haven",
+    "InternalName": "Haven",
+    "AssemblyVersion": "0.65.3.0",
+    "Description": "Personal housing interiors without owning a house: the full furnishing catalogue, lighting, music and atmosphere, saved on your PC. Host gatherings for friends to visit and decorate together. Everything is drawn on your own client; your character never leaves the spot you entered from. Invite-only alpha: gatherings need a Haven account and an access code. Requires Stagehand.",
+    "ApplicableVersion": "any",
+    "RepoUrl": "https://github.com/queenofardour/Haven",
+    "Tags": [
+      "housing",
+      "roleplay",
+      "stagehand"
+    ],
+    "DalamudApiLevel": 15,
+    "LoadRequiredState": 0,
+    "LoadSync": false,
+    "CanUnloadAsync": false,
+    "LoadPriority": 0,
+    "IconUrl": "https://raw.githubusercontent.com/queenofardour/Haven/main/images/icon.png",
+    "Punchline": "Housing interiors of your own, to furnish and share for roleplay.",
+    "AcceptsFeedback": true,
+    "DownloadLinkInstall": "https://github.com/queenofardour/Haven/releases/download/v0.65.3/Haven-alpha-0.65.3.zip",
+    "DownloadLinkUpdate": "https://github.com/queenofardour/Haven/releases/download/v0.65.3/Haven-alpha-0.65.3.zip",
+    "IsHide": false,
+    "IsTestingExclusive": false,
+    "LastUpdate": 1793872666
+  }
+]
