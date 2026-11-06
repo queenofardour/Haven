@@ -104,7 +104,7 @@ public static partial class HouseFormat
                 || f.Position is not { Length: 3 }
                 || !f.Position.All(x => float.IsFinite(x) && Math.Abs(x) <= 10000) || !SafeAngles.Sane(f.Rotation, f.Pitch, f.Roll) || f.StainId > ushort.MaxValue || f.SurfaceFinish > int.MaxValue
                 || !float.IsFinite(f.Scale) || f.Scale is < 0.05f or > 10
-                || f.SoundVolume is float volume && (f.BuildingPart != null || !float.IsFinite(volume) || volume is < 0 or > 1)
+                || f.SoundVolume is float volume && (f.BuildingPart is { } part && !BuildingParts.TakesSoundVolume(part) || !float.IsFinite(volume) || volume is < 0 or > 1)
                 || f.Display != 0 && (f.BuildingPart != null || f.Display > 100_000 || f.Picture != 0 || f.CustomPicture != null || f.SurfaceFinish != 0)
                 || f.Aquarium is { } tank && (f.BuildingPart != null || tank.Fish is not { Length: <= Aquariums.MaxTier } || tank.Fish.Any(x => x is 0 or > 100_000)
                     || tank.Decor > Aquariums.MaxDecor || f.Display != 0))

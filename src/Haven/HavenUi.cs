@@ -4,7 +4,7 @@ using Dalamud.Interface.Utility;
 
 namespace Haven;
 
-internal enum HavenIcon { Home, Chair, Paint, Music, Friends, Library, Plus, Search, Check, Play, Stop, Leaf, Undo, Redo, Wrench, Refresh, Close, Alert, Info, Back, More, Settings, Copy, Star, Grid, Trash, Custom, Camera, Download, FreeCamera }
+internal enum HavenIcon { Home, Chair, Paint, Music, Friends, Library, Plus, Search, Check, Play, Stop, Leaf, Undo, Redo, Wrench, Refresh, Close, Alert, Info, Back, More, Settings, Copy, Star, Grid, Trash, Custom, Camera, Download, FreeCamera, Light, Sparkle }
 
 // Shared native draw primitives under the HavenKit components: line icons, colour conversion and the invisible
 // native button that gives custom-drawn controls focus, navigation and hit testing.
@@ -70,6 +70,10 @@ internal static class HavenUi
                 L(12, 2, 12, 22); L(2, 12, 22, 12);
                 L(9, 5, 12, 2); L(12, 2, 15, 5); L(9, 19, 12, 22); L(12, 22, 15, 19);
                 L(5, 9, 2, 12); L(2, 12, 5, 15); L(19, 9, 22, 12); L(22, 12, 19, 15); C(12, 12, 3); break;
+            // A light bulb: a world piece that brings a light of its own.
+            case HavenIcon.Light: C(12, 9, 6.5f); L(9, 15, 9, 18); L(15, 15, 15, 18); L(9, 18, 15, 18); L(10, 21, 14, 21); break;
+            // A sparkle: a world piece that brings effects of its own (a flame, spray, glitter).
+            case HavenIcon.Sparkle: L(12, 2, 12, 22); L(2, 12, 22, 12); L(6, 6, 18, 18); L(18, 6, 6, 18); break;
             case HavenIcon.Camera: R(2, 7, 22, 20); C(12, 13.5f, 4); L(8, 7, 10, 4); L(10, 4, 14, 4); L(14, 4, 16, 7); break;
             // Custom content made by a player: a package with a sparkle.
             case HavenIcon.Custom: R(2, 10, 16, 22); L(2, 15, 16, 15); L(9, 10, 9, 15); L(19, 1, 19, 9); L(15, 5, 23, 5); L(17, 3, 21, 7); L(21, 3, 17, 7); break;

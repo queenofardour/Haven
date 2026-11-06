@@ -4,6 +4,7 @@ using FFXIVClientStructs.FFXIV.Client.Graphics;
 using FFXIVClientStructs.FFXIV.Client.Graphics.Scene;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
 using Haven.Core;
+using Haven.Native.PatchCheck;
 
 namespace Haven;
 
@@ -14,6 +15,14 @@ internal sealed unsafe class FurnitureVisuals(FurnitureCatalogue catalogue, IPlu
 {
     public bool BuildingFinishesAvailable => materials.Available;
     private readonly record struct Key(Guid Id, int Part, bool Preview, Guid Proposal = default);
+    // The glow canary: a new model's +0xCD reads 255 (the client's constructor) while the field is where Haven thinks.
+    private static int glowReadings;
+    private void GlowCanary(byte value)
+    {
+        if (value != 255) { PatchGuard.Canary(PatchFeature.FurnishingGlow, $"a new model's glow byte (BgObject +0xCD) read {value}, not 255"); return; }
+        if (++glowReadings == 3) PatchGuard.CanaryPassed(PatchFeature.FurnishingGlow);
+    }
+
     private sealed class Live(nint pointer, string path)
     {
         public nint Pointer = pointer;
@@ -26,6 +35,7 @@ internal sealed unsafe class FurnitureVisuals(FurnitureCatalogue catalogue, IPlu
         public readonly DateTimeOffset Created = DateTimeOffset.UtcNow;
         public bool Warned;
         public bool WasReady;
+        public bool GlowChecked;
     }
     private readonly Dictionary<Key, Live> objects = [];
     private readonly List<Key> removed = [];
@@ -148,16 +158,19 @@ internal sealed unsafe class FurnitureVisuals(FurnitureCatalogue catalogue, IPlu
                 : playing is { } p && model.ActionGlows?.TryGetValue(p.SubId, out var fades) == true ? GlowFade.ToByte(SgbTimelines.GlowLevel(fades!, p.Since))
                 : model.LoopGlow is {} lap ? lap.Byte(animationMilliseconds)
                 : model.Glow is {} fade ? fade.Byte(on, preview ? long.MaxValue : switchAge?.Invoke(item) ?? long.MaxValue) : (byte)255;
-            if (((byte*)obj)[0xCD] != glow) ((byte*)obj)[0xCD] = glow;
+            // +0xCD isn't in ClientStructs: its first reading on each new model checks it's still the glow (the client's
+            // constructor sets 255), and after a game patch it's written only once that check passes (PatchGuard).
+            if (!live.GlowChecked) { live.GlowChecked = true; GlowCanary(((byte*)obj)[0xCD]); }
+            if (((byte*)obj)[0xCD] != glow && PatchGuard.Allows(PatchFeature.FurnishingGlow)) ((byte*)obj)[0xCD] = glow;
             // A one-shot's colour override (C113: a gathering machine's red flash), as the client's setter writes it:
             // +0xCE intensity, +0xD0..+0xD2 colour, +0xD3 blend; none (0,0,0,0 at intensity 1) otherwise.
             if (model.ActionColours != null)
             {
                 var (intensity, r, g, bl, a) = SgbTimelines.ColourBytes(playing is { } c && model.ActionColours.TryGetValue(c.SubId, out var steps)
                     ? SgbTimelines.ColourAt(steps, c.Since) : Vector4.Zero);
-                var bytes = (byte*)obj;
-                if (bytes[0xCE] != intensity || bytes[0xD0] != r || bytes[0xD1] != g || bytes[0xD2] != bl || bytes[0xD3] != a)
-                { bytes[0xCE] = intensity; bytes[0xD0] = r; bytes[0xD1] = g; bytes[0xD2] = bl; bytes[0xD3] = a; }
+                // ClientStructs' ColorIntensity (+0xCE) and Color (+0xD0..+0xD3).
+                if (obj->ColorIntensity != intensity || obj->Color.R != r || obj->Color.G != g || obj->Color.B != bl || obj->Color.A != a)
+                { obj->ColorIntensity = intensity; obj->Color.R = r; obj->Color.G = g; obj->Color.B = bl; obj->Color.A = a; }
             }
             if (ready)
             {

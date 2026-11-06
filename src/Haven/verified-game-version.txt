@@ -1,0 +1,4 @@
+# The FFXIV version (ffxivgame.ver, also Framework.GameVersionString) this Haven was last tried in game on.
+# While the running game is newer, features that write game memory at Haven's own offsets are paused
+# (Haven.Core.PatchFeature). Update this line once a release has been checked in game on a new game version.
+2026.10.16.0000.0000

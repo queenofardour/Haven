@@ -132,6 +132,19 @@ internal sealed class NpcModStore(IDalamudPluginInterface plugin, IPluginLog log
         return (paths, set.Meta);
     }
 
+    /// <summary>Every set this PC keeps (framework thread; each read once, as Stored does).</summary>
+    public IReadOnlyList<NpcModSet> All()
+    {
+        if (!Directory.Exists(Root)) return [];
+        var found = new List<NpcModSet>();
+        foreach (var file in Directory.EnumerateFiles(Root, "*.json"))
+            if (Guid.TryParseExact(Path.GetFileNameWithoutExtension(file), "N", out var npc) && Stored(npc) is { } set) found.Add(set);
+        return found;
+    }
+
+    /// <summary>Deletes store files no kept set uses any more. Only while nothing is being kept (NpcModShare's busy flag).</summary>
+    public void TidyFiles() => Tidy();
+
     /// <summary>A set Keep wrote (framework thread).</summary>
     public void Remember(NpcModSet set) => sets[set.Npc] = set;
 

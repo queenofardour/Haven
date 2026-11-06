@@ -2,7 +2,7 @@ namespace Haven.Core;
 
 public static class HousingWire
 {
-    public const int ProtocolRevision = 40;
+    public const int ProtocolRevision = 41;
     public const byte Snapshot = 0x60;
     public const byte CompressedSnapshot = 0x61;
     public const byte SceneReady = 0x62;

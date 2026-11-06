@@ -468,7 +468,9 @@ internal sealed partial class HousingController
     }
 
     /// <summary>Whether this PC may play a home's custom animations: the owner's, the player's own, or a home whose custom content they agreed to.</summary>
-    private bool ShowsAnimations(string package) => active != null && (OwnsActiveHouse || CustomPicturesLoaded || Animations.Item(package) != null);
+    // A package that needs game data this game lacks (a free trial) is never shown: its balls stand still, as for a
+    // guest who declined the home's custom content.
+    private bool ShowsAnimations(string package) => active != null && (OwnsActiveHouse || CustomPicturesLoaded || Animations.Item(package) != null) && !Animations.LacksGameData(package);
 
     // Each frame: the home's custom animations are served; the owner shares its packages and guests who agreed fetch
     // them; the player's ball holds them and starts or stops its animation; others' scales and tilts are applied; and
@@ -585,7 +587,7 @@ internal sealed partial class HousingController
             ushort emote;
             if (role.Custom)
             {
-                if (!ShowsAnimations(set.Package!)) { Bound = bound with { Status = "Load this home's custom content (Visit panel) to play this animation." }; return; }
+                if (!ShowsAnimations(set.Package!)) { Bound = bound with { Status = Animations.LacksGameData(set.Package!) ? "This animation needs an expansion's game data your game doesn't have, so it isn't played here." : "Load this home's custom content (Visit panel) to play this animation." }; return; }
                 if (!Animations.Serving(set.Package!, role.Animation, role.Carrier, role.Silent))
                 { Bound = bound with { Status = Animations.Has(set.Package!) ? "Preparing the animation…" : "Getting the animation…" }; return; }
                 emote = PoseCarriers.Get(role.Carrier)!.Value.Emote;

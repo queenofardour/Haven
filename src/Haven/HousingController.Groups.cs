@@ -27,6 +27,8 @@ internal sealed partial class HousingController
         }
     }
     private bool IsFollower(Guid id) { foreach (var f in followers) if (f.Id == id) return true; return false; }
+    /// <summary>Whether a piece moves with the one being moved (a group's), so it isn't drawn where it stood.</summary>
+    public bool MovesWithPlacement(Guid id) => MovingId != null && IsFollower(id);
 
     /// <summary>Moves several placed pieces together, led by one of them.</summary>
     public void BeginGroupPlacement(IReadOnlyCollection<Guid> ids, Guid leader)
@@ -118,6 +120,8 @@ internal sealed partial class HousingController
     {
         if (active == null) return;
         var group = SavedGroups.FirstOrDefault(g => g.Id == id) ?? throw new InvalidOperationException("That group is no longer saved.");
+        if (IsSharedVisit && group.Pieces.Any(NeedsNewerServer))
+            throw new InvalidOperationException("This group has world effects or sounds (or a world set's sound volume), which can be placed in Just me visits for now: gatherings can carry them once Haven's server is updated.");
         var missing = group.Pieces.Where(f => f.CustomFurniture is { } hash && !Furniture.Has(hash)).Count();
         var (leader, rest) = Haven.Core.SavedGroups.Copies(group);
         BeginPlacement(leader);

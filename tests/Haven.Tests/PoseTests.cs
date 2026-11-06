@@ -424,6 +424,13 @@ internal static class PoseTests
                 var hash = ContentLocker.Fingerprint(zip);
                 var served = PoseAnimations.EffectRedirections([hash], h => h == hash ? read.Manifest : null, (p, n) => "disk/" + n);
                 Assert(served.Count == 3 && served.ContainsKey(waveEffect) && served.ContainsKey(copy));
+                // A free trial checks what the package points at without carrying it: here only the base game's effects and
+                // textures, never asked about; an effect's texture or a sound from Dawntrail's data, which a trial lacks, is found.
+                static bool Trial(string path) => GameDataPaths.Expansion(path) <= 3;
+                Assert(PackageNeeds.Missing(read.Files.Select(f => (f.Key, f.Value)), _ => false) == null);
+                Assert(PackageNeeds.Missing([("e.avfx", Avfx(modTexture, "bg/ex5/02_ykt_y6/fld/y6f1/texture/y6f1_a1_wate1_d.tex"))], Trial) is { Expansion: 5 });
+                Assert(PackageNeeds.Missing([("a.pap", Pap(["x"], "music/ex5/BGM_EX5_Field_01.scd"))], Trial) is { Path: "music/ex5/bgm_ex5_field_01.scd", Expansion: 5 });
+                Assert(PackageNeeds.Missing([("a.pap", Pap(["x"], "music/ex3/BGM_EX3_Field_01.scd"))], Trial) == null);
                 // Damaged or mismatched effects are refused.
                 Assert(Refuses(() => PoseAnimations.Read(Tamper(zip, waveEffect[PoseAnimations.EffectRoot.Length..], b => b[..^4]))));
                 Assert(Refuses(() => AvfxFiles.Check(effect[..^4])) && Refuses(() => AvfxFiles.Check(Corrupt(effect, 4, 9))));

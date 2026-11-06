@@ -56,6 +56,7 @@ public static class WorldThumbnails
         try
         {
             if (read(material) is not { } mtrl) return (null, new(.7f), 0, false);
+            if (Invisible(material, mtrl)) return (null, default, 0, true);
             var shader = FurnitureFiles.MaterialShader(mtrl);
             if (Unseen.Any(s => shader.Contains(s, StringComparison.Ordinal))) return (null, default, 0, true);
             if (Water.Any(s => shader.Contains(s, StringComparison.Ordinal))) return (null, new(.33f, .52f, .66f), 0, false);
@@ -69,6 +70,18 @@ public static class WorldThumbnails
             return (texture == null ? null : Texture(texture, read, textures), texture == null ? colour * .7f : colour, cut, false);
         }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or IndexOutOfRangeException or OverflowException) { return (null, new(.7f), 0, false); }
+    }
+
+    /// <summary>
+    /// Whether a material is one the game draws nothing with: a collision surface's (bgcommon/collision/material, the
+    /// invisible walls and ramps a zone's layout keeps beside what's seen) or a placeholder's, whose every texture is the
+    /// game's blank dummy or a collision texture (tinted yellow, tan or grey in the files, but never drawn).
+    /// </summary>
+    public static bool Invisible(string material, byte[] mtrl)
+    {
+        if (material.StartsWith("bgcommon/collision/", StringComparison.Ordinal)) return true;
+        var textures = FurnitureFiles.MaterialTextures(mtrl);
+        return textures.Count > 0 && textures.All(t => t.StartsWith("bgcommon/texture/dummy", StringComparison.Ordinal) || t.StartsWith("bgcommon/collision/", StringComparison.Ordinal));
     }
 
     private static bool IsDetailMap(string texture)

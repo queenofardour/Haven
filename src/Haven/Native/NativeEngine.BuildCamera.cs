@@ -104,7 +104,10 @@ public sealed partial class NativeEngine
 
     private unsafe nint CameraCollideDetour(nint camera, System.Numerics.Vector3* from, System.Numerics.Vector3* to, float distance, nint unknown, float radius)
     {
-        if (camera != buildCamera || buildCameraFocus == null || !packetFilter.IsActive) return cameraCollideHook!.Original(camera, from, to, distance, unknown, radius);
+        // The distance fields (+0x218/+0x21C) aren't in ClientStructs: after a game patch the camera collides as usual
+        // until Haven is updated (PatchGuard).
+        if (camera != buildCamera || buildCameraFocus == null || !packetFilter.IsActive || !Haven.Native.PatchCheck.PatchGuard.Allows(Haven.Core.PatchFeature.BuildCamera))
+            return cameraCollideHook!.Original(camera, from, to, distance, unknown, radius);
         // Nothing in the way: the camera may pull back as far as it is zoomed.
         *(float*)(camera + 0x218) = distance + .001f;
         *(float*)(camera + 0x21C) = distance + .001f;

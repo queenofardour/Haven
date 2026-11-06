@@ -203,6 +203,82 @@ internal sealed class CustomFurnitureLibrary : IDisposable
         nextRegistration = default;
     }
 
+    // Downloaded for other people's homes (ContentCache) ------------------------
+
+    // A package's id, read from its manifest once (packages are named by fingerprint, so it never changes).
+    private readonly ConcurrentDictionary<string, string?> ids = new();
+    private string? IdOf(string hash)
+    {
+        lock (gate) if (ready.TryGetValue(hash, out var manifest)) return manifest.Id;
+        return ids.GetOrAdd(hash, h =>
+        {
+            try { using var file = File.OpenRead(PackageFile(h)); return FurniturePackages.ManifestId(file); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+        });
+    }
+    // An unpacked folder's size, remembered once it has files (a package's files never change).
+    private readonly ConcurrentDictionary<string, long> folderSizes = new();
+    private long FolderSize(string? id)
+    {
+        if (id == null) return 0;
+        if (folderSizes.TryGetValue(id, out var known)) return known;
+        if (!Directory.Exists(Path.Combine(unpacked, id))) return 0;
+        try
+        {
+            var size = new DirectoryInfo(Path.Combine(unpacked, id)).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length);
+            if (size > 0) folderSizes[id] = size;
+            return size;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }
+    }
+
+    /// <summary>Packages on this PC that aren't the player's own: fetched for other people's homes, with their unpacked files.</summary>
+    public List<CachedContent> Downloaded()
+    {
+        var found = new List<CachedContent>();
+        if (!Directory.Exists(packages)) return found;
+        HashSet<string> mine; lock (gate) mine = [.. records.Keys];
+        foreach (var file in new DirectoryInfo(packages).EnumerateFiles("*.zip", SearchOption.AllDirectories))
+        {
+            var hash = Path.GetFileNameWithoutExtension(file.Name);
+            if (ContentLocker.IsFingerprint(hash) && !mine.Contains(hash)) found.Add(new("furniture", hash, file.Length + FolderSize(IdOf(hash)), file.LastWriteTimeUtc));
+        }
+        return found;
+    }
+
+    /// <summary>Notes that a home uses a downloaded package now, so the cache keeps it longest.</summary>
+    public void Touch(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || Item(hash) != null || !Has(hash)) return;
+        try { File.SetLastWriteTimeUtc(PackageFile(hash), DateTime.UtcNow); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>
+    /// Deletes a downloaded package (never one of the player's own) and its unpacked files, unless another package on
+    /// this PC unpacks to the same folder. It is fetched again when a home needs it. Outside a home only.
+    /// </summary>
+    public long ForgetDownloaded(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || Item(hash) != null || !File.Exists(PackageFile(hash))
+            || working.TryGetValue(hash, out var busy) && !busy.IsCompleted) return 0;
+        var id = IdOf(hash);
+        var size = new FileInfo(PackageFile(hash)).Length + FolderSize(id);
+        // Another package with the same id (the same import kept twice) holds the same files: its folder stays.
+        var shared = id != null && Directory.Exists(packages) && new DirectoryInfo(packages).EnumerateFiles("*.zip", SearchOption.AllDirectories)
+            .Select(f => Path.GetFileNameWithoutExtension(f.Name)).Any(other => other != hash && ContentLocker.IsFingerprint(other) && IdOf(other) == id);
+        lock (gate) { ready.Remove(hash); registered.Remove(hash); props.Remove(hash); }
+        try
+        {
+            present.TryRemove(hash, out _); unusable.TryRemove(hash, out _); ids.TryRemove(hash, out _);
+            File.Delete(PackageFile(hash));
+            if (id != null && !shared && Directory.Exists(Path.Combine(unpacked, id))) { folderSizes.TryRemove(id, out _); Directory.Delete(Path.Combine(unpacked, id), true); }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { log.Warning(ex, "[Haven] A downloaded furnishing's files could not be deleted."); }
+        nextRegistration = default;
+        return size;
+    }
+
     public void Change(string hash, Func<FurnitureRecord, FurnitureRecord> change)
     {
         lock (gate) { if (records.TryGetValue(hash, out var item)) { records[hash] = change(item); Save(); } }
@@ -244,6 +320,13 @@ internal sealed class CustomFurnitureLibrary : IDisposable
     private void UnpackOne(string hash)
     {
         var package = FurniturePackages.Read(Package(hash));
+        // A game file it points at without carrying it, from an expansion this game lacks (a free trial), would close
+        // the game when drawn: it shows as its original furnishing here instead.
+        if (PackageNeeds.Missing(package.Files.Select(f => (f.Key, f.Value)), data.FileExists) is { } needs)
+        {
+            log.Warning("[Haven] The custom furnishing {Name} isn't shown: it needs {Path}, which this game doesn't have.", package.Manifest.Name, needs.Path);
+            throw new InvalidDataException(PackageNeeds.Message($"\"{package.Manifest.Name}\"", needs.Expansion) + " It shows as its original furnishing.");
+        }
         var folder = Path.Combine(unpacked, package.Manifest.Id);
         lock (gate)
         {

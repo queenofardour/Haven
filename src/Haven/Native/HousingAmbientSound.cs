@@ -31,14 +31,18 @@ internal sealed unsafe class HousingAmbientSound(IPluginLog log)
         }
     }
 
+    // Still Haven's sound: the same manager, active or loading, and once loaded the same resource it first loaded (not
+    // the file's name, which a Penumbra mod replacing the sound changes, so the loop would never be stopped or handed back).
+    private nint resource;
     private bool Owns()
     {
         if (sound == null || manager == null || SoundManager.Instance() != manager) return false;
         if (!sound->IsActive && !sound->IsLoadingSoundResource) return false;
-        if (sound->SoundResourceHandle == null) return true;
+        var loaded = (nint)sound->SoundResourceHandle;
+        if (loaded == 0) return true;
+        if (resource == 0) resource = loaded;
         // A slot the game has since handed to another sound isn't Haven's.
-        var file = sound->GetFileName().ToString().Replace('\\', '/');
-        return file.Length == 0 || file.EndsWith(path, StringComparison.OrdinalIgnoreCase);
+        return resource == loaded;
     }
 
     public bool Play(string file, float volume)
@@ -48,7 +52,7 @@ internal sealed unsafe class HousingAmbientSound(IPluginLog log)
         if (instance == null) return false;
         var played = instance->PlaySystemSound(file, Math.Clamp(volume, 0, 1), 0, 0, false, SoundVolumeCategory.BypassVolumeRules);
         if (played == null) return false;
-        manager = instance; sound = played; path = file; startedAt = Environment.TickCount64;
+        manager = instance; sound = played; path = file; startedAt = Environment.TickCount64; resource = 0;
         return true;
     }
 
@@ -62,7 +66,9 @@ internal sealed unsafe class HousingAmbientSound(IPluginLog log)
         var owned = Owns(); var old = sound;
         sound = null; manager = null;
         if (!owned) return;
-        try { old->Stop(fadeMs); }
+        // Stopped, then handed to the game's auto-release, so its slot (one of 256 the whole game shares) comes back once the
+        // fade-out ends; before 0.66.5 the pointer was only dropped, and each loop replaced kept a slot for good.
+        try { old->Stop(fadeMs); old->IsAutoReleaseEnabled = true; }
         catch (Exception ex) { log.Warning(ex, "[ATMOSPHERE] the outside sound could not be stopped."); }
     }
 }

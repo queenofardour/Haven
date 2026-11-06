@@ -22,9 +22,9 @@ public sealed partial class NativeEngine
         if (!HousingZoneReady(territory)) return list;
         var env = EnvManager.Instance();
         if (env == null || env->EnvScene == null) return list;
-        var table = (byte*)env->EnvScene + 0x30;
+        var table = env->EnvScene->WeatherIds;
         var sheet = dataManager.GetExcelSheet<Weather>();
-        for (var i = 0; i < 32; i++)
+        for (var i = 0; i < table.Length; i++)
         {
             var id = table[i];
             if (id == 0 || list.Any(x => x.Item1 == id)) continue;
@@ -67,9 +67,8 @@ public sealed partial class NativeEngine
 
         var env = EnvManager.Instance();
         if (env == null || env->EnvScene == null) return;
-        var table = (byte*)env->EnvScene + 0x30;
-        bool Holds(uint id) { for (var i = 0; i < 32; i++) if (table[i] == id) return true; return false; }
-        if (weather is uint chosen && chosen is > 0 and <= 255 && Holds(chosen))
+        var table = env->EnvScene->WeatherIds;
+        if (weather is uint chosen && chosen is > 0 and <= 255 && table.Contains((byte)chosen))
         {
             if (env->ActiveWeather != chosen)
             {

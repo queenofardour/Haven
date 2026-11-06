@@ -13,6 +13,13 @@ internal sealed record SettingsPicture(string Hash, long Size, float Aspect, str
 internal sealed record SettingsSong(string Hash, string Title, string Detail, string[] Homes, bool Stored);
 // One of the player's custom furnishings: its name, what it is built on, where it is placed.
 internal sealed record SettingsFurniture(string Hash, string Name, string Detail, string[] Homes);
+/// <summary>
+/// What this PC keeps of custom content downloaded for other people's homes (not used by any home here), the most it
+/// keeps, and the built picture frames; whether a home is open (clearing waits until the player leaves it).
+/// </summary>
+internal sealed record SettingsStorage(long Downloaded, int Items, long Limit, long Frames, bool InHome, bool Clearing);
+/// <summary>The mods this PC keeps for one NPC: its name, size, where it is used (homes, Your NPCs) or where it came from.</summary>
+internal sealed record SettingsNpcMods(Guid Npc, string Name, string Detail, string Where, string[] Homes, bool Saved);
 internal sealed record SettingsUsage(long OwnerBytes, long OwnerLimit, int UploadsToday, int UploadsPerDay, long PoolBytes, long PoolLimit, DateTimeOffset At);
 internal sealed record SettingsModel(bool Effects, bool Sounds, int MaxEffects, int MaxSounds, IReadOnlyList<SettingsHome> Homes,
     string HomesFolder, string DeletedFolder, string Relay, string HostedRelay, string HostCode, bool CanChangeConnection,
@@ -35,9 +42,26 @@ internal sealed record SettingsModel(bool Effects, bool Sounds, int MaxEffects, 
     public IReadOnlyList<string> AnimationProps { get; init; } = [];
     public int PropChoices { get; init; }
     public SettingsUsage? Usage { get; init; }
+    public SettingsStorage? Storage { get; init; }
+    public IReadOnlyList<SettingsNpcMods> NpcMods { get; init; } = [];
     public Func<string, ImTextureID?>? Thumbnail { get; init; }
     public SettingsAccount Account { get; init; } = new(false, "", false, null);
+    public SettingsPatch Patch { get; init; } = new(true, false, [], []);
+    /// <summary>Whether Haven draws furnishing lights itself (instead of Stagehand), and how many it draws now (all, world pieces').</summary>
+    public bool HavenLights { get; init; }
+    public (int All, int World) HavenLightCount { get; init; }
+    /// <summary>Whether Haven draws furnishing effects itself (instead of Stagehand), and how many it draws now.</summary>
+    public bool HavenEffects { get; init; }
+    public int HavenEffectCount { get; init; }
+    /// <summary>Whether Haven plays furnishing sounds itself (instead of Stagehand), and how many it plays now.</summary>
+    public bool HavenSounds { get; init; }
+    public int HavenSoundCount { get; init; }
 }
+/// <summary>
+/// After a game update: whether the game is the version this Haven was checked on, whether the player turned paused
+/// features on for it, what's paused, and the self-check's lines.
+/// </summary>
+internal sealed record SettingsPatch(bool Checked, bool AllowedHere, IReadOnlyList<string> Paused, IReadOnlyList<string> Lines);
 /// <summary>This PC's Haven account (Discord sign-in).</summary>
 internal sealed record SettingsAccount(bool SignedIn, string Name, bool SigningIn, string? Problem, string? Code = null);
 /// <summary>Room chat preferences: the [Haven] sender marker, emote log lines and typing bubbles.</summary>
@@ -45,7 +69,8 @@ public readonly record struct ChatPreferences(bool Tag, bool EmoteMessages, bool
 
 internal enum SettingsAction { None, Chat, Ambience, Import, Export, OpenHomes, OpenDeleted, OpenLayouts, OpenGroups, SaveRelay, UseHostedRelay, SaveCode, NewCode, CopyCode,
     Close, DeletePicture, DeleteUnusedPictures, DeleteSong, DeleteFurniture, DeleteAnimations,
-    SignIn, SignOut, CancelSignIn, WarnMinionProps, RemoveProps, ForgetPropChoices, Changelog, WarnTiltedSeats }
+    SignIn, SignOut, CancelSignIn, WarnMinionProps, RemoveProps, ForgetPropChoices, Changelog, WarnTiltedSeats, PatchAllow,
+    DownloadLimit, ClearDownloads, RemoveNpcMods, HavenLights, HavenEffects, HavenSounds }
 internal readonly record struct SettingsCommand(SettingsAction Action, bool First = false, bool Second = false, Guid Home = default, string Text = "")
 {
     public ChatPreferences Chat { get; init; }
@@ -60,8 +85,10 @@ internal sealed class SettingsState
     public string? Deleting;
     // The delete dialog's "also from Haven's server" choice.
     public bool DeleteFromServer = true;
-    // Custom content: 0 pictures, 1 music, 2 furniture, 3 animations.
+    // Custom content: 0 pictures, 1 music, 2 furniture, 3 animations, 4 NPC mods.
     public int Content;
+    // NPC mods: the NPC whose mods are being removed, while its dialog is open.
+    public Guid RemovingNpc;
 }
 
 // Sizes of custom content, as Settings and the panels show them.
@@ -157,11 +184,21 @@ internal static class SettingsUi
         }
         ImGui.Dummy(Px(0, Space3));
         var content = state.Content;
-        if (HavenKit.Segmented("settings-content", [$"Pictures · {model.Pictures.Count}", $"Music · {model.Songs.Count}", $"Furniture · {model.Furniture.Count}", $"Animations · {model.Animations.Count}"], ref content)) state.Content = content;
+        if (HavenKit.Segmented("settings-content", [$"Pictures · {model.Pictures.Count}", $"Music · {model.Songs.Count}", $"Furniture · {model.Furniture.Count}",
+            $"Animations · {model.Animations.Count}", $"NPC mods · {model.NpcMods.Count}"], ref content)) state.Content = content;
         ImGui.Dummy(Px(0, Space1));
-        if (state.Content == 1) return Music(state, model);
-        if (state.Content == 2) return Furniture(state, model);
-        if (state.Content == 3) return Animations(state, model);
+        var chosen = state.Content switch { 1 => Music(state, model), 2 => Furniture(state, model), 3 => Animations(state, model), 4 => NpcMods(state, model), _ => PictureList(state, model) };
+        if (chosen.Action != SettingsAction.None) command = chosen;
+        // What this PC keeps, below whichever list is shown.
+        ImGui.Dummy(Px(0, Space4));
+        if (OnThisPc(model) is { Action: not SettingsAction.None } stored) command = stored;
+        return command;
+    }
+
+    // The owner's pictures (originals, each framed per frame).
+    private static SettingsCommand PictureList(SettingsState state, SettingsModel model)
+    {
+        var command = default(SettingsCommand);
         var total = model.Pictures.Sum(p => p.Size);
         HavenKit.SectionTitle("Your pictures", model.Pictures.Count == 0 ? "" : $"{model.Pictures.Count} · {ContentSizes.Megabytes(total)} on this PC");
         HavenKit.Caption(model.Pictures.Count == 0 ? "Pictures you upload appear here, ready to hang in any frame."
@@ -187,6 +224,97 @@ internal static class SettingsUi
             if (DeleteDialog(state, picture.Hash) is { Action: not SettingsAction.None } deleted) command = deleted;
         ImGui.Dummy(Px(0, Space2));
         HavenKit.Caption("Pictures no gathering uses expire from Haven's server after 30 days; they stay on this PC until you delete them.");
+        return command;
+    }
+
+    // Content downloaded for other people's homes: how much this PC keeps, the most it keeps, and clearing it.
+    private static readonly string[] LimitNames = [.. ContentCache.Limits.Select(ContentSizes.Megabytes)];
+    private static SettingsCommand OnThisPc(SettingsModel model)
+    {
+        var command = default(SettingsCommand);
+        if (model.Storage is not { } storage) return command;
+        HavenKit.SectionTitle("On this PC", storage.Frames > 0 ? $"{ContentSizes.Megabytes(storage.Frames)} of built picture frames" : "");
+        Meter(storage.Items == 0 ? "Nothing downloaded for other people's homes is kept here."
+            : $"Downloaded for other people's homes: {ContentSizes.Megabytes(storage.Downloaded)} of {ContentSizes.Megabytes(storage.Limit)} kept ({storage.Items} item{(storage.Items == 1 ? "" : "s")})",
+            storage.Downloaded, storage.Limit);
+        var limit = Array.IndexOf(ContentCache.Limits, storage.Limit);
+        if (HavenKit.Select("##settings-download-limit", "Keep at most", LimitNames, ref limit, Px(160)) && limit >= 0)
+            command = new(SettingsAction.DownloadLimit, Text: ContentCache.Limits[limit].ToString(System.Globalization.CultureInfo.InvariantCulture));
+        ImGui.SameLine(0, Px(Space2));
+        ImGui.BeginDisabled(storage.InHome || storage.Clearing || storage.Items == 0);
+        if (HavenKit.Button(storage.Clearing ? "Clearing…##settings-clear-downloads" : "Clear downloaded content…##settings-clear-downloads", ButtonKind.Secondary)) ImGui.OpenPopup("##settings-clear-downloads");
+        ImGui.EndDisabled();
+        if (storage.InHome && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) HavenKit.Tooltip("Leave the home first.");
+        if (HavenKit.BeginDialog("##settings-clear-downloads", "Clear downloaded content?", 460))
+        {
+            HavenKit.Caption($"Deletes the {ContentSizes.Megabytes(storage.Downloaded)} of pictures, furniture and animations downloaded for other people's homes. Haven downloads them again the next time you visit a home that has them.");
+            HavenKit.AlignRight(HavenKit.ButtonWidth("Keep") + HavenKit.ButtonWidth("Clear") + Px(Space2));
+            if (HavenKit.Button("Keep##clear-downloads", ButtonKind.Ghost)) ImGui.CloseCurrentPopup();
+            ImGui.SameLine(0, Px(Space2));
+            if (HavenKit.Button("Clear##clear-downloads", ButtonKind.Danger)) { command = new(SettingsAction.ClearDownloads); ImGui.CloseCurrentPopup(); }
+            HavenKit.EndDialog();
+        }
+        HavenKit.Caption("Past the limit, what a home used longest ago is cleared when Haven starts, and downloaded again on your next visit. Your own content, and anything a home or saved group on this PC uses, is never cleared.");
+        return command;
+    }
+
+    // The mods this PC keeps for NPCs: the player's own NPCs', those of Your NPCs, and those other people's homes sent.
+    private static SettingsCommand NpcMods(SettingsState state, SettingsModel model)
+    {
+        var command = default(SettingsCommand);
+        var inHome = model.Storage?.InHome ?? false;
+        HavenKit.SectionTitle("NPC mods", model.NpcMods.Count == 0 ? "" : $"{model.NpcMods.Count}");
+        HavenKit.Caption(model.NpcMods.Count == 0 ? "Mods you keep for an NPC (its Mods tab in the NPCs panel), or keep when a friend sends their NPC's, appear here."
+            : "The mods this PC keeps for NPCs: yours, and those friends sent you for theirs. Removing them here doesn't tell anyone else; an NPC without them is drawn in its Glamourer look only.");
+        var unused = model.NpcMods.Where(n => n.Homes.Length == 0 && !n.Saved).ToArray();
+        if (unused.Length > 0)
+        {
+            ImGui.BeginDisabled(inHome);
+            if (HavenKit.Button(unused.Length == 1 ? "Remove 1 not used here…" : $"Remove {unused.Length} not used here…", ButtonKind.Secondary)) ImGui.OpenPopup("##settings-remove-unused-npcs");
+            ImGui.EndDisabled();
+            if (inHome && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) HavenKit.Tooltip("Leave the home first.");
+            if (HavenKit.BeginDialog("##settings-remove-unused-npcs", "Remove NPC mods not used here?", 460))
+            {
+                HavenKit.Caption($"Removes the mods kept for {(unused.Length == 1 ? "1 NPC" : $"{unused.Length} NPCs")} that are in no home on this PC and not in Your NPCs. Some may be friends' NPCs: their owner can send them again.");
+                HavenKit.AlignRight(HavenKit.ButtonWidth("Keep") + HavenKit.ButtonWidth("Remove") + Px(Space2));
+                if (HavenKit.Button("Keep##remove-unused-npcs", ButtonKind.Ghost)) ImGui.CloseCurrentPopup();
+                ImGui.SameLine(0, Px(Space2));
+                if (HavenKit.Button("Remove##remove-unused-npcs", ButtonKind.Danger))
+                { command = new(SettingsAction.RemoveNpcMods, Text: string.Join(",", unused.Select(n => n.Npc.ToString("N")))); ImGui.CloseCurrentPopup(); }
+                HavenKit.EndDialog();
+            }
+        }
+        ImGui.Dummy(Px(0, Space1));
+        foreach (var item in model.NpcMods)
+        {
+            ImGui.PushID("npc-mods-" + item.Npc.ToString("N"));
+            using (HavenFonts.Use(HavenText.Strong)) ImGui.TextUnformatted(item.Name);
+            using (HavenFonts.Use(HavenText.Small))
+            {
+                ImGui.PushStyleColor(ImGuiCol.Text, TextSecondary);
+                ImGui.TextUnformatted(item.Detail);
+                ImGui.TextUnformatted(item.Where);
+                ImGui.PopStyleColor();
+            }
+            var inUse = item.Homes.Length > 0;
+            ImGui.BeginDisabled(inHome || inUse);
+            if (HavenKit.Button("Remove…", ButtonKind.Ghost)) { state.RemovingNpc = item.Npc; ImGui.OpenPopup("##settings-remove-npc-mods"); }
+            ImGui.EndDisabled();
+            if ((inHome || inUse) && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                HavenKit.Tooltip(inUse ? "To remove them, use Forget in the NPC's Mods tab in that home." : "Leave the home first.");
+            if (state.RemovingNpc == item.Npc && HavenKit.BeginDialog("##settings-remove-npc-mods", "Remove these NPC mods?", 460))
+            {
+                HavenKit.Caption(item.Saved ? $"{item.Name} in Your NPCs loses its mods, and NPCs you add from it later start without them."
+                    : "They are deleted from this PC. If this is a friend's NPC, they can send its mods again.");
+                HavenKit.AlignRight(HavenKit.ButtonWidth("Keep") + HavenKit.ButtonWidth("Remove") + Px(Space2));
+                if (HavenKit.Button("Keep##settings-remove-npc-mods", ButtonKind.Ghost)) ImGui.CloseCurrentPopup();
+                ImGui.SameLine(0, Px(Space2));
+                if (HavenKit.Button("Remove##settings-remove-npc-mods", ButtonKind.Danger)) { command = new(SettingsAction.RemoveNpcMods, Text: item.Npc.ToString("N")); ImGui.CloseCurrentPopup(); }
+                HavenKit.EndDialog();
+            }
+            ImGui.PopID();
+            ImGui.Dummy(Px(0, Space2));
+        }
         return command;
     }
 
@@ -482,6 +610,40 @@ internal static class SettingsUi
         var command = default(SettingsCommand);
         // Capturing homes from Stagehand stages (and linking them for later edits) was removed on 3 November 2026: the
         // user found it redundant, and no tester had used it.
+        HavenKit.SectionTitle("After a game update");
+        var patch = model.Patch;
+        if (patch.Checked) HavenKit.Caption("The game is the version this Haven was checked on: everything is on.");
+        else
+        {
+            HavenKit.Caption("The game has updated since this Haven was checked. A few extras that rely on details of the game's memory are paused until Haven is updated, so a changed game can't make them misbehave.");
+            var allowed = patch.AllowedHere;
+            if (HavenKit.Toggle("Use them anyway on this game version", ref allowed)) command = new(SettingsAction.PatchAllow, allowed);
+            if (patch.Paused.Count > 0) HavenKit.Caption("Paused: " + string.Join(", ", patch.Paused) + ".");
+        }
+        foreach (var line in patch.Lines) HavenKit.Caption(line);
+        ImGui.Dummy(Px(0, Space3));
+        HavenKit.SectionTitle("Lights", model.HavenLights && model.HavenLightCount.All > 0
+            ? $"{model.HavenLightCount.All} drawn by Haven" + (model.HavenLightCount.World > 0 ? $", {model.HavenLightCount.World} from world pieces" : "") : "");
+        var stagehand = !model.HavenLights;
+        if (HavenKit.Toggle("Use Stagehand's lights instead", ref stagehand)) command = new(SettingsAction.HavenLights, !stagehand);
+        HavenKit.Caption(stagehand
+            ? "Stagehand draws furnishing lights, as before 0.66. World pieces' own lights don't shine this way. Turn this off to go back to Haven's lights."
+            : "Haven draws lamps, the blank canvas's fill light and world pieces' lights itself; Stagehand still draws imported Stagehand objects. If a room's lighting looks wrong, turn this on to compare, and tell us.");
+        ImGui.Dummy(Px(0, Space3));
+        HavenKit.SectionTitle("Effects", model.HavenEffects && model.HavenEffectCount > 0 ? $"{model.HavenEffectCount} drawn by Haven" : "");
+        var stagehandEffects = !model.HavenEffects;
+        if (HavenKit.Toggle("Use Stagehand's effects instead", ref stagehandEffects)) command = new(SettingsAction.HavenEffects, !stagehandEffects);
+        HavenKit.Caption(stagehandEffects
+            ? "Stagehand draws furnishings' flames, steam, water and sparkles, as before 0.66. Turn this off to go back to Haven's effects."
+            : "Haven draws furnishings' flames, steam, water and sparkles itself; Stagehand still plays their sounds. If an effect looks wrong, turn this on to compare, and tell us.");
+        ImGui.Dummy(Px(0, Space3));
+        HavenKit.SectionTitle("Sounds", model.HavenSounds && model.HavenSoundCount > 0 ? $"{model.HavenSoundCount} played by Haven" : "");
+        var stagehandSounds = !model.HavenSounds;
+        if (HavenKit.Toggle("Use Stagehand's sounds instead", ref stagehandSounds)) command = new(SettingsAction.HavenSounds, !stagehandSounds);
+        HavenKit.Caption(stagehandSounds
+            ? "Stagehand plays furnishings' sounds, as before 0.66. World pieces' own sounds don't play this way. Turn this off to go back to Haven's sounds."
+            : "Haven plays furnishings' sounds itself: fountains, fires, chimes, clicks and instruments. If one sounds wrong, turn this on to compare, and tell us.");
+        ImGui.Dummy(Px(0, Space3));
         HavenKit.SectionTitle("Diagnostics");
         foreach (var line in model.Diagnostics) HavenKit.Caption(line);
         return command;

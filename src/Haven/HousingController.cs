@@ -25,6 +25,41 @@ internal sealed partial class HousingController : IDisposable
     private readonly IFramework framework;
     private readonly HousingRuntime runtime;
     private readonly FurnitureVisuals visuals;
+    // Furnishing lights Haven draws itself when HavenLights is on; Stagehand draws them otherwise.
+    private readonly FurnitureLights lights;
+    /// <summary>
+    /// Whether Haven draws furnishing lights and the blank canvas's fill light itself instead of Stagehand (the default
+    /// since 0.66.1; Settings → Advanced can give them back to Stagehand). World groups' lights show only then.
+    /// </summary>
+    public bool HavenLights
+    {
+        get => engine.HousingHavenLights;
+        set { if (engine.HousingHavenLights == value) return; engine.HousingHavenLights = value; if (!value) lights.Clear(); needsRender = true; }
+    }
+    /// <summary>How many lights Haven draws itself now, and how many belong to world pieces.</summary>
+    public (int All, int World) HavenLightCount => lights.Count;
+    // Furnishing effects Haven draws itself when HavenEffects is on; Stagehand otherwise.
+    private readonly FurnitureEffects effects;
+    // A world effect being placed or moved, drawn where the pointer puts it (its own, apart from the home's).
+    private readonly FurnitureEffects previewEffect;
+    /// <summary>Whether Haven draws furnishing effects itself instead of Stagehand (the default since 0.66.4; Settings → Advanced can give them back).</summary>
+    public bool HavenEffects
+    {
+        get => engine.HousingHavenEffects;
+        set { if (engine.HousingHavenEffects == value) return; engine.HousingHavenEffects = value; if (!value) effects.Clear(); needsRender = true; }
+    }
+    /// <summary>How many effects Haven draws itself now.</summary>
+    public int HavenEffectCount => effects.Count;
+    // Furnishing sounds Haven plays itself when HavenSounds is on; Stagehand otherwise.
+    private readonly FurnitureSounds sounds;
+    /// <summary>Whether Haven plays furnishing sounds itself instead of Stagehand (the default since 0.66.7; Settings → Advanced can give them back).</summary>
+    public bool HavenSounds
+    {
+        get => engine.HousingHavenSounds;
+        set { if (engine.HousingHavenSounds == value) return; StopSwitchCues(); engine.HousingHavenSounds = value; if (!value) sounds.Clear(); needsRender = true; }
+    }
+    /// <summary>How many furnishing sounds Haven plays itself now.</summary>
+    public int HavenSoundCount => sounds.Count;
     private readonly ConcurrentQueue<Action> actions = new();
     private readonly Stack<House> undo = new(), redo = new();
     private bool needsRender;
@@ -184,6 +219,10 @@ internal sealed partial class HousingController : IDisposable
         runtime = new HousingRuntime(engine, Catalogue, data, log);
         engine.RegisterHousingEmotes(CanUseNativeFurniture, UseNativeFurniture);
         visuals = new FurnitureVisuals(Catalogue, log, new BuildingMaterials(scanner)) { MachineAction = MachineAction };
+        lights = new FurnitureLights(Catalogue, data, log);
+        effects = new FurnitureEffects(data, log);
+        previewEffect = new FurnitureEffects(data, log);
+        sounds = new FurnitureSounds(data, log);
         engine.HousingSceneChanging += OnSceneChanging;
         // A guest whose game lacks the home's zone (GameDataPaths) leaves the gathering before anything loads.
         engine.LogInstalledExpansions();
@@ -200,6 +239,9 @@ internal sealed partial class HousingController : IDisposable
         // Everything in the game: read from this PC's game data the first time it's wanted.
         World = new WorldCatalogue(data, ConfigDirectory, log, () => Catalogue.ReadyBuildings);
         Catalogue.World = World;
+        Ambient = new AmbientCatalogue(data, log);
+        Catalogue.Ambient = Ambient;
+        World.EffectColour = path => Ambient.Find(path)?.Colour;
         Store = new HouseStore(Path.Combine(pi.ConfigDirectory.FullName, "houses"));
         owners = new HomeOwners(Path.Combine(pi.ConfigDirectory.FullName, "home-owners.json"));
         switchesPath = Path.Combine(pi.ConfigDirectory.FullName, "housing-switches.json");
@@ -333,6 +375,7 @@ internal sealed partial class HousingController : IDisposable
         RequireHousing(house.TerritoryId); RequireInstalled(house.TerritoryId);
         RequireNoVisit();
         RequireAccount();
+        RequireAmbientShareable(house);
         // Detach arrays and JSON from the saved library before admission can begin.
         house = HouseFormat.Parse(HouseFormat.Serialize(house with { FormatVersion = 2 }));
         var scene = new PublishedHouseScene(house);
@@ -376,6 +419,7 @@ internal sealed partial class HousingController : IDisposable
 
     public void Leave()
     {
+        StopPreview();
         Leaving?.Invoke();
         CancelPlacement();
         runtime.Clear();
@@ -448,7 +492,7 @@ internal sealed partial class HousingController : IDisposable
 
     private void OnSnapshot(byte[] bytes) => Interlocked.Exchange(ref receivedSnapshot, bytes);
     private void OnLocationChanged(StageLocation _) => Interlocked.Exchange(ref locationChanged, 1);
-    private void OnSceneChanging() { visuals.Clear(); Interlocked.Exchange(ref locationChanged, 1); }
+    private void OnSceneChanging() { visuals.Clear(); lights.Clear(); effects.Clear(); previewEffect.Clear(); sounds.Clear(); Interlocked.Exchange(ref locationChanged, 1); }
 
     private ulong namedCharacter;
     public void Update()
@@ -460,10 +504,13 @@ internal sealed partial class HousingController : IDisposable
         Run(UpdateCustomMusic);
         Run(UpdateCustomFurniture);
         Run(UpdatePoses);
+        Run(UpdateContentCache);
+        Run(UpdatePreview);
+        Run(UpdateAmbientReady);
         Run(UpdateServerDeletes);
         Run(() =>
         {
-            if (Interlocked.Exchange(ref locationChanged, 0) != 0) { visuals.Clear(); rendered = false; HideAmbience(); }
+            if (Interlocked.Exchange(ref locationChanged, 0) != 0) { visuals.Clear(); lights.Clear(); rendered = false; HideAmbience(); }
             var received = Interlocked.Exchange(ref receivedSnapshot, null);
             if (received != null && engine.HousingRelay.RoomJoinedAcknowledged)
                 ReceiveSharedHouse(HouseFormat.Parse(received));
@@ -488,6 +535,7 @@ internal sealed partial class HousingController : IDisposable
                 if (IsPlacing) CancelPlacement();
                 if (rendered) Hide();
                 visuals.Clear();
+                lights.Clear();
                 runtime.Clear();
                 if (pendingHost == null)
                 {
@@ -520,6 +568,11 @@ internal sealed partial class HousingController : IDisposable
                 if (engine.HousingZoneReady(active.TerritoryId)) runtime.Update(active, MovingId, visuals.PlatformReady, previewInterior, SwitchOn);
                 else { runtime.Clear(); engine.HousingReleaseAtmosphere(); }
                 if (ready) visuals.Update(active, MovingId, placement, stagedFurniture, runtime.Doors, runtime.ClockSeconds, runtime.AnimationMilliseconds, SwitchOn, SwitchAge, FollowerPreviews); else visuals.Clear();
+                // The lights Stagehand would otherwise draw: those of the home as drawn (Display), once it's shown.
+                if (ready && rendered && HavenLights) lights.Update(Display(active), SwitchOn); else lights.Clear();
+                UpdatePlacementEffect(ready && rendered);
+                // Haven's own ambient sounds: one that finished plays again, as Stagehand's do.
+                if (ready && rendered && HavenSounds) sounds.Update();
                 if (rendered) { UpdateLapCues(runtime.AnimationMilliseconds); UpdateSwitchCues(); UpdateLapEffects(); }
                 UpdateGhost();
                 if (needsPublish && engine.HousingRelay.IsHost && engine.HousingRelay.IsConnected && engine.HousingRelay.RoomJoinedAcknowledged && DateTimeOffset.UtcNow >= nextPublish)
@@ -547,7 +600,8 @@ internal sealed partial class HousingController : IDisposable
         var t = house.Transform;
         var display = Display(house);
         if (stagedScene != null) t = stagedScene.Transform;
-        var stage = Catalogue.BuildStage(display, excludeImported: importedPlacement?.Definition.Path, includeFurnitureModels: false, switchOn: SwitchOn).ToDefinitionString();
+        var stage = Catalogue.BuildStage(display, excludeImported: importedPlacement?.Definition.Path, includeFurnitureModels: false, switchOn: SwitchOn,
+            havenLights: HavenLights).ToDefinitionString();
         if (!stagehand.TryCreateOrUpdateTemporaryStageWithTransform(stage, LiveStage, t.Position, t.Orientation, t.Scale, house.Name)
             || !stagehand.TrySetTemporaryStageVisible(LiveStage, true)) throw new InvalidOperationException("Stagehand could not display the housing stage.");
         rendered = true;
@@ -565,12 +619,20 @@ internal sealed partial class HousingController : IDisposable
     private ulong lapEffects = LapSeed;
     private void UpdateLapEffects()
     {
-        if (active == null || !engine.HousingAmbientEffects) return;
+        // Also when only sounds are on: a world piece built after the home was shown brings its sounds too.
+        if (active == null || !engine.HousingAmbientEffects && !(HavenSounds && engine.HousingAmbientSounds)) return;
         var clock = runtime.AnimationMilliseconds;
         var signature = LapSeed;
         foreach (var item in active.Furnishings)
         {
-            if (item.BuildingPart != null) continue;
+            // A world piece built since (its part is read in the background) brings its effects: count them in.
+            if (item.BuildingPart != null)
+            {
+                var part = Catalogue.Prefab(item);
+                if (HavenEffects) signature = (signature ^ (ulong)part.WorldEffects.Length) * LapPrime;
+                if (HavenSounds) signature = (signature ^ (ulong)part.WorldSounds.Length << 20) * LapPrime;
+                continue;
+            }
             var prefab = Catalogue.Prefab(item);
             var laps = prefab.LoopEffects;
             for (var i = 0; i < laps.Length; i++) signature = (signature ^ (ulong)(laps[i].Loop.ShowingLap(clock, laps[i].AutoPlay) ?? long.MinValue)) * LapPrime;
@@ -591,13 +653,29 @@ internal sealed partial class HousingController : IDisposable
         AmbientScene scene;
         try { scene = Catalogue.BuildAmbience(display, engine.HousingAmbientEffects, engine.HousingAmbientSounds, SwitchOn, runtime.AnimationMilliseconds, PlayingAction); }
         catch (InvalidDataException e) { log.Warning(e, "Furnishing effects are unavailable."); return; }
-        if (scene.Effects != liveEffects)
+        // Haven's own effects, or Stagehand's ambient stage: never both.
+        if (HavenEffects)
         {
+            if (liveEffects != null) { stagehand.TryDestroyTemporaryStage(AmbientStage); liveEffects = null; }
+            effects.Show(scene.EffectList);
+        }
+        else if (scene.Effects != liveEffects)
+        {
+            effects.Clear();
             if (scene.Effects == null) stagehand.TryDestroyTemporaryStage(AmbientStage);
             else if (!stagehand.TryCreateOrUpdateTemporaryStageWithTransform(scene.Effects, AmbientStage, Vector3.Zero, Quaternion.Identity, 1, display.Name + " effects"))
                 log.Warning("Stagehand could not display furnishing effects.");
             liveEffects = scene.Effects;
         }
+        // Haven's own sounds, or Stagehand's one stage per sound: never both.
+        if (HavenSounds)
+        {
+            foreach (var key in liveSounds.Keys) stagehand.TryDestroyTemporaryStage(AmbientStage + "." + key);
+            liveSounds.Clear();
+            sounds.Show(scene.SoundList);
+            return;
+        }
+        sounds.Show([]);
         foreach (var (key, definition) in liveSounds.ToArray())
             if (scene.Sounds.GetValueOrDefault(key) != definition) { stagehand.TryDestroyTemporaryStage(AmbientStage + "." + key); liveSounds.Remove(key); }
         foreach (var (key, definition) in scene.Sounds)
@@ -615,6 +693,9 @@ internal sealed partial class HousingController : IDisposable
             foreach (var key in liveSounds.Keys) stagehand.TryDestroyTemporaryStage(AmbientStage + "." + key);
         }
         StopSwitchCues();
+        effects.Clear();
+        previewEffect.Clear();
+        sounds.Clear();
         liveEffects = null; liveSounds.Clear();
     }
     public void SetAmbience(bool effects, bool sounds)
@@ -625,6 +706,7 @@ internal sealed partial class HousingController : IDisposable
     private void Hide()
     {
         visuals.Clear();
+        lights.Clear();
         if (StagehandStatus == StagehandApiAvailability.Available) stagehand.TryDestroyTemporaryStage(LiveStage);
         HideAmbience();
         rendered = false;
@@ -636,6 +718,7 @@ internal sealed partial class HousingController : IDisposable
             throw new InvalidOperationException("You need decorating access in a ready home before editing it.");
         house = HomeNpcs.DropLostSeats(house with { FormatVersion = 2, SavedAt = DateTimeOffset.UtcNow });
         HouseFormat.Validate(house); Catalogue.Validate(house);
+        RequireShareableChange(house);
         if (visual) Catalogue.BuildStage(house);
         if (IsSharedVisit)
         {
@@ -660,6 +743,8 @@ internal sealed partial class HousingController : IDisposable
         => BeginPlacement(new Furnishing { ItemId = itemId }, move, faceCamera: move == null);
     public void BeginBuilding(string path)
     {
+        if (BuildingParts.IsAmbient(path) && IsSharedVisit && !AmbientShareable)
+            throw new InvalidOperationException("World effects and sounds can be placed in Just me visits for now: gatherings can carry them once Haven's server is updated.");
         // A world piece is read now (once), so the preview shows it and rests it on the floor from the first frame; one
         // this PC can't draw isn't placed.
         if (BuildingParts.IsWorldAsset(path) && !Catalogue.CanBuild(path))
@@ -667,10 +752,12 @@ internal sealed partial class HousingController : IDisposable
             if (!World.Contains(path)) throw new InvalidOperationException("This piece isn't in this game's world.");
             if (World.Part(path, wait: true).Prefab.Models.Length == 0) throw new InvalidOperationException("This piece can't be drawn in this game.");
         }
-        BeginPlacement(new Furnishing { BuildingPart = path }, faceCamera: true);
+        BeginPlacement(new Furnishing { BuildingPart = path, Scale = BuildingParts.IsAmbient(path) ? Ambient.StartingScale(path) : 1 }, faceCamera: true);
     }
     /// <summary>Every model and group the game places in its world, to place as building pieces.</summary>
     public WorldCatalogue World { get; }
+    /// <summary>The world's effects and ambient sounds as pieces.</summary>
+    public AmbientCatalogue Ambient { get; }
     /// <summary>Where the camera looks (world), for turning a new piece toward it; null when unknown.</summary>
     public Func<Vector3?>? CameraForward { get; set; }
     /// <param name="inPlace">A copy: it starts exactly where the template stands, to be dragged out from there.</param>
@@ -958,6 +1045,11 @@ internal sealed partial class HousingController : IDisposable
         Step("the world catalogue", World.Dispose);
         Step("the home's runtime", runtime.Dispose);
         Step("the furnishings", visuals.Dispose);
+        Step("the furnishing lights", lights.Dispose);
+        Step("the furnishing effects", effects.Dispose);
+        Step("the placement's effect", previewEffect.Dispose);
+        Step("the furnishing sounds", sounds.Dispose);
+        Step("the sound preview", StopPreview);
         Step("the account", () => Account?.Dispose());
         Step("custom songs", () => Songs?.Dispose());
         Step("custom furniture", () => Furniture?.Dispose());

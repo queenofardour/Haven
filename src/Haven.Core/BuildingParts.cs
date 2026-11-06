@@ -9,7 +9,17 @@ public static partial class BuildingParts
     // File paths are identifiers, never file payloads. The plugin additionally checks membership in the catalogue derived
     // from the installed residential layouts and inn rooms, and for world pieces in the world index its own PC builds
     // from its own game data.
-    public static bool IsHousingAsset(string path) => path.Length <= MaxPathLength && (HousingAsset().IsMatch(path) || InnAsset().IsMatch(path) || WorldAsset().IsMatch(path));
+    // A world effect or ambient sound is a building piece too: placed, moved and shared like one,
+    // drawn by Haven's own effects and sounds. Accepting more paths keeps every older home valid.
+    public static bool IsHousingAsset(string path) => path.Length <= MaxPathLength && (HousingAsset().IsMatch(path) || InnAsset().IsMatch(path) || WorldAsset().IsMatch(path)
+        || World.WorldAmbient.IsEffectPath(path) || World.WorldAmbient.IsSoundPath(path));
+
+    /// <summary>Whether a building piece is a world effect or ambient sound rather than something with a model.</summary>
+    public static bool IsAmbient(string path) => path.EndsWith(".avfx", StringComparison.Ordinal) ? World.WorldAmbient.IsEffectPath(path)
+        : path.EndsWith(".scd", StringComparison.Ordinal) && World.WorldAmbient.IsSoundPath(path);
+
+    /// <summary>Whether a building piece may carry a sound volume: an ambient sound, or a world piece (a set's own sounds).</summary>
+    public static bool TakesSoundVolume(string path) => World.WorldAmbient.IsSoundPath(path) || IsWorldAsset(path);
 
     /// <summary>
     /// Whether a path names a piece of the game's own world (housing protocol 40): any model a zone places, or a zone's

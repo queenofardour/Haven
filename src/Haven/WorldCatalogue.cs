@@ -32,8 +32,9 @@ internal sealed class WorldCatalogue : IDisposable
     private readonly Func<BuildingCatalogue?> buildings;
     private readonly ConcurrentDictionary<string, BuildingPart> parts = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> building = new(StringComparer.Ordinal), unavailable = new(StringComparer.Ordinal);
-    // Bumped when the renderer draws differently, so old thumbnails are drawn again.
-    private const int ThumbnailVersion = 1;
+    // Bumped when the renderer draws differently, so old thumbnails are drawn again (2: collision and placeholder
+    // surfaces, which the game never draws, left out). Older folders are deleted on loading.
+    private const int ThumbnailVersion = 2;
 
     public WorldCatalogue(IDataManager data, string configDirectory, IPluginLog log, Func<BuildingCatalogue?> buildings)
     {
@@ -58,9 +59,21 @@ internal sealed class WorldCatalogue : IDisposable
     public string[] Categories => Ready ? loading!.Result.Categories : [];
     public string[] Zones => Ready ? loading!.Result.Zones : [];
 
+    private void DeleteOldThumbnails()
+    {
+        try
+        {
+            if (!Directory.Exists(folder)) return;
+            foreach (var old in Directory.EnumerateDirectories(folder, "thumbnails-*"))
+                if (!string.Equals(Path.GetFullPath(old), Path.GetFullPath(thumbnails), StringComparison.OrdinalIgnoreCase)) Directory.Delete(old, true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { log.Warning(ex, "[WORLD] Old thumbnails couldn't be deleted; they'll be tried again next time."); }
+    }
+
     private Loaded Load()
     {
         var version = GameVersion;
+        DeleteOldThumbnails();
         var cache = Path.Combine(folder, "world-index.gz");
         var clock = System.Diagnostics.Stopwatch.StartNew();
         var index = WorldIndex.Load(cache, version);
@@ -91,6 +104,12 @@ internal sealed class WorldCatalogue : IDisposable
         return space > 0 && int.TryParse(name.AsSpan(space + 1), out var number) ? (name[..space], number) : (name, 0);
     }
 
+    /// <summary>Whether a world piece brings a light of its own (a group holding one; with Haven's lights on).</summary>
+    public bool GivesLight(string path) => Index?.Find(path) is { GivesLight: true };
+    /// <summary>Whether a world piece brings always-playing effects of its own (with Haven's effects on).</summary>
+    public bool HasEffects(string path) => Index?.Find(path) is { HasEffects: true };
+    /// <summary>Whether a world piece brings always-playing sounds of its own (with Haven's sounds on).</summary>
+    public bool HasSounds(string path) => Index?.Find(path) is { HasSounds: true };
     /// <summary>Whether a path is a world piece this PC's index holds (so it may be placed and drawn).</summary>
     public bool Contains(string path) => Index?.Contains(path) == true;
 
@@ -185,6 +204,9 @@ internal sealed class WorldCatalogue : IDisposable
     private int drawing;
     private const int MaxWanted = 256;
 
+    /// <summary>An effect piece's tint as its zone places it, for its thumbnail.</summary>
+    public Func<string, float[]?>? EffectColour { get; set; }
+
     /// <summary>
     /// A piece's thumbnail file (a PNG), or null while it's drawn, or when the piece draws nothing (the drawer then shows
     /// a plain tile). The newest asked are drawn first, one at a time, so the grid on screen fills in first.
@@ -227,7 +249,9 @@ internal sealed class WorldCatalogue : IDisposable
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(png)!);
-                var picture = Contains(path) ? WorldThumbnails.Render(WorldIndexBuilder.PieceModels(path, p => data.FileExists(p) ? data.GetFile<SgbFile>(p) : null), Readable, textures) : null;
+                // A world effect (the drawer's Effects) is drawn from its effect file; a piece from its models.
+                var picture = Haven.Core.World.WorldAmbient.IsEffectPath(path) ? EffectThumbnails.Render(path, Readable, EffectColour?.Invoke(path), textures)
+                    : Contains(path) ? WorldThumbnails.Render(WorldIndexBuilder.PieceModels(path, p => data.FileExists(p) ? data.GetFile<SgbFile>(p) : null), Readable, textures) : null;
                 if (picture == null) { File.WriteAllBytes(Path.ChangeExtension(png, ".none"), []); thumbnailFiles[path] = null; continue; }
                 using (var stream = File.Create(png + ".tmp"))
                     new ImageWriter().WritePng(picture, ThumbnailRenderer.Size, ThumbnailRenderer.Size, ColorComponents.RedGreenBlueAlpha, stream);

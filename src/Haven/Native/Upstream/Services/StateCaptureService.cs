@@ -245,7 +245,8 @@ public unsafe class StateCaptureService : IDisposable
                 }
                 // Suppress the game's native face-camera flag every frame while it's set, so it never drives the local
                 // look-at itself (our FaceControlState path is the sole driver). Flag @ Character+0x1930.
-                if (faceCamera)
+                // Not in ClientStructs: off after a game patch until Haven is updated (PatchGuard).
+                if (faceCamera && Haven.Native.PatchCheck.PatchGuard.Allows(Haven.Core.PatchFeature.FaceCamera))
                     *((byte*)ch + 0x1930) = 0;
                 lastCapturedFaceCamera = faceCamera;
             }

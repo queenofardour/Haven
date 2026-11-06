@@ -92,10 +92,10 @@ internal sealed partial class HousingController
     }
 
     // Once a session, outside any home: songs fetched for other people's homes that no home on this PC
-    // plays are deleted; they are fetched again when needed.
+    // plays (in its playlist or one of its moods) are deleted; they are fetched again when needed.
     private void TidySongs()
     {
-        var playing = allHouses.SelectMany(h => h.Music.Playlist).Where(t => t.IsCustom).Select(t => t.CustomMusic!).ToHashSet();
+        var playing = ContentInUse().Songs;
         foreach (var hash in Songs.Cached().Where(h => !playing.Contains(h))) Songs.Forget(hash);
     }
 

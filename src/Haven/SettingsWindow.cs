@@ -35,6 +35,13 @@ internal sealed class SettingsWindow : Window, IDisposable
     public System.Action<string>? Notify;
     /// <summary>Opens "What's new" (the latest versions' notes).</summary>
     public System.Action? ShowChangelog;
+    /// <summary>Set by the plugin: the NPC mods this PC keeps, and the names of the NPCs in Your NPCs (every character's), by id.</summary>
+    public Func<IReadOnlyList<NpcModSet>>? KeptNpcMods;
+    public Func<IReadOnlyDictionary<Guid, string>>? RosterNames;
+    // Settings → Custom content: what's kept on this PC and the NPC mods, rebuilt every 3 seconds (they read the disk).
+    private SettingsStorage? storage;
+    private SettingsNpcMods[] npcMods = [];
+    private DateTime storageAt;
 
     public SettingsWindow(HousingController housing, NativeEngine engine, ICommandManager commands, IDataManager data, ITextureProvider textures)
         : base("Haven settings###Haven.Settings", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
@@ -54,6 +61,28 @@ internal sealed class SettingsWindow : Window, IDisposable
             $"{ContentSizes.Megabytes(d.Size)} · {(d.FromCommunity ? "from the former community gallery" : d.LastStored != null ? "on Haven's server" : "not on Haven's server; uploaded when you place it")}", d.Homes);
         var mine = housing.MyPictures().Select(h => (Hash: h, Details: housing.Details(h))).ToArray();
         return pictures = mine.Select(p => Row(p.Hash, p.Details, p.Details.Width > 0 ? $"{p.Details.Width} × {p.Details.Height}" : "Picture")).ToArray();
+    }
+
+    private void Storage()
+    {
+        if (DateTime.UtcNow - storageAt < TimeSpan.FromSeconds(3)) return;
+        storageAt = DateTime.UtcNow;
+        var downloads = housing.Downloads();
+        storage = new(downloads.Sum(d => d.Bytes), downloads.Count, housing.DownloadLimit, housing.FramesSize(), housing.ActiveHouse != null, housing.ClearingDownloads);
+        var homes = housing.NpcHomes();
+        var roster = RosterNames?.Invoke() ?? new Dictionary<Guid, string>();
+        npcMods = [.. (KeptNpcMods?.Invoke() ?? []).Select(set =>
+        {
+            var inHomes = homes.TryGetValue(set.Npc, out var home) ? home : (Name: "", Homes: Array.Empty<string>());
+            var saved = roster.TryGetValue(set.Npc, out var rosterName);
+            var name = inHomes.Homes.Length > 0 ? inHomes.Name : saved ? rosterName! : set.From != null ? "A friend's NPC" : "An NPC no longer in a home";
+            var bytes = set.Files.DistinctBy(f => f.Hash).Sum(f => f.Size);
+            var mods = set.Mods is { } count ? $" · {count} mod{(count == 1 ? "" : "s")}" : "";
+            var detail = $"{set.Files.Length} file{(set.Files.Length == 1 ? "" : "s")} · {ContentSizes.Megabytes(bytes)}{mods} · kept {set.Shared.ToLocalTime():d MMM yyyy}";
+            var where = inHomes.Homes.Length > 0 ? "In " + string.Join(", ", inHomes.Homes) : saved ? "Saved in Your NPCs"
+                : set.From != null ? "Sent from another player's home" : "Not in any home on this PC";
+            return new SettingsNpcMods(set.Npc, name, detail, where, inHomes.Homes, saved);
+        }).OrderBy(n => n.Homes.Length > 0 ? 0 : n.Saved ? 1 : 2).ThenBy(n => n.Name, StringComparer.CurrentCultureIgnoreCase)];
     }
 
     private ImTextureID? Thumbnail(string hash)
@@ -100,6 +129,13 @@ internal sealed class SettingsWindow : Window, IDisposable
             Chat = engine.HousingChat,
             WarnMinionProps = engine.HousingWarnMinionProps,
             WarnTiltedSeats = engine.HousingWarnTiltedSeats,
+            Patch = state.Tab == 4 ? new SettingsPatch(Native.PatchCheck.PatchGuard.Checked,
+                Native.PatchCheck.PatchGuard.AllowedFor.Length > 0 && Native.PatchCheck.PatchGuard.AllowedFor == Native.PatchCheck.PatchGuard.Running,
+                [.. Native.PatchCheck.PatchGuard.Paused.Select(f => Haven.Core.PatchGate.Names[f])],
+                [.. Native.PatchCheck.PatchGuard.Lines().Skip(1).Concat(Native.PatchCheck.PatchReport.Lines())]) : new(true, false, [], []),
+            HavenLights = housing.HavenLights, HavenLightCount = housing.HavenLightCount,
+            HavenEffects = housing.HavenEffects, HavenEffectCount = housing.HavenEffectCount,
+            HavenSounds = housing.HavenSounds, HavenSoundCount = housing.HavenSoundCount,
             Pictures = state.Tab == 2 ? Pictures() : [],
             Furniture = state.Tab == 2 ? [.. housing.Furniture.Library.Select(f => new SettingsFurniture(f.Hash, f.Item.Name,
                 f.Item.BaseItem == 0 ? "A prop made from a minion model" : "Built on " + (housing.Catalogue.Find(f.Item.BaseItem)?.Name ?? "an unknown item"), housing.FurnitureHomes(f.Hash)))] : [],
@@ -112,11 +148,15 @@ internal sealed class SettingsWindow : Window, IDisposable
                 housing.SongHomes(s.Hash), s.Song.Stored != null && !s.Song.FromCommunity))] : [],
             Usage = housing.PictureUsage is {} u ? new(u.OwnerBytes, u.OwnerLimit, u.UploadsToday, u.UploadsPerDay, u.PoolBytes, u.PoolLimit, u.At) : null,
             Thumbnail = Thumbnail,
+            Storage = state.Tab == 2 ? StorageNow() : null,
+            NpcMods = state.Tab == 2 ? npcMods : [],
             Account = new(housing.Account.SignedIn, housing.Account.Name, housing.Account.SigningIn, housing.Account.Problem, housing.Account.Code),
         };
         var command = SettingsUi.Draw(state, model);
         if (command.Action != SettingsAction.None) Execute(command);
     }
+
+    private SettingsStorage? StorageNow() { Storage(); return storage; }
 
     private void Execute(SettingsCommand command)
     {
@@ -137,8 +177,21 @@ internal sealed class SettingsWindow : Window, IDisposable
             case SettingsAction.Ambience: housing.Run(() => housing.SetAmbience(command.First, command.Second)); break;
             case SettingsAction.Chat: housing.Run(() => engine.SetHousingChat(command.Chat)); break;
             case SettingsAction.WarnMinionProps: housing.Run(() => engine.HousingWarnMinionProps = command.First); break;
+            case SettingsAction.PatchAllow:
+                Native.PatchCheck.PatchGuard.AllowedFor = engine.HousingPatchAllowedFor = command.First ? Native.PatchCheck.PatchGuard.Running : "";
+                break;
             case SettingsAction.WarnTiltedSeats: housing.Run(() => engine.HousingWarnTiltedSeats = command.First); break;
             case SettingsAction.Changelog: ShowChangelog?.Invoke(); break;
+            case SettingsAction.DownloadLimit:
+                if (long.TryParse(command.Text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var limit)) housing.Run(() => housing.DownloadLimit = limit);
+                storageAt = default; break;
+            case SettingsAction.HavenLights: housing.Run(() => housing.HavenLights = command.First); break;
+            case SettingsAction.HavenEffects: housing.Run(() => housing.HavenEffects = command.First); break;
+            case SettingsAction.HavenSounds: housing.Run(() => housing.HavenSounds = command.First); break;
+            case SettingsAction.ClearDownloads: housing.Run(() => housing.TidyDownloads(all: true)); storageAt = default; break;
+            case SettingsAction.RemoveNpcMods:
+                var ids = command.Text.Split(',').Select(t => Guid.TryParseExact(t, "N", out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty).ToArray();
+                housing.Run(() => housing.RemoveNpcMods(ids)); storageAt = default; break;
             case SettingsAction.Import: Import(); break;
             case SettingsAction.Export: Export(command.Home); break;
             case SettingsAction.OpenHomes: OpenFolder(housing.Store.DirectoryPath); break;

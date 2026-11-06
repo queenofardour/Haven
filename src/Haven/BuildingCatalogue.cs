@@ -199,8 +199,7 @@ internal sealed class BuildingCatalogue
         {
             if (!exists(piece.Path)) throw new InvalidDataException("this game doesn't have the model.");
             var mdl = worldModel(piece.Path) ?? throw new InvalidDataException("the model doesn't read.");
-            var bb = mdl.ModelBoundingBoxes;
-            var min = new Vector3(bb.Min[0], bb.Min[1], bb.Min[2]); var max = new Vector3(bb.Max[0], bb.Max[1], bb.Max[2]);
+            var (min, max) = FurniturePrefabReader.WorldBounds(mdl);
             PrefabCollider[] colliders = piece.Collision switch
             {
                 Haven.Core.World.WorldCollision.Box => [new(null, Matrix4x4.Identity, min, max)],
@@ -228,8 +227,20 @@ internal sealed class BuildingCatalogue
                     throw new InvalidDataException($"it needs {Haven.Core.GameDataPaths.ExpansionName(Haven.Core.GameDataPaths.Expansion(texture))}'s game data, which this game doesn't have.");
         }
         var entry = new FurnitureEntry(0, 0, 0, 0, name.Name, name.Category, zone, 0, 0, piece.Path);
-        // A group's lights are left out: furnishing lights are drawn through Stagehand, and new features don't lean on it.
-        return new(entry, Normalize(prefab with { Lights = [] }), zone, [.. materials.Distinct()]);
+        // A group's lights aren't drawn through Stagehand (new features don't lean on it): they're kept apart, for Haven's
+        // own lights when those are on, each normalised with the group.
+        var normal = Normalize(prefab);
+        // Its effects likewise (Haven's own effects only); one outside the base game is kept only when every texture it
+        // names is installed (an effect file this game has can still name another expansion's texture).
+        bool Installed(PrefabEffect effect)
+        {
+            if (Haven.Core.GameDataPaths.Expansion(effect.Path) < CheckedExpansion) return true;
+            try { return read(effect.Path) is { } avfx && Haven.Core.Animation.AvfxFiles.Textures(avfx).All(t => Haven.Core.GameDataPaths.Expansion(t) < CheckedExpansion || exists(t)); }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { return false; }   // an effect that doesn't read is left out, not the piece
+        }
+        var effects = normal.Effects.Where(Installed).ToArray();
+        // Its sounds likewise (each one's file was checked to exist when read).
+        return new(entry, normal with { Lights = [], WorldLights = normal.Lights, Effects = [], WorldEffects = effects, Sounds = [], WorldSounds = normal.Sounds }, zone, [.. materials.Distinct()]);
     }
 
     public FurniturePrefab WithFinish(string path, uint kind, string material)
@@ -292,7 +303,9 @@ internal sealed class BuildingCatalogue
                 Loop = x.Loop is {} loop ? [new Haven.Core.LoopLevel(offset, null), .. loop] : null }).ToArray(),
             Colliders = prefab.Colliders.Select(x => x with { Transform = x.Transform * offset }).ToArray(),
             Doors = prefab.Doors.Select(x => x with { Trigger = x.Trigger with { Transform = x.Trigger.Transform * offset } }).ToArray(),
-            Lights = prefab.Lights.Select(x => x with { Transform = x.Transform * offset }).ToArray(), Seats = [] };
+            Lights = prefab.Lights.Select(x => x with { Transform = x.Transform * offset }).ToArray(),
+            Effects = prefab.Effects.Select(x => x with { Transform = x.Transform * offset }).ToArray(),
+            Sounds = prefab.Sounds.Select(x => x with { Transform = x.Transform * offset }).ToArray(), Seats = [] };
     }
 
     internal static string[] MaterialPaths(MdlFile mdl) => mdl.MaterialNameOffsets.Select(offset =>

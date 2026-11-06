@@ -231,6 +231,65 @@ internal sealed class CustomPictures : IDisposable
         Record(r => { r.Originals.Remove(hash); r.FromCommunity.Remove(hash); r.Stored.Remove(hash); });
     }
 
+    // Downloaded for other people's homes (ContentCache) ------------------------
+
+    /// <summary>Originals on this PC that aren't the player's own: fetched for other people's homes.</summary>
+    public List<Haven.Core.CachedContent> Downloaded()
+    {
+        var found = new List<Haven.Core.CachedContent>();
+        if (!Directory.Exists(originals)) return found;
+        HashSet<string> mine; lock (recordsGate) mine = [.. records.Originals.Keys];
+        foreach (var file in new DirectoryInfo(originals).EnumerateFiles("*.jpg", SearchOption.AllDirectories))
+        {
+            var hash = Path.GetFileNameWithoutExtension(file.Name);
+            if (ContentLocker.IsFingerprint(hash) && !mine.Contains(hash)) found.Add(new("picture", hash, file.Length, file.LastWriteTimeUtc));
+        }
+        return found;
+    }
+
+    /// <summary>Notes that a home uses a downloaded original now, so the cache keeps it longest.</summary>
+    public void Touch(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || IsMine(hash) || !HasOriginal(hash)) return;
+        try { System.IO.File.SetLastWriteTimeUtc(OriginalFile(hash), DateTime.UtcNow); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Deletes a downloaded original (never one of the player's own); it is fetched again when a home needs it.</summary>
+    public long ForgetDownloaded(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || IsMine(hash) || !HasOriginal(hash) || Busy(hash)) return 0;
+        try
+        {
+            var size = new FileInfo(OriginalFile(hash)).Length;
+            System.IO.File.Delete(OriginalFile(hash));
+            thumbnails.TryRemove(hash, out _); retries.TryRemove(hash, out _); broken.TryRemove(hash, out _);
+            return size;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { log.Warning(ex, "A downloaded picture could not be deleted."); return 0; }
+    }
+
+    /// <summary>
+    /// Deletes built frames (textures and materials) that no home or saved group on this PC shows, other than those built
+    /// this session. They are only ever built from an original, so a frame that needs one again is simply rebuilt.
+    /// </summary>
+    public (int Frames, long Bytes) TidyFrames(IReadOnlySet<string> shown)
+    {
+        int count = 0; long bytes = 0;
+        if (!Directory.Exists(frames)) return (0, 0);
+        foreach (var file in new DirectoryInfo(frames).EnumerateFiles("*", SearchOption.AllDirectories))
+        {
+            var key = Path.GetFileNameWithoutExtension(file.Name);
+            if (file.Extension is not (".tex" or ".mtrl" or ".tmp") || shown.Contains(key) || built.ContainsKey(key) || working.ContainsKey(key)) continue;
+            try { var size = file.Length; file.Delete(); bytes += size; if (file.Extension == ".tex") count++; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { log.Debug("A built picture frame could not be deleted: {Message}", ex.Message); }
+        }
+        return (count, bytes);
+    }
+
+    /// <summary>How much room built frames take on this PC.</summary>
+    public long FramesSize() => Directory.Exists(frames) ? new DirectoryInfo(frames).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length) : 0;
+
     public bool PenumbraMissing { get; private set; }
     public string? TakeFailure() => failures.TryDequeue(out var failure) ? failure : null;
     public bool IsFromCommunity(string hash) { lock (recordsGate) return records.FromCommunity.Contains(hash); }

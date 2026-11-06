@@ -37,6 +37,10 @@ internal sealed class PoseAnimationLibrary : IDisposable
     private readonly ConcurrentDictionary<string, Task> working = new();
     // Packages that couldn't be unpacked: tried again after a wait that doubles (from a minute), and reported once.
     private readonly ConcurrentDictionary<string, (long RetryAt, int Tries)> unpackFailed = new();
+    // Packages that need game data this game lacks (PackageNeeds): never served here, not tried again this session.
+    private readonly ConcurrentDictionary<string, byte> missingData = new();
+    /// <summary>Whether a package needs game data this game doesn't have (a free trial): its balls stand still here.</summary>
+    public bool LacksGameData(string hash) => missingData.ContainsKey(hash);
     // The names each carrier key's own animation declares (null: the game has no file there, so nothing to serve).
     private readonly Dictionary<string, IReadOnlyList<string>?> carrierNames = [];
     // What Penumbra serves now (game path → file), and what each carrier has served in this game session, by the
@@ -145,6 +149,61 @@ internal sealed class PoseAnimationLibrary : IDisposable
         catch (IOException ex) { log.Warning(ex, "[Haven] A custom animation's files could not be deleted."); }
     }
 
+    // Downloaded for other people's homes (ContentCache) ------------------------
+
+    /// <summary>Packages on this PC that aren't the player's own: fetched for other people's homes, with their unpacked files.</summary>
+    public List<CachedContent> Downloaded()
+    {
+        var found = new List<CachedContent>();
+        if (!Directory.Exists(packages)) return found;
+        HashSet<string> mine; lock (gate) mine = [.. records.Keys];
+        foreach (var file in new DirectoryInfo(packages).EnumerateFiles("*.zip", SearchOption.AllDirectories))
+        {
+            var hash = Path.GetFileNameWithoutExtension(file.Name);
+            if (!ContentLocker.IsFingerprint(hash) || mine.Contains(hash)) continue;
+            found.Add(new("animations", hash, file.Length + FolderSize(hash), file.LastWriteTimeUtc));
+        }
+        return found;
+    }
+
+    // An unpacked folder's size, remembered once it has files. Served copies are added to it as carriers need them, so
+    // it is read again after a while.
+    private readonly ConcurrentDictionary<string, (long Size, long At)> folderSizes = new();
+    private long FolderSize(string hash)
+    {
+        if (folderSizes.TryGetValue(hash, out var known) && Environment.TickCount64 - known.At < 60_000) return known.Size;
+        try
+        {
+            var size = Directory.Exists(Folder(hash)) ? new DirectoryInfo(Folder(hash)).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length) : 0;
+            folderSizes[hash] = (size, Environment.TickCount64);
+            return size;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }
+    }
+
+    /// <summary>Notes that a home uses a downloaded package now, so the cache keeps it longest.</summary>
+    public void Touch(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || Item(hash) != null || !Has(hash)) return;
+        try { File.SetLastWriteTimeUtc(PackageFile(hash), DateTime.UtcNow); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>
+    /// Deletes a downloaded package (never one of the player's own) and its unpacked files; it is fetched again when a
+    /// home needs it. Outside a home only, when nothing is served (HousingController clears the library there).
+    /// </summary>
+    public long ForgetDownloaded(string hash)
+    {
+        if (!ContentLocker.IsFingerprint(hash) || Item(hash) != null || !File.Exists(PackageFile(hash))
+            || working.TryGetValue(hash, out var busy) && !busy.IsCompleted) return 0;
+        folderSizes.TryRemove(hash, out _);
+        var size = new FileInfo(PackageFile(hash)).Length + FolderSize(hash);
+        Delete(hash);
+        unpackFailed.TryRemove(hash, out _); folderSizes.TryRemove(hash, out _);
+        return size;
+    }
+
     public void Change(string hash, Func<AnimationRecord, AnimationRecord> change)
     {
         lock (gate) { if (records.TryGetValue(hash, out var item)) { records[hash] = change(item); Save(); } }
@@ -167,7 +226,7 @@ internal sealed class PoseAnimationLibrary : IDisposable
         {
             bool done; lock (gate) done = ready.ContainsKey(package);
             // A finished task still listed (its continuation ran before it was stored) doesn't count as working.
-            if (done || working.TryGetValue(package, out var busy) && !busy.IsCompleted || !Has(package)) continue;
+            if (done || working.TryGetValue(package, out var busy) && !busy.IsCompleted || !Has(package) || missingData.ContainsKey(package)) continue;
             if (unpackFailed.TryGetValue(package, out var failed) && Environment.TickCount64 < failed.RetryAt) continue;
             working[package] = Task.Run(() => Unpack(package)).ContinueWith(task =>
             {
@@ -266,6 +325,14 @@ internal sealed class PoseAnimationLibrary : IDisposable
     private void UnpackNow(string hash)
     {
         var package = PoseAnimations.Read(File.ReadAllBytes(PackageFile(hash)));
+        // A game file it points at without carrying it (an effect's texture, a sound), from an expansion this game lacks
+        // (a free trial), would close the game when played: the package isn't served here, and its balls stand still.
+        if (PackageNeeds.Missing(package.Files.Select(f => (f.Key, f.Value)), data.FileExists) is { } needs)
+        {
+            log.Warning("[Haven] The custom animations {Name} aren't played: they need {Path}, which this game doesn't have.", package.Manifest.Name, needs.Path);
+            missingData[hash] = 0;
+            throw new InvalidDataException(PackageNeeds.Message($"The animations \"{package.Manifest.Name}\"", needs.Expansion));
+        }
         var folder = Folder(hash);
         Directory.CreateDirectory(folder);
         foreach (var (name, bytes) in package.Files)

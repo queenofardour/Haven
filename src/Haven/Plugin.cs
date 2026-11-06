@@ -64,6 +64,11 @@ public sealed class Plugin : IDalamudPlugin
         IAddonLifecycle addonLifecycle, IDtrBar dtrBar, IKeyState keyState, ICondition condition, IToastGui toast, INotificationManager notifications,
         INamePlateGui namePlates)
     {
+        // Every signature lookup and signature hook goes through recorders, so /haven selfcheck can say what a game
+        // patch broke.
+        hooks = new Haven.Native.PatchCheck.RecordingInterop(hooks);
+        sigScanner = new Haven.Native.PatchCheck.RecordingSigScanner(sigScanner);
+        Haven.Native.PatchCheck.PatchGuard.Start(RunningGameVersion());
         this.pluginInterface = pluginInterface;
         this.commands = commands;
         this.framework = framework;
@@ -123,6 +128,9 @@ public sealed class Plugin : IDalamudPlugin
         engine.HousingRelay.OnMiniGame += npc.Receive;
         var roster = new NpcRoster(Path.Combine(pluginInterface.ConfigDirectory.FullName, "npc-roster.json")) { CopyMods = npcMods.CopyKept, DropMods = npcMods.DropKept };
         visitors = new NpcVisitors(housing, engine, roster, log);
+        settings.KeptNpcMods = npcMods.KeptSets;
+        settings.RosterNames = () => roster.Everyone.GroupBy(n => n.Id).ToDictionary(g => g.Key, g => g.First().Name);
+        housing.RemoveKeptNpcMods = npcMods.RemoveKept;
         npc.Visitors = visitors;
         npcMods.Visitors = visitors;
         visitors.Welcomed = npcMods.VisitorWelcomed;
@@ -172,6 +180,8 @@ public sealed class Plugin : IDalamudPlugin
             if (housing.ActiveHouse is not { } house || housing.Catalogue.Get(item).Arcade is not { } machine) return;
             if (arcade.Active) return;
             if (minigames.Playing) throw new InvalidOperationException("Finish the game you're playing first.");
+            if (!Haven.Native.PatchCheck.PatchGuard.Allows(Haven.Core.PatchFeature.Arcade))
+                throw new InvalidOperationException("The Gold Saucer machines are paused after the game's update until Haven is updated (Settings → Advanced can turn them on).");
             arcade.Start(machine, item.Id, FurnitureCatalogue.ItemMatrix(item) * FurnitureCatalogue.HouseMatrix(house));
         });
         // The Triple Triad Board: choose an opponent (Haven, or any of the game's Triple Triad NPCs), then play.
@@ -284,10 +294,50 @@ public sealed class Plugin : IDalamudPlugin
         // Friends nearby are asked to join a gathering; the visit code stays the fallback.
         invites = new GatheringInvites(housing, engine, pluginInterface.ConfigDirectory.FullName, log);
         editor.Invites = invites;
+        // A game patch: what it broke, and what Haven paused.
+        Haven.Native.PatchCheck.PatchGuard.AllowedFor = engine.HousingPatchAllowedFor;
+        Haven.Native.PatchCheck.PatchGuard.CanaryFailed = (feature, why) => framework.RunOnFrameworkThread(() =>
+        {
+            log.Warning("[SELFCHECK] {Feature} switched off: {Why}", Haven.Core.PatchGate.Names[feature], why);
+            notifications.AddNotification(new Notification { Title = "Haven", Content = $"Switched off {Haven.Core.PatchGate.Names[feature]}: the game has changed under it. A Haven update will bring it back.", Type = NotificationType.Warning });
+        });
+        Haven.Native.PatchCheck.PatchGuard.Warned = (feature, why) => log.Warning("[SELFCHECK] {Feature}'s runtime check failed on the checked game version (left on): {Why}", Haven.Core.PatchGate.Names[feature], why);
+        foreach (var line in SelfCheck()) log.Information("[SELFCHECK] {Line}", line);
+        framework.RunOnTick(() => NoticePatch(notifications), TimeSpan.FromSeconds(5));
         pluginInterface.UiBuilder.Draw += Draw;
         pluginInterface.UiBuilder.OpenMainUi += Open;
         pluginInterface.UiBuilder.OpenConfigUi += OpenSettings;
         framework.Update += Update;
+    }
+
+    private static unsafe string RunningGameVersion()
+    {
+        try { return FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->GameVersionString ?? ""; }
+        catch { return ""; }
+    }
+
+    /// <summary>The self-check's lines: the game version against the checked one, entering homes, and the code lookups.</summary>
+    private IEnumerable<string> SelfCheck()
+    {
+        foreach (var line in Haven.Native.PatchCheck.PatchGuard.Lines()) yield return line;
+        yield return engine.HousingCanLoad ? "Entering homes: available." : "Entering homes: NOT available on this game version (a hook it needs is missing). A Haven update will fix it.";
+        foreach (var line in Haven.Native.PatchCheck.PatchReport.Lines()) yield return line;
+    }
+
+    // Once per game version: say when homes can't be entered, or which extras are paused, after a patch.
+    private void NoticePatch(INotificationManager notifications)
+    {
+        var running = Haven.Native.PatchCheck.PatchGuard.Running;
+        if (running.Length == 0 || engine.HousingPatchNoticeFor == running) return;
+        string? text = !engine.HousingCanLoad
+            ? "This game version broke something Haven needs to open homes, so entering is off until Haven is updated. /haven selfcheck shows the details."
+            : Haven.Native.PatchCheck.PatchGuard.Paused is { Count: > 0 } paused
+                ? "The game has updated since this Haven was checked. Until Haven is updated, these are paused: " + string.Join(", ", paused.Select(f => Haven.Core.PatchGate.Names[f])) + ". Settings → Advanced can turn them on."
+                : null;
+        if (text == null) return;
+        engine.HousingPatchNoticeFor = running;
+        notifications.AddNotification(new Notification { Title = "Haven and the game update", Content = text, Type = NotificationType.Warning, InitialDuration = TimeSpan.FromSeconds(30) });
+        chat.Print("[Haven] " + text);
     }
 
     private void Update(IFramework _)
@@ -332,6 +382,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (args.Trim().Equals("leave", StringComparison.OrdinalIgnoreCase)) housing.Run(housing.Leave);
         else if (args.Trim().Equals("kit", StringComparison.OrdinalIgnoreCase)) galleryOpen = !galleryOpen;
+        // What this game version broke: code lookups that failed, entering homes, features paused.
+        else if (args.Trim().Equals("selfcheck", StringComparison.OrdinalIgnoreCase))
+            foreach (var line in SelfCheck()) { chat.Print("[Haven] " + line); log.Information("[SELFCHECK] {Line}", line); }
         else if (args.Trim().Equals("settings", StringComparison.OrdinalIgnoreCase)) settings.Show();
         // NPCs: add one in your look in front of you (saved in the home), and take or give up control of the nearest.
         else if (args.Trim().Equals("npc", StringComparison.OrdinalIgnoreCase)) chat.Print("[Haven] " + npc.Add());

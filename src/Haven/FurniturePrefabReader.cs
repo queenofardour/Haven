@@ -66,6 +66,13 @@ internal sealed record PrefabActionEffect(int SubId, string Path, Matrix4x4 Tran
 internal sealed record FurniturePrefab(PrefabModel[] Models, PrefabCollider[] Colliders, PrefabSeat[] Seats, PrefabLight[] Lights)
 {
     public PrefabDoor[] Doors { get; init; } = [];
+    // A world group's own lights: drawn only when Haven draws lights itself, never sent to
+    // Stagehand, and not counted in a home's budget (NativeLights.MaxWorldLights bounds them instead).
+    public PrefabLight[] WorldLights { get; init; } = [];
+    // A world group's always-playing effects, likewise: drawn only when Haven draws effects itself, never sent to Stagehand.
+    public PrefabEffect[] WorldEffects { get; init; } = [];
+    // And its always-playing sounds: played only when Haven plays sounds itself, never through Stagehand.
+    public PrefabSound[] WorldSounds { get; init; } = [];
     // Passive autoplay members outside every timeline: flames, steam, water and their ambient loops.
     public PrefabEffect[] Effects { get; init; } = [];
     public PrefabSound[] Sounds { get; init; } = [];
@@ -151,15 +158,25 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
     {
         List<PrefabModel> models = []; List<PrefabCollider> colliders = []; List<PrefabSeat> seats = []; List<PrefabLight> lights = [];
         List<PrefabDoor> doors = [];
+        List<PrefabEffect>? effects;
+        List<PrefabSound>? sounds;
         lock (reading)
         {
+            // A world group's always-playing effects (a brazier's flame, a waterfall's spray) and sounds (its roar), for
+            // Haven's own effects and sounds.
+            effects = readingWorld ? [] : null;
+            sounds = readingWorld ? [] : null;
             readingInn = innRoom;
-            try { Read(root, Matrix4x4.Identity, 0, new HashSet<string>(StringComparer.Ordinal), models, colliders, seats, lights, doors, true); }
+            try { Read(root, Matrix4x4.Identity, 0, new HashSet<string>(StringComparer.Ordinal), models, colliders, seats, lights, doors, true, effects: effects, sounds: sounds); }
             finally { readingInn = false; }
         }
         if (models.Count == 0) throw new InvalidDataException("This building group has no supported model: " + root);
-        return new(models.ToArray(), colliders.ToArray(), [], lights.ToArray()) { Doors = doors.ToArray() };
+        return new(models.ToArray(), colliders.ToArray(), [], lights.ToArray()) { Doors = doors.ToArray(), Effects = effects?.ToArray() ?? [], Sounds = sounds?.ToArray() ?? [] };
     }
+    /// <summary>The most effects one world group brings (a zone group can hold a whole street's braziers).</summary>
+    public const int MaxWorldGroupEffects = 64;
+    /// <summary>The most sounds one world group brings.</summary>
+    public const int MaxWorldGroupSounds = 16;
     /// <summary>
     /// A world group as a building piece: read like an inn's groups, with up to
     /// <paramref name="maxModels"/> parts, and with any motion or door data this reader can't follow left still instead
@@ -175,6 +192,27 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
             finally { readingWorld = false; }
         }
     }
+    /// <summary>
+    /// A world model's bounds: where its vertices are, not the box its file declares. Many zone models declare a box
+    /// reaching far past what they draw (a weather vane modelled 14 m up its tower, its box from the ground; a frame's
+    /// box 40 m long), which would centre and rest a placed piece by empty space, out of sight, with a collision box to
+    /// match. The declared box stands in when the vertices can't be read.
+    /// </summary>
+    internal static (Vector3 Min, Vector3 Max) WorldBounds(MdlFile mdl)
+    {
+        var bb = mdl.ModelBoundingBoxes;
+        var declared = (new Vector3(bb.Min[0], bb.Min[1], bb.Min[2]), new Vector3(bb.Max[0], bb.Max[1], bb.Max[2]));
+        try
+        {
+            var min = new Vector3(float.MaxValue); var max = new Vector3(float.MinValue);
+            foreach (var mesh in Haven.Core.Furniture.ModelMeshes.ReadGeometry(mdl.Data))
+                foreach (var p in mesh.Positions)
+                    if (float.IsFinite(p.X + p.Y + p.Z)) { min = Vector3.Min(min, p); max = Vector3.Max(max, p); }
+            return min.X <= max.X ? (min, max) : declared;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or ArgumentException or IndexOutOfRangeException or OverflowException) { return declared; }
+    }
+
     private bool readingWorld;
     private int WorldModelLimit = 128;
     // A group's motion data, or none for a world group whose data this reader refuses.
@@ -182,7 +220,8 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
     {
         if (!readingWorld) return read();
         try { return read(); }
-        catch (InvalidDataException) { return none; }
+        // A world group's data a reader can't follow (an offset past the file, an overflow) leaves that part still.
+        catch (Exception ex) when (ex is InvalidDataException or OverflowException or IndexOutOfRangeException or ArgumentException) { return none; }
     }
     // Custom furniture imports read prefabs off the framework thread, so reads are one at a time.
     private readonly object reading = new();
@@ -313,7 +352,8 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
             var spins = Still(() => SgbSpins.Read(group.Data), []);
             var oscillations = Still(() => SgbOscillations.Read(group.Data), new OscillationFile(false, []));
             // Switch/triggered state belongs to timelines; only members no timeline addresses are passive.
-            var timed = effects == null && sounds == null ? null : SgbTimelines.Targets(group.Data);
+            // A world group whose timelines don't read keeps its effects as passive ones (Still: furniture still refuses).
+            var timed = effects == null && sounds == null ? null : Still(() => SgbTimelines.Targets(group.Data), new HashSet<uint>());
             // The root's one-shot timelines (an arcade machine's results) move its own parts when played by index.
             var actions = depth == 0 && !building ? SgbTimelines.Actions(group.Data) : null;
             var actionSounds = depth == 0 && !building && switchSounds != null ? SgbTimelines.ActionSounds(group.Data) : new Dictionary<int, SwitchSound[]>();
@@ -331,7 +371,9 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
             }
             // A clickable on/off pair keeps every side's parts with their activity; any other autoplay
             // switch-like timeline is applied once as the item's fixed default side.
-            var toggle = effects == null ? null : SgbTimelines.Switch(group.Data);
+            // A world group's switch is never played (it has no switch of its own in a home), so its parts are read as
+            // before; only its always-playing effects are kept.
+            var toggle = effects == null || readingWorld ? null : SgbTimelines.Switch(group.Data);
             if (toggle != null) onSwitch?.Invoke(toggle);
             var defaults = toggle != null ? new DefaultTimelineState(new HashSet<uint>(), new HashSet<uint>())
                 : Still(() => SgbTimelines.DefaultState(group.Data), new DefaultTimelineState(new HashSet<uint>(), new HashSet<uint>()));
@@ -477,9 +519,10 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
                         if (partSwitch is {} shown && !shown.Active(true, true) && !shown.Active(false, true)) continue;
                         var mdl = readModel(bg.AssetPath);
                         if (mdl == null) continue;
+                        // A world group's members by their vertices (many zone models declare boxes far past them);
+                        // furniture and housing parts as their files declare, as vanilla does.
                         var bb = mdl.ModelBoundingBoxes;
-                        var min = new Vector3(bb.Min[0], bb.Min[1], bb.Min[2]);
-                        var max = new Vector3(bb.Max[0], bb.Max[1], bb.Max[2]);
+                        var (min, max) = readingWorld ? WorldBounds(mdl) : (new Vector3(bb.Min[0], bb.Min[1], bb.Min[2]), new Vector3(bb.Max[0], bb.Max[1], bb.Max[2]));
                         var panel = door < 0 || item.InstanceId is 0 or > byte.MaxValue ? -1 : Array.IndexOf(action!.Panels, (byte)item.InstanceId);
                         var clock = clocks.FirstOrDefault(c => c.Hour == item.InstanceId || c.Minute == item.InstanceId);
                         // Door leaves and clock hands keep their own motion; everything else that moves (loops, paths,
@@ -539,8 +582,8 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
                         break;
                     case LayerCommon.VFXInstanceObject vfx when effects != null && Activity(item.InstanceId) is {} effectSwitch
                         && (effectSwitch.Active(true, vfx.IsAutoPlay != 0) || effectSwitch.Active(false, vfx.IsAutoPlay != 0))
-                        && Ambient(vfx.AssetPath, "bgcommon/hou/", ".avfx"):
-                        if (effects.Count >= 16) throw new InvalidDataException("Furniture prefab has too many effects.");
+                        && EffectPath(vfx.AssetPath):
+                        if (effects.Count >= (readingWorld ? MaxWorldGroupEffects : 16)) { if (readingWorld) break; throw new InvalidDataException("Furniture prefab has too many effects."); }
                         var authored = vfx.IsAutoPlay != 0;
                         effects.Add(new(vfx.AssetPath, transform, new Vector4(vfx.Color.Red, vfx.Color.Green, vfx.Color.Blue, vfx.Color.Alpha) / 255f,
                             effectSwitch.Varies(authored) ? new(effectSwitch.Active(true, authored), effectSwitch.Active(false, authored)) : null));
@@ -553,8 +596,8 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
                         break;
                     case LayerCommon.VFXInstanceObject vfx when effects != null && Activity(item.InstanceId) == null
                         && (vfx.IsAutoPlay != 0 && !timed!.Contains(item.InstanceId) || defaults.Started.Contains(item.InstanceId))
-                        && Ambient(vfx.AssetPath, "bgcommon/hou/", ".avfx"):
-                        if (effects.Count >= 16) throw new InvalidDataException("Furniture prefab has too many effects.");
+                        && EffectPath(vfx.AssetPath):
+                        if (effects.Count >= (readingWorld ? MaxWorldGroupEffects : 16)) { if (readingWorld) break; throw new InvalidDataException("Furniture prefab has too many effects."); }
                         effects.Add(new(vfx.AssetPath, transform, new Vector4(vfx.Color.Red, vfx.Color.Green, vfx.Color.Blue, vfx.Color.Alpha) / 255f));
                         break;
                     // Only the root prefab's switch is clickable, so only its sound members are switch sounds.
@@ -583,8 +626,8 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
                         foreach (var s in lapSounds.Where(s => s.Timing.Member == item.InstanceId)) loopSounds.Add(new(lap.AssetPath, transform, s));
                         break;
                     case LayerCommon.SoundInstanceObject sound when sounds != null && sound.SEParam.AutoPlay != 0 && !timed!.Contains(item.InstanceId)
-                        && Ambient(sound.AssetPath, "bgcommon/sound/", ".scd"):
-                        if (sounds.Count >= 8) throw new InvalidDataException("Furniture prefab has too many sounds.");
+                        && SoundPath(sound.AssetPath):
+                        if (sounds.Count >= (readingWorld ? MaxWorldGroupSounds : 8)) { if (readingWorld) break; throw new InvalidDataException("Furniture prefab has too many sounds."); }
                         sounds.Add(new(sound.AssetPath, transform));
                         break;
                     case LayerCommon.LightInstanceObject light:
@@ -603,6 +646,14 @@ internal sealed class FurniturePrefabReader(Func<string, SgbFile?> readGroup, Fu
         }
         finally { chain.Remove(path); }
     }
+    // An effect a piece may bring: a furnishing's own (bgcommon/hou/), or for a world group any zone or common effect.
+    private bool EffectPath(string? path) => readingWorld
+        ? Ambient(path, "bg/", ".avfx") || Ambient(path, "bgcommon/", ".avfx")
+        : Ambient(path, "bgcommon/hou/", ".avfx");
+    // A sound a piece may bring: a furnishing's own (bgcommon/sound/), or for a world group any zone or common sound.
+    private bool SoundPath(string? path) => readingWorld
+        ? Ambient(path, "bg/", ".scd") || Ambient(path, "bgcommon/", ".scd")
+        : Ambient(path, "bgcommon/sound/", ".scd");
     private bool Ambient(string? path, string root, string extension) => !string.IsNullOrEmpty(path)
         && path.StartsWith(root, StringComparison.Ordinal) && path.EndsWith(extension, StringComparison.Ordinal) && exists(path);
     private static bool AllowedPath(string path, bool building) => path.StartsWith("bgcommon/hou/", StringComparison.Ordinal)

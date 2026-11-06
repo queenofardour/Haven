@@ -19,7 +19,7 @@ internal sealed record WorldAmbient(string Path, string Kind, int Zone);
 internal static class WorldIndexBuilder
 {
     // A group's own pieces, read once per group: its models (with their collision) and the groups inside it.
-    private sealed record GroupMembers((string Path, WorldCollision Collision, string? CollisionPath)[] Models, string[] Groups);
+    private sealed record GroupMembers((string Path, WorldCollision Collision, string? CollisionPath)[] Models, string[] Groups, int Lights, int Effects, int Sounds);
     private sealed class Stat { public int Uses; public WorldCollision Collision; public string? CollisionPath; public readonly Dictionary<int, int> ByZone = []; }
 
     /// <param name="ambient">Effects and sounds the layouts place, when the caller wants them (the offline tool).</param>
@@ -57,11 +57,54 @@ internal static class WorldIndexBuilder
                 {
                     var objects = group.LayerGroups.SelectMany(g => g.Layers).SelectMany(l => l.InstanceObjects).ToArray();
                     members = new([.. objects.Select(o => o.Object).OfType<LayerCommon.BGInstanceObject>().Select(Model)],
-                        [.. objects.Select(o => o.Object).OfType<LayerCommon.SharedGroupInstanceObject>().Select(g => g.AssetPath)]);
+                        [.. objects.Select(o => o.Object).OfType<LayerCommon.SharedGroupInstanceObject>().Select(g => g.AssetPath)],
+                        objects.Count(o => o.Object is LayerCommon.LightInstanceObject),
+                        // Always-playing effects no timeline addresses (what the furniture reader keeps for a world group).
+                        Passive(objects, group), PassiveSounds(objects, group));
                 }
             }
             catch (Exception ex) when (ex is not OutOfMemoryException) { members = null; } // an unreadable group adds nothing
             return groups[path] = members;
+        }
+        static int Passive(IEnumerable<LayerCommon.InstanceObject> objects, SgbFile group)
+        {
+            IReadOnlySet<uint> timed;
+            try { timed = SgbTimelines.Targets(group.Data); } catch (Exception ex) when (ex is not OutOfMemoryException) { timed = new HashSet<uint>(); }
+            return objects.Count(o => o.Object is LayerCommon.VFXInstanceObject { AssetPath: { } vfxPath } vfx && vfx.IsAutoPlay != 0 && !timed.Contains(o.InstanceId)
+                && vfxPath.EndsWith(".avfx", StringComparison.Ordinal) && (vfxPath.StartsWith("bg/", StringComparison.Ordinal) || vfxPath.StartsWith("bgcommon/", StringComparison.Ordinal)));
+        }
+        // Always-playing sounds no timeline addresses (what the furniture reader keeps for a world group).
+        static int PassiveSounds(IEnumerable<LayerCommon.InstanceObject> objects, SgbFile group)
+        {
+            IReadOnlySet<uint> timed;
+            try { timed = SgbTimelines.Targets(group.Data); } catch (Exception ex) when (ex is not OutOfMemoryException) { timed = new HashSet<uint>(); }
+            return objects.Count(o => o.Object is LayerCommon.SoundInstanceObject { AssetPath: { } soundPath } sound && sound.SEParam.AutoPlay != 0 && !timed.Contains(o.InstanceId)
+                && soundPath.EndsWith(".scd", StringComparison.Ordinal) && (soundPath.StartsWith("bg/", StringComparison.Ordinal) || soundPath.StartsWith("bgcommon/", StringComparison.Ordinal)));
+        }
+        var soundsIn = new Dictionary<string, int>(StringComparer.Ordinal);
+        int SoundsIn(string path, int depth)
+        {
+            if (depth > 4 || Members(path) is not { } members) return 0;
+            if (soundsIn.TryGetValue(path, out var known)) return known;
+            soundsIn[path] = 0;
+            return soundsIn[path] = Math.Min(members.Sounds + members.Groups.Sum(g => SoundsIn(g, depth + 1)), FurniturePrefabReader.MaxWorldGroupSounds);
+        }
+        var effectsIn = new Dictionary<string, int>(StringComparer.Ordinal);
+        int EffectsIn(string path, int depth)
+        {
+            if (depth > 4 || Members(path) is not { } members) return 0;
+            if (effectsIn.TryGetValue(path, out var known)) return known;
+            effectsIn[path] = 0;
+            return effectsIn[path] = Math.Min(members.Effects + members.Groups.Sum(g => EffectsIn(g, depth + 1)), FurniturePrefabReader.MaxWorldGroupEffects);
+        }
+        // A group's lights with its nested groups', as far down as Expand goes (the furniture reader reads them all).
+        var lightsIn = new Dictionary<string, int>(StringComparer.Ordinal);
+        int LightsIn(string path, int depth)
+        {
+            if (depth > 4 || Members(path) is not { } members) return 0;
+            if (lightsIn.TryGetValue(path, out var known)) return known;
+            lightsIn[path] = 0; // a group that holds itself counts once
+            return lightsIn[path] = members.Lights + members.Groups.Sum(g => LightsIn(g, depth + 1));
         }
         void Expand(string path, int zone, int depth)
         {
@@ -98,7 +141,10 @@ internal static class WorldIndexBuilder
             // A collision mesh whose path isn't one the index keeps is left out, never guessed at.
             var mesh = stat.Collision == WorldCollision.Mesh && stat.CollisionPath is { } c && WorldIndex.IsCollisionPath(c);
             var collision = stat.Collision == WorldCollision.Mesh && !mesh ? WorldCollision.None : stat.Collision;
-            return new WorldPiece(kv.Key, renumber[zone], stat.Uses, stat.ByZone.Count, collision, mesh ? stat.CollisionPath : null);
+            return new WorldPiece(kv.Key, renumber[zone], stat.Uses, stat.ByZone.Count, collision, mesh ? stat.CollisionPath : null,
+                kv.Key.EndsWith(".sgb", StringComparison.Ordinal) ? LightsIn(kv.Key, 0) : 0,
+                kv.Key.EndsWith(".sgb", StringComparison.Ordinal) ? EffectsIn(kv.Key, 0) : 0,
+                kv.Key.EndsWith(".sgb", StringComparison.Ordinal) ? SoundsIn(kv.Key, 0) : 0);
         });
         if (ambient != null)
         {

@@ -12,11 +12,21 @@ public enum WorldCollision : byte { None, Box, Mesh }
 /// <summary>
 /// One piece of the game's world: a model or shared group some zone's layout places. Zone is
 /// the zone placing it most (its name comes from there), Uses how often the layouts place it, Zones in how many zones.
-/// A model keeps the collision its first solid placement gives it (a group's members carry their own).
+/// A model keeps the collision its first solid placement gives it (a group's members carry their own). Lights: how many
+/// lights a group holds itself (with its nested groups'), which Haven's own lights draw; a model never has any (a
+/// lantern's light in the world is placed beside it by the zone's layout, so the model alone only glows).
 /// </summary>
-public sealed record WorldPiece(string Path, int Zone, int Uses, int Zones, WorldCollision Collision = WorldCollision.None, string? CollisionPath = null)
+/// Effects: how many always-playing effects a group holds (with its nested groups'), which Haven's own effects draw.
+/// Sounds: how many always-playing sounds, which Haven's own sounds play.
+public sealed record WorldPiece(string Path, int Zone, int Uses, int Zones, WorldCollision Collision = WorldCollision.None, string? CollisionPath = null, int Lights = 0, int Effects = 0, int Sounds = 0)
 {
     public bool Group => Path.EndsWith(".sgb", StringComparison.Ordinal);
+    /// <summary>Whether placing the piece brings a light of its own (with Haven's lights on).</summary>
+    public bool GivesLight => Lights > 0;
+    /// <summary>Whether placing the piece brings effects of its own (flames, spray, sparkles; with Haven's effects on).</summary>
+    public bool HasEffects => Effects > 0;
+    /// <summary>Whether placing the piece brings sounds of its own (a fountain's trickle; with Haven's sounds on).</summary>
+    public bool HasSounds => Sounds > 0;
 
     /// <summary>
     /// What the piece costs the home's scene budget before it is built: a model is one draw object (and one collider
@@ -35,7 +45,8 @@ public sealed record WorldPiece(string Path, int Zone, int Uses, int Zones, Worl
 /// </summary>
 public sealed class WorldIndex
 {
-    public const int Format = 1;
+    // 2 (0.66.1): each piece's lights; 3 (0.66.5): and effects; 4 (0.66.7): and sounds.
+    public const int Format = 4;
     private const string Magic = "haven-world-index";
     public string GameVersion { get; }
     public IReadOnlyList<WorldZone> Zones { get; }
@@ -67,7 +78,7 @@ public sealed class WorldIndex
         writer.WriteLine($"{Magic}\t{Format}\t{Clean(GameVersion)}\t{Zones.Count}\t{Pieces.Count}");
         foreach (var zone in Zones) writer.WriteLine($"{Clean(zone.Folder)}\t{Clean(zone.Name)}");
         foreach (var piece in Pieces)
-            writer.WriteLine($"{piece.Path}\t{piece.Zone}\t{piece.Uses}\t{piece.Zones}\t{(int)piece.Collision}\t{piece.CollisionPath}");
+            writer.WriteLine($"{piece.Path}\t{piece.Zone}\t{piece.Uses}\t{piece.Zones}\t{(int)piece.Collision}\t{piece.CollisionPath}\t{piece.Lights}\t{piece.Effects}\t{piece.Sounds}");
     }
 
     /// <summary>
@@ -90,11 +101,13 @@ public sealed class WorldIndex
             var pieces = new List<WorldPiece>(piecesExpected);
             for (var i = 0; i < piecesExpected; i++)
             {
-                if (reader.ReadLine()?.Split('\t') is not [var path, var zone, var uses, var spread, var collision, var collisionPath]
+                if (reader.ReadLine()?.Split('\t') is not [var path, var zone, var uses, var spread, var collision, var collisionPath, var lightCount, var effectCount, var soundCount]
                     || !int.TryParse(zone, out var z) || !int.TryParse(uses, out var u) || !int.TryParse(spread, out var s)
-                    || !byte.TryParse(collision, out var c) || c > (byte)WorldCollision.Mesh) return null;
+                    || !byte.TryParse(collision, out var c) || c > (byte)WorldCollision.Mesh || !int.TryParse(lightCount, out var l) || l is < 0 or > 100_000
+                    || !int.TryParse(effectCount, out var e) || e is < 0 or > 100_000
+                    || !int.TryParse(soundCount, out var so) || so is < 0 or > 100_000) return null;
                 if (collisionPath.Length > 0 && !IsCollisionPath(collisionPath)) return null;
-                pieces.Add(new(path, z, u, s, (WorldCollision)c, collisionPath.Length > 0 ? collisionPath : null));
+                pieces.Add(new(path, z, u, s, (WorldCollision)c, collisionPath.Length > 0 ? collisionPath : null, l, e, so));
             }
             return reader.ReadLine() == null ? new WorldIndex(gameVersion, zones, pieces) : null;
         }

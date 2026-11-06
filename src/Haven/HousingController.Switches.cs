@@ -61,10 +61,13 @@ internal sealed partial class HousingController
     // switch through BuildAmbience instead. Local presentation only: nothing here is saved or sent.
     // Looping animations' lap sounds (a Drinking Apkallu's drip, the garden bamboo's clack) are the same kind of cue,
     // fired when the shared animation clock crosses their frame, so they keep time with the motion on every client.
-    private sealed class SwitchCue(Guid item, string path, string stage, long startAt, long stopAt, string definition)
+    private sealed class SwitchCue(Guid item, string path, string stage, long startAt, long stopAt, string definition, Vector3 position, float volume)
     {
         public Guid Item => item; public string Path => path; public string Stage => stage; public long StartAt => startAt; public long StopAt => stopAt;
         public string Definition => definition; public bool Started { get; set; }
+        public Vector3 Position => position; public float Volume => volume;
+        // Started by Haven's own sounds (FurnitureSounds) rather than as a Stagehand stage: stopped the same way.
+        public bool Native { get; set; }
     }
     private readonly List<SwitchCue> cues = [];
     private long cueSerial;
@@ -110,7 +113,8 @@ internal sealed partial class HousingController
 
     private void AddCue(Furnishing item, string path, Vector3 position, long start, long length)
     {
-        cues.Add(new(item.Id, path, $"{AmbientStage}.cue{++cueSerial}", start, start + length, FurnitureCatalogue.CueStage(path, position, item.SoundVolume ?? 1)));
+        cues.Add(new(item.Id, path, $"{AmbientStage}.cue{++cueSerial}", start, start + length, FurnitureCatalogue.CueStage(path, position, item.SoundVolume ?? 1),
+            position, item.SoundVolume ?? 1));
         while (cues.Count > MaxCues) { Destroy(cues[0]); cues.RemoveAt(0); }
     }
 
@@ -153,7 +157,8 @@ internal sealed partial class HousingController
             }
             if (cue.Started || now < cue.StartAt) continue;
             cue.Started = true;
-            if (!stagehand.TryCreateOrUpdateTemporaryStageWithTransform(cue.Definition, cue.Stage, Vector3.Zero, Quaternion.Identity, 1, "Furnishing sound"))
+            if (HavenSounds) { cue.Native = true; sounds.PlayCue(cue.Stage, cue.Path, cue.Position, cue.Volume); }
+            else if (!stagehand.TryCreateOrUpdateTemporaryStageWithTransform(cue.Definition, cue.Stage, Vector3.Zero, Quaternion.Identity, 1, "Furnishing sound"))
                 log.Warning("Stagehand could not play a furnishing sound cue.");
         }
     }
@@ -165,7 +170,8 @@ internal sealed partial class HousingController
     }
     private void Destroy(SwitchCue cue)
     {
-        if (cue.Started && StagehandStatus == StagehandApiAvailability.Available) stagehand.TryDestroyTemporaryStage(cue.Stage);
+        if (cue.Native) sounds.StopCue(cue.Stage);
+        else if (cue.Started && StagehandStatus == StagehandApiAvailability.Available) stagehand.TryDestroyTemporaryStage(cue.Stage);
     }
 
     private void SetSwitch(Furnishing item, bool on, bool save = true)

@@ -20,7 +20,7 @@ Everything Haven shows is drawn on your own client. Nothing is placed on the gam
 - Placement with the mouse or exact values: move, turn, tilt, scale, grid and edge snapping, undo and redo.
 - Linked groups, copies in rows, circles and mirrors, saved groups, and a free building camera.
 - Remodel mode: remove or move the shell's own walls, pillars and fixtures.
-- A World catalogue of the game's own world models (about 100,000), drawn from your installed game data.
+- A World catalogue of the game's own world models (about 90,000) with their lights, effects and sounds, plus about 1,000 of the game's effects (waterfalls, fires, smoke, sparkles) and 740 ambient sounds to place, with a preview to listen first. All drawn from your installed game data.
 
 **How furniture behaves**
 - Collision, and `/sit`, `/doze` and `/cpose` on seats and beds.
@@ -49,7 +49,7 @@ Everything Haven shows is drawn on your own client. Nothing is placed on the gam
 ## Requirements
 
 - Windows and FFXIV with Dalamud (API 15).
-- [Stagehand](https://stagehandxiv.com), for furnishing lights and effects.
+- [Stagehand](https://stagehandxiv.com). Haven draws furnishing lights, effects and sounds itself; Stagehand still shows imported Stagehand objects.
 - [Penumbra](https://github.com/xivdev/Penumbra) for custom pictures, songs, furniture and animations.
 - Optional: Glamourer and Customize+ for NPC looks.
 

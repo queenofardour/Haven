@@ -30,6 +30,8 @@ internal sealed partial class FurnishingEditor
     private UiBounds DrawPanels()
     {
         var open = true;
+        // A sound previewed from the drawer stops once the drawer isn't shown.
+        if (ShownPanel != RoomPanel.Furnish && housing.PreviewingSound != null) housing.Run(housing.StopPreview);
         switch (ShownPanel)
         {
             case RoomPanel.Furnish: drawerOpen = true; DrawDrawer(); open = drawerOpen; break;

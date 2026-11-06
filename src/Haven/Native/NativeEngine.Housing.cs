@@ -217,8 +217,8 @@ public sealed partial class NativeEngine
         if (!HousingZoneReady(territory)) return;
         var env = FFXIVClientStructs.FFXIV.Client.Graphics.Environment.EnvManager.Instance();
         if (env == null) return;
-        // The environment scene's weather table starts at +0x30; its first entry is always backed by this shell.
-        var natural = env->EnvScene == null ? (byte)0 : *((byte*)env->EnvScene + 0x30);
+        // The environment scene's weather table (EnvScene +0x30); its first entry is always backed by this shell.
+        var natural = env->EnvScene == null ? (byte)0 : env->EnvScene->WeatherIds[0];
         if (housingWeather.Observe(env->ActiveWeather, clientState.IsGPosing, natural) is not {} restore) return;
         env->ActiveWeather = restore;
         if (Environment.TickCount64 - housingWeatherLogged > 10_000)
@@ -237,6 +237,18 @@ public sealed partial class NativeEngine
         config.WorldChatOff = (int)(Haven.Core.WorldChannels.All & ~chat.World);
         config.Save();
     }
+    /// <summary>The game version the player turned paused features on for after a patch (Settings → Advanced), or empty.</summary>
+    public string HousingPatchAllowedFor
+    {
+        get => config.PatchAllowedFor;
+        set { if (config.PatchAllowedFor == value) return; config.PatchAllowedFor = value; config.Save(); }
+    }
+    /// <summary>The game version whose "the game has updated" notice was last shown.</summary>
+    public string HousingPatchNoticeFor
+    {
+        get => config.PatchNoticeFor;
+        set { if (config.PatchNoticeFor == value) return; config.PatchNoticeFor = value; config.Save(); }
+    }
     /// <summary>Whether importing a minion prop shows the experimental warning first (Settings → Custom content → Furniture).</summary>
     public bool HousingWarnMinionProps
     {
@@ -249,6 +261,14 @@ public sealed partial class NativeEngine
         get => config.WarnTiltedSeats;
         set { config.WarnTiltedSeats = value; config.Save(); }
     }
+    /// <summary>Whether Haven draws furnishing lights itself (the default) rather than Stagehand (Settings → Advanced).</summary>
+    public bool HousingHavenLights { get => !config.StagehandLights; set { if (config.StagehandLights == !value) return; config.StagehandLights = !value; config.Save(); } }
+    /// <summary>Whether Haven draws furnishing effects itself (the default) rather than Stagehand (Settings → Advanced).</summary>
+    public bool HousingHavenEffects { get => !config.StagehandEffects; set { if (config.StagehandEffects == !value) return; config.StagehandEffects = !value; config.Save(); } }
+    /// <summary>Whether Haven plays furnishing sounds itself (the default) rather than Stagehand (Settings → Advanced).</summary>
+    public bool HousingHavenSounds { get => !config.StagehandSounds; set { if (config.StagehandSounds == !value) return; config.StagehandSounds = !value; config.Save(); } }
+    /// <summary>The most this PC keeps of custom content downloaded for other people's homes (Settings → Custom content).</summary>
+    public long HousingDownloadLimit { get => config.DownloadLimit; set { if (config.DownloadLimit == value) return; config.DownloadLimit = value; config.Save(); } }
     public bool HousingPoseSounds { get => config.PoseSounds; set { config.PoseSounds = value; config.Save(); } }
     public bool HousingPoseRestOnSurface { get => config.PoseRestOnSurface; set { config.PoseRestOnSurface = value; config.Save(); } }
     public bool HousingCinematicChatTwoHintSeen { get => config.CinematicChatTwoHintSeen; set { config.CinematicChatTwoHintSeen = value; config.Save(); } }

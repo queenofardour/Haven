@@ -233,7 +233,7 @@ internal sealed partial class RoomHub(ILogger<RoomHub> log, bool durableRecovery
     {
         ExpireReservations();
         if (join.HavenProtocolRevision != HousingWire.ProtocolRevision)
-        { Error(peer, ErrCode.Generic, $"This relay requires Haven housing protocol revision {HousingWire.ProtocolRevision} (Haven 0.65.0 or newer)."); return; }
+        { Error(peer, ErrCode.Generic, $"This relay requires Haven housing protocol revision {HousingWire.ProtocolRevision} (Haven 0.68.0 or newer)."); return; }
         if (!string.IsNullOrEmpty(join.ResumeToken)) { Resume(peer, join); return; }
         var password = join.RoomPassword ?? "";
         if (join.ContentId == 0 || PoseNpcs.IsNpc(join.ContentId) || string.IsNullOrWhiteSpace(join.CharacterName) || join.CharacterName.Length > 80 || join.CharacterName.Any(char.IsControl)

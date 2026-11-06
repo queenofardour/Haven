@@ -6,7 +6,12 @@ namespace Haven;
 
 internal enum DrawerTab { Catalogue, Room, Yours }
 // Thumbnail: a world piece's path, whose drawn thumbnail stands in for an icon.
-internal readonly record struct DrawerItem(int Index, string Name, ushort Icon, bool Favourite, bool Selected, string? Thumbnail = null);
+// GivesLight: a world group with a light of its own (WorldPiece.GivesLight), which shines with Haven's lights on.
+// HasEffects: a world group with always-playing effects of its own (WorldPiece.HasEffects), shown with Haven's effects on.
+// HasSounds: a world group with always-playing sounds of its own, played with Haven's sounds on.
+// Sound: an ambient sound, drawn as a note with a ▶ preview; Playing while its preview plays.
+internal readonly record struct DrawerItem(int Index, string Name, ushort Icon, bool Favourite, bool Selected, string? Thumbnail = null, bool GivesLight = false, bool HasEffects = false, bool HasSounds = false,
+    bool Sound = false, bool Playing = false, string? Note = null);
 internal readonly record struct DrawerRoomRow(int Index, string Name, string Detail, bool Selected);
 // One of the player's custom furnishings: its name, the item it is built on, that item's icon.
 internal readonly record struct DrawerCustom(int Index, string Name, string Detail, ushort Icon, bool Selected);
@@ -35,7 +40,9 @@ internal sealed record FurnishDrawerModel(IReadOnlyList<string> Filters, IReadOn
 }
 internal enum DrawerAction { None, Pick, Favourite, SelectRoom, Close, PickCustom, ImportFile, ImportFolder, Import, CancelImport, AgreeAndPickCustom, RenameCustom, DeleteCustom,
     // A saved group: Index is the group; RenameGroup's Text the new name.
-    PickGroup, RenameGroup, DeleteGroup }
+    PickGroup, RenameGroup, DeleteGroup,
+    // An ambient sound's ▶: plays it for a few seconds (again stops it).
+    Preview }
 internal readonly record struct DrawerCommand(DrawerAction Action, int Index = -1, string Text = "")
 {
     /// <summary>The options chosen for an import, by group index (Single: the option; Multi: a bit mask).</summary>
@@ -53,6 +60,10 @@ internal sealed class FurnishDrawerState
     public bool Building;
     // The World source: every model the game places in its world, filtered by zone too.
     public bool World;
+    // The world's effects and ambient sounds, filtered by kind like the World source.
+    public bool Effects, Sounds;
+    // Which of the world's kinds its source last showed (0 pieces, 1 effects, 2 sounds), kept when another source is chosen.
+    public int WorldKind;
     public int Zone;
     public int ImportItem;          // the item chosen in the import dialog
     public Dictionary<int, ulong> ImportOptions = [];
@@ -78,7 +89,8 @@ internal sealed class FurnishDrawerState
 // It stays open while placing. Grids draw only their visible rows, so the full catalogue costs a screenful.
 internal static class FurnishDrawerUi
 {
-    public const string AllFilter = "All furnishings", AllWorldFilter = "All pieces", RecentFilter = "Recent", FavouritesFilter = "Favourites";
+    public const string AllFilter = "All furnishings", AllWorldFilter = "All pieces", RecentFilter = "Recent", FavouritesFilter = "Favourites", LightFilter = "Gives light", EffectsFilter = "Has effects", SoundsFilter = "Has sounds",
+        RoomSizedFilter = "Fits a room (under 10 m)";
     public static UiBounds Bounds => SidePanelUi.Bounds;
     // For the standalone preview's click checks.
     public static (Vector2 Min, Vector2 Max) FirstTileBounds { get; private set; }
@@ -342,10 +354,24 @@ internal static class FurnishDrawerUi
         var command = default(DrawerCommand);
         if (model.CustomHome)
         {
-            var source = state.World ? 2 : state.Building ? 1 : 0;
-            if (HavenKit.Segmented("drawer-source", ["Furnishings", "Building", "World"], ref source)) { state.Building = source == 1; state.World = source == 2; state.Filter = 0; state.Zone = 0; }
+            // Three sources; the world's own has three kinds under it (its pieces, effects and sounds), on a row of their
+            // own so every choice fits the panel.
+            var source = state.World || state.Effects || state.Sounds ? 2 : state.Building ? 1 : 0;
+            if (HavenKit.Segmented("drawer-source", ["Furnishings", "Building", "World"], ref source))
+            {
+                state.Building = source == 1;
+                state.World = source == 2 && state.WorldKind == 0; state.Effects = source == 2 && state.WorldKind == 1; state.Sounds = source == 2 && state.WorldKind == 2;
+                state.Filter = 0; state.Zone = 0;
+            }
+            if (source == 2)
+            {
+                var kind = state.Sounds ? 2 : state.Effects ? 1 : 0;
+                if (HavenKit.Segmented("drawer-world-kind", ["Pieces", "Effects", "Sounds"], ref kind))
+                { state.WorldKind = kind; state.World = kind == 0; state.Effects = kind == 1; state.Sounds = kind == 2; state.Filter = 0; state.Zone = 0; }
+            }
         }
-        HavenKit.Search("##drawer-search", ref state.Search, state.World ? "Search the world: a name, a zone or a file" : state.Building ? "Search building pieces or district" : "Search furnishings");
+        HavenKit.Search("##drawer-search", ref state.Search, state.Sounds ? "Search sounds: a name, a zone or a file" : state.Effects ? "Search effects: a name, a zone or a file"
+            : state.World ? "Search the world: a name, a zone or a file" : state.Building ? "Search building pieces or district" : "Search furnishings");
         var filter = Math.Clamp(state.Filter, 0, Math.Max(0, model.Filters.Count - 1));
         if (state.World && model.Zones.Count > 0)
         {
@@ -398,7 +424,8 @@ internal static class FurnishDrawerUi
             if (HavenKit.Card("##tile", tile, item.Selected, out var min)) command = new(DrawerAction.Pick, item.Index);
             ImGui.SetItemAllowOverlap();
             var hovered = ImGui.IsItemHovered();
-            if (hovered) HavenKit.Tooltip(item.Name);
+            if (hovered) HavenKit.Tooltip(item.Name + (item.GivesLight ? "\nGives light of its own" : "") + (item.HasEffects ? "\nHas effects of its own" : "") + (item.HasSounds ? "\nHas sounds of its own" : "")
+                + (item.Note is { Length: > 0 } note ? "\n" + note : ""));
             if (i == 0) FirstTileBounds = (min, min + tile);
             var draw = ImGui.GetWindowDrawList(); var icon = new Vector2(Px(side)); var at = min + new Vector2((tile.X - icon.X) / 2, Px(Space2));
             if (item.Thumbnail != null)
@@ -408,8 +435,20 @@ internal static class FurnishDrawerUi
                 draw.AddRectFilled(at, at + icon, HavenUi.U(IconWell), Px(RadiusField));
                 if (model.Thumbnail?.Invoke(item.Thumbnail) is { } thumbnail) draw.AddImageRounded(thumbnail, at, at + icon, Vector2.Zero, Vector2.One, HavenUi.U(Vector4.One), Px(RadiusField));
             }
+            else if (item.Sound)
+            {
+                // A sound has nothing to see: a note on the well, brighter while its preview plays.
+                draw.AddRectFilled(at, at + icon, HavenUi.U(IconWell), Px(RadiusField));
+                HavenUi.DrawIcon(draw, HavenIcon.Music, at + icon / 2, Px(34), item.Playing ? Accent : TextSecondary);
+            }
             else if (model.Icon(item.Icon) is { } texture) draw.AddImageRounded(texture, at, at + icon, Vector2.Zero, Vector2.One, HavenUi.U(Vector4.One), Px(RadiusField));
             else draw.AddRectFilled(at, at + icon, HavenUi.U(IconWell), Px(RadiusField));
+            // A world piece that brings a light: a bulb in the tile's top-left corner (the star has the other).
+            if (item.GivesLight) HavenUi.DrawIcon(draw, HavenIcon.Light, min + Px(16, 16), Px(16), Warning);
+            // Effects: a sparkle beside the bulb (or in its place).
+            if (item.HasEffects) HavenUi.DrawIcon(draw, HavenIcon.Sparkle, min + Px(item.GivesLight ? 34 : 16, 16), Px(13), Accent);
+            // Sounds: a note after them.
+            if (item.HasSounds) HavenUi.DrawIcon(draw, HavenIcon.Music, min + Px(16 + 18 * ((item.GivesLight ? 1 : 0) + (item.HasEffects ? 1 : 0)), 16), Px(13), TextSecondary);
             using (HavenFonts.Use(HavenText.Caption))
             {
                 var text = new Vector2(min.X + Px(6), at.Y + icon.Y + Px(6)); var wrap = tile.X - Px(12);
@@ -426,6 +465,16 @@ internal static class FurnishDrawerUi
             if (item.Favourite || hovered || starHovered)
                 HavenUi.DrawStar(draw, min + new Vector2(tile.X - star.X / 2 - Px(4), Px(4) + star.Y / 2), Px(15), item.Favourite ? Warning : starHovered ? Text : TextTertiary, item.Favourite);
             if (starHovered) HavenKit.Tooltip(item.Favourite ? "Remove from Favourites" : "Add to Favourites");
+            if (item.Sound)
+            {
+                // ▶ in the tile's top-left corner: hear the sound before placing it.
+                var play = new Vector2(Px(26));
+                ImGui.SetCursorScreenPos(min + new Vector2(Px(4), Px(4)));
+                if (HavenUi.Surface("##preview", play)) command = new(DrawerAction.Preview, item.Index);
+                var playHovered = ImGui.IsItemHovered();
+                HavenUi.DrawIcon(draw, item.Playing ? HavenIcon.Stop : HavenIcon.Play, min + new Vector2(Px(4), Px(4)) + play / 2, Px(14), item.Playing || playHovered ? Accent : Text);
+                if (playHovered) HavenKit.Tooltip(item.Playing ? "Stop" : "Listen");
+            }
             ImGui.PopID();
         }
         ImGui.EndDisabled();

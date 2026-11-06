@@ -627,6 +627,8 @@ public readonly record struct AmbientEmitter(string Key, string Path, Matrix4x4 
 public static class AmbientBudget
 {
     public const int MaxEffects = 256;
+    /// <summary>The most world groups' effects one home shows (Haven's own effects only), within MaxEffects in all.</summary>
+    public const int MaxWorldEffects = 128;
     public const int MaxSounds = 24;
     // Copies of one loop started at different moments phase against each other; six adjacent Eternity
     // Cakes were reported as a harsh, glitchy soundscape. Nearby copies share one emitter, and each

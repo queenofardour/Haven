@@ -64,6 +64,8 @@ public sealed class NpcRoster
     }
 
     public IReadOnlyList<RosterNpc> Of(string character) => characters.GetValueOrDefault(character) ?? [];
+    /// <summary>Every character's saved NPCs on this PC.</summary>
+    public IEnumerable<RosterNpc> Everyone => characters.Values.SelectMany(x => x);
     public RosterNpc? Find(string character, Guid id) => Of(character).FirstOrDefault(x => x.Id == id);
 
     /// <summary>Saves an NPC to a character's roster (a new entry each time).</summary>

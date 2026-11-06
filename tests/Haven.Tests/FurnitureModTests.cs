@@ -79,9 +79,36 @@ internal static class FurnitureModTests
             Assert(texture.StartsWith(FurniturePackages.Root + manifest.Id + "/") && package.Files[texture].SequenceEqual(Tex(32)));
             // The same import gives the same paths.
             Assert(FurniturePackages.Build(mod, 13, [Model], Game, "Toilet").Manifest.Id == manifest.Id);
+            // The folder a package unpacks to is read from its manifest alone (clearing downloaded furniture); not a package: none.
+            Assert(FurniturePackages.ManifestId(new MemoryStream(zip)) == manifest.Id);
+            Assert(FurniturePackages.ManifestId(new MemoryStream([1, 2, 3, 4])) == null);
             // A mod that changes nothing the item draws with is refused.
             using var unrelated = PenumbraMod.Open(Pmp(new() { ["default_mod.json"] = Json("{\"Files\":{\"x/y.tex\":\"y.tex\"}}"), ["y.tex"] = Tex(2) }));
             RejectOperation(() => FurniturePackages.Build(unrelated, 13, [Model], Game, "x"));
+        });
+
+        await check("A package pointing at game files from an expansion this game lacks is found out, so a free trial never asks for them", () =>
+        {
+            const string dawntrail = "bg/ex5/01_xkt_x6/twn/x6t1/texture/x6t1_w1_wall01_d.tex", endwalker = "bg/ex4/01_cvt_g5/twn/g5t1/material/g5t1_w1_door1.mtrl";
+            const string stormblood = "bg/ex2/01_gyr_g3/fld/g3f1/texture/g3f1_w1_stone_d.tex";
+            (string, byte[])[] files =
+            [
+                ("bgcommon/hou/hv/0123456789ab/m0.mtrl", Mtrl(dawntrail)),
+                ("bgcommon/hou/hv/0123456789ab/model.mdl", Mdl(endwalker, "bgcommon/hou/hv/0123456789ab/m0.mtrl")),
+                ("bgcommon/hou/hv/0123456789ab/m1.mtrl", Mtrl(stormblood)),
+                ("bgcommon/hou/hv/0123456789ab/t0.tex", Tex(2)),
+            ];
+            // A trial has the base game and the first three expansions.
+            static bool Trial(string path) => Haven.Core.GameDataPaths.Expansion(path) <= 3;
+            Assert(Haven.Core.PackageNeeds.Missing(files, Trial) is { Path: dawntrail, Expansion: 5 });
+            Assert(Haven.Core.PackageNeeds.Missing(files[1..], Trial) is { Path: endwalker, Expansion: 4 });
+            Assert(Haven.Core.PackageNeeds.Missing(files, _ => true) == null && Haven.Core.PackageNeeds.Missing(files[2..], Trial) == null);
+            // The base game's files, Haven's own and a character model's relative material names are never even asked about.
+            var asked = new List<string>();
+            Assert(Haven.Core.PackageNeeds.Missing([("a.mtrl", Mtrl(TextureA)), ("b.mdl", Mdl("/mt_c0101e0001_a.mtrl", MaterialA))], p => { asked.Add(p); return false; }) == null && asked.Count == 0);
+            // A file that doesn't read names nothing (it was refused when the package was opened).
+            Assert(Haven.Core.PackageNeeds.Missing([("bad.mtrl", [1, 2, 3]), ("bad.mdl", [0]), ("x.tex", Tex(2))], _ => false) == null);
+            Assert(Haven.Core.PackageNeeds.Message("\"Chair\"", 5).Contains("Dawntrail's game data"));
         });
 
         await check("A furnishing carries its custom furniture package beside its base item", () =>

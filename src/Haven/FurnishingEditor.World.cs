@@ -39,6 +39,10 @@ internal sealed partial class FurnishingEditor
         { worldHome = house?.Id; EndEditing(); Select(null, null); snapHouse = null; }
         var focused = WorldEditorKeys.Focused;
         if (house != null && housing.IsReady) DrawStagedGuides(house);
+        // Markers draw from the home's data each frame: a piece that won't place (a malformed one) is skipped, not fatal.
+        if (house != null)
+            try { DrawAmbientMarkers(house); }
+            catch (Exception ex) when (ex is IndexOutOfRangeException or NullReferenceException or ArgumentException or InvalidOperationException) { }
         if (editing && !housing.CanFurnish) EndEditing();
         var toolbar = house != null && housing.IsReady;
         if (toolbar)

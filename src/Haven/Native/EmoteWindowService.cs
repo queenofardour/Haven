@@ -68,7 +68,8 @@ internal sealed unsafe class EmoteWindowService : IDisposable
         commandText.Clear();
     }
 
-    private bool Active => inside() && locked.Count > 0;
+    // The agent's row counts (+0x31/+0x34/+0x36) aren't in ClientStructs: off after a game patch until Haven is updated.
+    private bool Active => inside() && locked.Count > 0 && Haven.Native.PatchCheck.PatchGuard.Allows(Haven.Core.PatchFeature.EmoteWindow);
 
     private void OnFrame(IFramework _)
     {

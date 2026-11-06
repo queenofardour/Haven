@@ -10,5 +10,6 @@
     <!-- World pieces' names, filled later from the offline tool's contact sheets. -->
     <EmbeddedResource Include="World/world-names.json" LogicalName="Haven.Core.World.world-names.json" />
     <EmbeddedResource Include="World/world-hidden.txt" LogicalName="Haven.Core.World.world-hidden.txt" />
+    <EmbeddedResource Include="World/world-ambient.json" LogicalName="Haven.Core.World.world-ambient.json" />
   </ItemGroup>
 </Project>

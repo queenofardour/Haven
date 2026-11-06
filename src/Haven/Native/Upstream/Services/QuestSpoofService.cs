@@ -83,9 +83,12 @@ internal sealed unsafe class QuestSpoofService : IDisposable
     // shipped in prod (see AutoAdvanceZones) — the read-only populace blanket here is harmless and stays.
     private static readonly HashSet<uint> ExtraBlanketTerritories = new() { 759, 1189 };
 
-    // 7.55 function-prologue sigs (Fable, verified count=1 each). ScanText resolves to the function start.
+    // 7.55 function-prologue sigs (verified count=1 each then). ScanText resolves to the function start.
     private const string SigIsQuestComplete = "0F B7 C2 4C 8B C9 44 8B C0 49 C1 E8 03 49 81 F8 EF 02";   // bool(this, ushort) @0xdf5680
-    private const string SigGetQuestSequence = "40 53 48 83 EC 20 0F B7 D9 E8 ?? ?? ?? ?? 45 33";          // byte(ushort)      @0xdf59d0
+    // GetQuestSequence's 7.55 signature ("40 53 48 83 EC 20 0F B7 D9 E8 ?? ?? ?? ?? 45 33") later matched three
+    // functions, and Dalamud took the first, one that isn't it (game 2026.10.16: 0xDFB4B0). This one finds only the
+    // function 0x350 past IsQuestComplete, as on 7.55 (0xDFBAF0; tools/Haven.PatchCheck find/disasm, 5 November 2026).
+    private const string SigGetQuestSequence = "40 53 48 83 EC 20 0F B7 D9 E8 ?? ?? ?? ?? 45 33 C0 41 8B D0 48 83 C0 10 66 39 58 ?? 74 ?? 41 FF C0 48 FF C2 48 83 C0 18 48 83 FA 1E 7C ?? 32 C0";   // byte(ushort)
     private const string SigIsQuestAccepted = "45 33 C0 48 8D 41 18 66 39 10 74 10 49 FF C0 48";           // bool(this, ushort) @0xdf5750
 
     // Native bool returns in AL (1 byte); declaring the return as byte reads it correctly and dodges the 4-byte

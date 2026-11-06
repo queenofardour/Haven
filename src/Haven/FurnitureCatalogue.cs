@@ -8,7 +8,13 @@ using Stagehand.Definitions.Objects;
 
 namespace Haven;
 
-internal sealed record AmbientScene(string? Effects, IReadOnlyDictionary<string, string> Sounds);
+// EffectList: the same effects as Effects' stage, for Haven's own effects (FurnitureEffects) when they're on.
+internal sealed record AmbientScene(string? Effects, IReadOnlyDictionary<string, string> Sounds)
+{
+    public IReadOnlyList<AmbientEmitter> EffectList { get; init; } = [];
+    // SoundList: the same sounds as Sounds' stages (budgeted, keyed alike), for Haven's own sounds (FurnitureSounds).
+    public IReadOnlyList<AmbientEmitter> SoundList { get; init; } = [];
+}
 
 internal sealed class FurnitureCatalogue
 {
@@ -166,10 +172,13 @@ internal sealed class FurnitureCatalogue
     public FurnitureEntry Get(Furnishing item) => item.BuildingPart == null ? Get(item.ItemId) : Part(item.BuildingPart).Entry;
     /// <summary>The game's world as building pieces; null until the plugin sets it up.</summary>
     public WorldCatalogue? World { get; set; }
+    /// <summary>The world's effects and ambient sounds as pieces; null until the plugin sets it up.</summary>
+    public AmbientCatalogue? Ambient { get; set; }
     // A building part: the housing and inn parts read up front, else a world piece (built when first wanted; a
     // placeholder drawing nothing meanwhile, or when this PC can't draw it).
     private BuildingPart Part(string path)
     {
+        if (Ambient != null && BuildingParts.IsAmbient(path)) return Ambient.Part(path);
         var catalogue = buildings.GetAwaiter().GetResult();
         return World != null && !catalogue.CanBuild(path) && BuildingParts.IsWorldAsset(path) ? World.Part(path) : catalogue.Get(path);
     }
@@ -414,17 +423,19 @@ internal sealed class FurnitureCatalogue
     public static int MotionSeed(Furnishing item) => BitConverter.ToInt32(item.Id.ToByteArray(), 0);
     public static Matrix4x4 HouseMatrix(House house) => Matrix4x4.CreateScale(house.Transform.Scale) * Matrix4x4.CreateFromQuaternion(house.Transform.Orientation) * Matrix4x4.CreateTranslation(house.Transform.Position);
 
+    /// <param name="havenLights">Haven draws the furnishing lights and the canvas fill itself (FurnitureLights), so the
+    /// stage leaves them out; an imported stage's own lights stay on it either way.</param>
     public StageDefinition BuildStage(House house, Furnishing? ghost = null, string[]? excludeImported = null, bool includeFurnitureModels = true,
-        Func<Furnishing, bool>? switchOn = null)
+        Func<Furnishing, bool>? switchOn = null, bool havenLights = false)
     {
         if (!StageDefinition.TryParseDefinitionString(house.Stage.GetRawText(), out var stage)) throw new InvalidDataException("Invalid legacy furnishing stage.");
         if (excludeImported != null) ImportedScene.Remove(stage, excludeImported);
         var lights = 0;
         LimitImportedLights(stage.Objects, ref lights);
-        if (house.CustomLayout)
+        if (house.CustomLayout && !havenLights)
             stage.Objects["haven-canvas-fill"] = new LightDefinition { DisplayName = "Canvas fill light", Position = new(0, 6, 0),
                 Color = Vector3.One, Intensity = 1.4f * (house.Interior.Brightness ?? 5) / 5, Range = 24 };
-        foreach (var item in house.Furnishings) Add(stage, item, false, includeFurnitureModels, switchOn);
+        foreach (var item in house.Furnishings) Add(stage, item, false, includeFurnitureModels, switchOn, havenLights);
         if (ghost != null) Add(stage, ghost, true, includeFurnitureModels, null);
         if (Count(stage.Objects.Values) + (house.CustomLayout ? 1 : 0) > HouseFormat.MaxObjects) throw new InvalidDataException("The furnishing scene exceeds its rendering budget.");
         return stage;
@@ -460,21 +471,48 @@ internal sealed class FurnitureCatalogue
                     audio.Add(new($"sw-{id}-{i}", held.Path, held.Transform * world, Vector4.One, item.SoundVolume ?? 1));
         }
         var stage = new StageDefinition { FormatVersion = StageDefinition.CurrentFormatVersion };
-        foreach (var e in AmbientBudget.Effects(fx))
+        var drawn = AmbientBudget.Effects(fx);
+        // World groups' always-playing effects: only for Haven's own effects (EffectList), never on Stagehand's stage, after
+        // the furnishings' and within the same budget.
+        List<AmbientEmitter> worldFx = [];
+        if (effects)
+            foreach (var item in house.Furnishings.Where(x => x.BuildingPart != null))
+            {
+                var prefab = Prefab(item);
+                if (prefab.WorldEffects.Length == 0) continue;
+                var world = ItemMatrix(item) * parent; var id = item.Id.ToString("N");
+                for (var i = 0; i < prefab.WorldEffects.Length; i++) worldFx.Add(new($"wf-{id}-{i}", prefab.WorldEffects[i].Path, prefab.WorldEffects[i].Transform * world, prefab.WorldEffects[i].Color));
+            }
+        var withWorld = worldFx.Count == 0 ? drawn
+            : [.. drawn, .. worldFx.Take(Math.Min(AmbientBudget.MaxWorldEffects, AmbientBudget.MaxEffects - drawn.Length))];
+        foreach (var e in drawn)
         {
             Matrix4x4.Decompose(e.World, out var scale, out var rotation, out var position);
             var definition = new VfxObjectDefinition { DisplayName = "Furnishing effect", VfxGamePath = e.Path, Position = position, Scale = scale, Color = e.Color };
             definition.RotationQuaternion = rotation; stage.Objects[e.Key] = definition;
         }
         var soundStages = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var s in AmbientBudget.Sounds(audio))
+        var heard = AmbientBudget.Sounds(audio);
+        // World groups' always-playing sounds: only for Haven's own sounds (SoundList), never on Stagehand's stages. They
+        // share the budget with the furnishings' (merged and capped together), at the piece's own volume (since 0.67).
+        List<AmbientEmitter> worldAudio = [];
+        if (sounds)
+            foreach (var item in house.Furnishings.Where(x => x.BuildingPart != null))
+            {
+                var prefab = Prefab(item);
+                if (prefab.WorldSounds.Length == 0) continue;
+                var world = ItemMatrix(item) * parent; var id = item.Id.ToString("N");
+                for (var i = 0; i < prefab.WorldSounds.Length; i++) worldAudio.Add(new($"ws-{id}-{i}", prefab.WorldSounds[i].Path, prefab.WorldSounds[i].Transform * world, Vector4.One, item.SoundVolume ?? 1));
+            }
+        var heardAll = worldAudio.Count == 0 ? heard : AmbientBudget.Sounds([.. audio, .. worldAudio]);
+        foreach (var s in heard)
         {
             var single = new StageDefinition { FormatVersion = StageDefinition.CurrentFormatVersion };
             // A changed volume changes the definition, so the sound is recreated rather than updated in place.
             single.Objects["sound"] = new SoundObjectDefinition { DisplayName = "Furnishing sound", SoundGamePath = s.Path, Position = s.World.Translation, IsPositional = true, Volume = s.Volume };
             soundStages[s.Key] = single.ToDefinitionString();
         }
-        return new(stage.Objects.Count == 0 ? null : stage.ToDefinitionString(), soundStages);
+        return new(stage.Objects.Count == 0 ? null : stage.ToDefinitionString(), soundStages) { EffectList = withWorld, SoundList = heardAll };
     }
     // A looping sound its side never stops is held with the switch; everything else is a one-off cue on the change.
     public bool Held(PrefabSwitchSound sound) => sound.StopFrame == null && soundLoops.GetOrAdd(sound.Path, path =>
@@ -535,7 +573,7 @@ internal sealed class FurnitureCatalogue
         }
     }
     private static int Count(IEnumerable<ObjectDefinition> objects) => objects.Sum(x => 1 + (x is GroupDefinition g ? Count(g.Objects.Values) : 0));
-    private void Add(StageDefinition stage, Furnishing item, bool ghost, bool includeModels, Func<Furnishing, bool>? switchOn)
+    private void Add(StageDefinition stage, Furnishing item, bool ghost, bool includeModels, Func<Furnishing, bool>? switchOn, bool havenLights = false)
     {
         var entry = Get(item); var prefab = Prefab(item);
         var on = prefab.Switch == null || (switchOn?.Invoke(item) ?? prefab.Switch.DefaultOn);
@@ -557,7 +595,7 @@ internal sealed class FurnitureCatalogue
             definition.RotationQuaternion = rotation;
             group.Objects["part-" + i] = definition;
         }
-        if (!ghost)
+        if (!ghost && !havenLights)
             for (var i = 0; i < prefab.Lights.Length; i++)
             {
                 var light = prefab.Lights[i];

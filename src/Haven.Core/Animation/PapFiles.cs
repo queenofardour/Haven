@@ -135,6 +135,14 @@ public static class PapFiles
         return sounds;
     }
 
+    /// <summary>Every string the file's timelines name (effects, sounds and whatever else their items point at), each once.</summary>
+    public static IReadOnlyList<string> TimelineStrings(ReadOnlySpan<byte> pap)
+    {
+        List<string> strings = [];
+        Rewrite(pap, null, (_, _, value) => { if (!strings.Contains(value)) strings.Add(value); return null; });
+        return strings;
+    }
+
     /// <summary>The file with its timelines' sounds (C063 entries) pointed elsewhere: map gives a new path, or null to keep one.</summary>
     public static byte[] RepointSounds(ReadOnlySpan<byte> pap, Func<string, string?> map) =>
         Rewrite(pap, null, (_, tag, value) => tag == "C063" ? map(value) : null);

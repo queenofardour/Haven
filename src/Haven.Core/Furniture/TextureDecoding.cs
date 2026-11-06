@@ -3,12 +3,13 @@ using System.Buffers.Binary;
 namespace Haven.Core.Furniture;
 
 /// <summary>
-/// Reads the first mip of a game texture (.tex) into RGBA bytes: uncompressed B8G8R8A8 and the block formats character
-/// mods use (BC1, BC2, BC3, BC4, BC5, BC7). Used to bake a character material's colour table into scenery textures.
+/// Reads the first mip of a game texture (.tex) into RGBA bytes: uncompressed B8G8R8A8, the one-channel L8 (grey) and A8
+/// (white with that alpha, as effects' masks are), and the block formats character mods use (BC1, BC2, BC3, BC4, BC5,
+/// BC7). Used to bake a character material's colour table into scenery textures, and for thumbnails.
 /// </summary>
 public static class TextureDecoding
 {
-    public const uint B8G8R8A8 = 0x1450, Bc1 = 0x3420, Bc2 = 0x3430, Bc3 = 0x3431, Bc4 = 0x6120, Bc5 = 0x6230, Bc7 = 0x6432;
+    public const uint L8 = 0x1130, A8 = 0x1131, B8G8R8A8 = 0x1450, Bc1 = 0x3420, Bc2 = 0x3430, Bc3 = 0x3431, Bc4 = 0x6120, Bc5 = 0x6230, Bc7 = 0x6432;
 
     /// <summary>The texture's format, width and height, read from its header.</summary>
     public static (uint Format, int Width, int Height) Header(byte[] tex)
@@ -65,7 +66,7 @@ public static class TextureDecoding
     }
 
     /// <summary>Whether <see cref="Decode"/> reads this texture.</summary>
-    public static bool Readable(byte[] tex) => tex.Length >= 80 && Header(tex).Format is B8G8R8A8 or Bc1 or Bc2 or Bc3 or Bc4 or Bc5 or Bc7;
+    public static bool Readable(byte[] tex) => tex.Length >= 80 && Header(tex).Format is B8G8R8A8 or L8 or A8 or Bc1 or Bc2 or Bc3 or Bc4 or Bc5 or Bc7;
 
     /// <summary>
     /// The first mip as RGBA bytes, row by row; or, given <paramref name="maxSide"/>, the largest mip no wider or taller
@@ -86,6 +87,17 @@ public static class TextureDecoding
             for (var i = 0; i < width * height; i++)
             {
                 rgba[i * 4] = tex[at + i * 4 + 2]; rgba[i * 4 + 1] = tex[at + i * 4 + 1]; rgba[i * 4 + 2] = tex[at + i * 4]; rgba[i * 4 + 3] = tex[at + i * 4 + 3];
+            }
+            return (rgba, width, height);
+        }
+        if (format is L8 or A8)
+        {
+            if (at + (long)width * height > tex.Length) throw new InvalidDataException("A texture's data runs past its end.");
+            for (var i = 0; i < width * height; i++)
+            {
+                var value = tex[at + i];
+                if (format == L8) { rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = value; rgba[i * 4 + 3] = 255; }
+                else { rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255; rgba[i * 4 + 3] = value; }
             }
             return (rgba, width, height);
         }

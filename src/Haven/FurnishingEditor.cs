@@ -48,6 +48,7 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
 
     private sealed record RoomRow(Guid? Id, string? ImportedKey, string Name, string Detail);
     private House? roomHouse;
+    private int roomAmbient;
     private RoomRow[] roomRows = [];
     private ImportedObject[] importedObjects = [];
     private string? selectedImported;
@@ -59,8 +60,9 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
             selectedProposal = housing.EditProposals.FirstOrDefault(p => p.Author == selectedProposalAuthor && selectedProposalPath != null
                 && p.Batch.Changes.Any(c => HostedEditing.Overlaps(c.Path, selectedProposalPath)))?.Batch.Id;
         if (selected is Guid selection && housing.Placement?.Id != selection && house?.Furnishings.Any(x => x.Id == selection) != true) Select(null, null);
-        if (ReferenceEquals(roomHouse, house)) return;
-        roomHouse = house;
+        // Again once the effects' and sounds' catalogue is read (their names come from it).
+        if (ReferenceEquals(roomHouse, house) && roomAmbient == housing.AmbientVersion) return;
+        roomHouse = house; roomAmbient = housing.AmbientVersion;
         this.selection.RemoveWhere(id => house?.Furnishings.Any(x => x.Id == id) != true);
         importedObjects = house == null ? [] : housing.Imported.Objects(house.Stage);
         List<RoomRow> rows = [];
@@ -321,6 +323,22 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
     }
     private void DrawAppearance(Furnishing item, FurnitureEntry entry)
     {
+        // A world effect or sound: where it's from, whether it plays here, and a sound's volume.
+        if (IsAmbient(item))
+        {
+            var sound = Haven.Core.World.WorldAmbient.IsSoundPath(item.BuildingPart!);
+            var plays = sound ? Catalogue.Prefab(item).WorldSounds.Length > 0 : Catalogue.Prefab(item).WorldEffects.Length > 0;
+            HavenKit.Caption(!plays && housing.Ambient.Unlisted(item.BuildingPart!) ? $"This {(sound ? "sound" : "effect")} isn't in this Haven's list (a newer Haven's, or one taken out because it showed nothing or didn't fit a room), so it doesn't {(sound ? "play" : "show")} here. Its marker lets you move or delete it."
+                : !plays ? $"This {(sound ? "sound" : "effect")} isn't in this game (a free trial has no Endwalker or Dawntrail effects), so it doesn't {(sound ? "play" : "show")} here."
+                : sound ? (housing.HavenSounds ? $"One of the game's own ambient sounds, from {entry.Description}. It has no surface: its marker shows where it plays while you decorate."
+                    : "It plays only with Haven's own sounds: turn off Settings → Advanced → \"Use Stagehand's sounds instead\".")
+                : housing.HavenEffects ? $"One of the game's own effects, from {entry.Description}.{EffectSizeLine(item)} Scale it to make it bigger or smaller; its marker shows where it is while you decorate."
+                    : "It shows only with Haven's own effects: turn off Settings → Advanced → \"Use Stagehand's effects instead\".");
+            if (!sound && housing.EffectOverBudget(item))
+                HavenKit.Caption($"This home already shows as many effects as Haven draws at once ({AmbientBudget.MaxWorldEffects} from world sets and placed effects), so this one isn't shown. Remove some to make room.");
+            if (sound) DrawSoundVolume(item);
+            return;
+        }
         if (item.BuildingPart != null)
         {
             if (entry.FinishPart is {} part)
@@ -338,10 +356,22 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
             else if (BuildingParts.IsWorldAsset(item.BuildingPart) && !Catalogue.CanBuild(item.BuildingPart))
                 HavenKit.Caption(Catalogue.Prefab(item).Models.Length == 0
                     ? "This piece of the game's world isn't drawn here: it's still being read, or this game doesn't have it (a free trial has no Endwalker or Dawntrail pieces)."
-                    : $"A piece of the game's world, from {entry.Description}, in its own materials.");
+                    : $"A piece of the game's world, from {entry.Description}, in its own materials."
+                    + (!housing.World.GivesLight(item.BuildingPart) ? "" : housing.HavenLights ? " It brings its own light."
+                        : " It brings its own light, which shines with Haven's lights (Settings → Advanced: turn off \"Use Stagehand's lights instead\").")
+                    + (!housing.World.HasEffects(item.BuildingPart) ? "" : housing.HavenEffects ? " It plays effects of its own."
+                        : " It plays effects of its own, which show with Haven's effects (Settings → Advanced: turn off \"Use Stagehand's effects instead\").")
+                    + (!housing.World.HasSounds(item.BuildingPart) ? "" : housing.HavenSounds ? " It plays sounds of its own."
+                        : " It plays sounds of its own, which play with Haven's sounds (Settings → Advanced: turn off \"Use Stagehand's sounds instead\")."));
             else HavenKit.Caption("This piece uses its original housing materials.");
             DrawCollision(item);
             if (Catalogue.Prefab(item).Colliders.Length == 0) HavenKit.Caption("This asset has no solid collision.");
+            // A world set's own sounds have a volume too (housing format: a world piece may carry one).
+            if (BuildingParts.TakesSoundVolume(item.BuildingPart))
+            {
+                if (housing.SoundVolumeEditable(item)) DrawSoundVolume(item);
+                else if (Catalogue.Prefab(item).WorldSounds.Length > 0) HavenKit.Caption("Its sound volume can be set in Just me visits for now (gatherings can carry it once Haven's server is updated).");
+            }
             if (entry.DyeSlots == 0) return;
         }
         else { DrawDisplay(item, entry); DrawCollision(item); DrawSeatSwitch(item); DrawDoorSwitch(item); DrawSoundVolume(item); }
@@ -369,7 +399,8 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
     private void DrawSoundVolume(Furnishing item)
     {
         var prefab = Catalogue.Prefab(item);
-        if (prefab.Sounds.Length == 0 && prefab.LoopSounds.Length == 0 && (prefab.Switch == null || prefab.SwitchSounds.Length == 0)) return;
+        // A furnishing's own sounds, a world set's or a world sound piece's.
+        if (prefab.Sounds.Length == 0 && prefab.LoopSounds.Length == 0 && prefab.WorldSounds.Length == 0 && (prefab.Switch == null || prefab.SwitchSounds.Length == 0)) return;
         var value = liveSoundVolume is { } live && live.Item == item.Id ? live.Value : item.SoundVolume ?? 1;
         var drag = HavenKit.Slide("##sound-volume", "Sound volume", ref value, 0, 1, value <= 0 ? "Off" : $"{MathF.Round(value * 100):0}%");
         liveSoundVolume = drag.Active ? (item.Id, value) : null;
@@ -510,11 +541,16 @@ internal sealed partial class FurnishingEditor(HousingController housing, Native
     private PickedObject? PickNow(House house, Vector3 origin, Vector3 direction)
     {
         var distance = float.MaxValue; PickedObject? result = null;
+        // An effect's or sound's marker under the pointer is chosen before anything else (it's drawn over everything).
+        if (MarkerAt(house) is Guid marked)
+            return housing.StagedFurniture.FirstOrDefault(s => s.Item.Id == marked) is {} markedStaged ? new(null, null, markedStaged.Proposal) : new(marked, null);
         // Moved pieces of the house are chosen in Remodel, not here.
         var moved = housing.MovedShellCopies;
         foreach (var item in house.Furnishings)
         {
             if (moved.Contains(item.Id)) continue;
+            // An effect or sound has no surface: only its marker answers (above).
+            if (IsAmbient(item)) continue;
             var prefab = Catalogue.Prefab(item);
             var on = prefab.Switch == null || housing.SwitchOn(item);
             foreach (var model in prefab.Models)

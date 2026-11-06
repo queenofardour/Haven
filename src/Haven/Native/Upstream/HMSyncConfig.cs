@@ -24,8 +24,25 @@ public class HavenNativeConfig : IPluginConfiguration
     public int WorldChatOff { get; set; }
     // Custom furniture: warn before importing a minion prop (experimental), until turned off in the warning or Settings.
     public bool WarnMinionProps { get; set; } = true;
+    // After a game patch: the game version the player turned paused features on for, and the last one noticed.
+    public string PatchAllowedFor { get; set; } = "";
+    public string PatchNoticeFor { get; set; } = "";
     // Furnishing: warn when a chair or bed is tilted (it can't be sat on then), until turned off in the warning or Settings.
     public bool WarnTiltedSeats { get; set; } = true;
+    // Stagehand draws furnishing lights instead of Haven (Settings → Advanced). Haven's own lights
+    // are the default since 0.66.1 (user-confirmed in game, 5 November 2026); 0.66.0's opt-in setting (HavenLights,
+    // saved off for everyone) is no longer read.
+    public bool StagehandLights { get; set; }
+    // Stagehand draws furnishing effects instead of Haven (Settings → Advanced). Haven's own effects
+    // are the default since 0.66.4 (user-confirmed in game on 0.66.3, 5 November 2026); 0.66.2's opt-in setting
+    // (HavenEffects, saved off for everyone) is no longer read.
+    public bool StagehandEffects { get; set; }
+    // Stagehand plays furnishing sounds instead of Haven (Settings → Advanced). Haven's own sounds are
+    // the default since 0.66.7 (user-confirmed in game on 0.66.5, 5 November 2026); 0.66.5's opt-in setting (HavenSounds,
+    // saved off for everyone) is no longer read.
+    public bool StagehandSounds { get; set; }
+    // Custom content downloaded for other people's homes: the most this PC keeps (bytes; Haven.Core.ContentCache).
+    public long DownloadLimit { get; set; } = 2_000_000_000;
     // Haven: how loud the weather heard outside a home plays on this PC (0-1, of the game's music volume).
     public float OutsideVolume { get; set; } = 0.6f;
     // Pose balls: custom animations play their own sounds; a player whose animated body would sink is raised onto the surface.

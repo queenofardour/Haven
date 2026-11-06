@@ -199,8 +199,13 @@ internal sealed partial class HousingController
         if (!CanFurnish || sharedDraft == null || !HasArchivedDraft || HasSharedDraft || editBusy) return;
         var saved = HouseStore.Read(draftStore.PathFor(sharedDraft.Published.Id));
         var origin = HouseStore.Read(draftBaseStore.PathFor(saved.Id));
+        // A draft kept by 0.67.0 may hold what Haven's server can't take yet (a world set's sound volume): set aside.
+        var held = saved.Furnishings.Count(f => NeedsNewerServer(f) && !(origin.Furnishings.FirstOrDefault(o => o.Id == f.Id) is { } before && SameForServer(before, f)));
+        if (held > 0) saved = saved with { Furnishings = [.. saved.Furnishings.Where(f => !NeedsNewerServer(f) || origin.Furnishings.Any(o => o.Id == f.Id && SameForServer(o, f)))
+            .Concat(origin.Furnishings.Where(o => NeedsNewerServer(o) && saved.Furnishings.Any(f => f.Id == o.Id && !SameForServer(o, f))))] };
         sharedDraft = new(origin); sharedDraft.Change(saved); sharedDraft.Receive(active!);
-        active = sharedDraft.Working; needsRender = true; EditStatus = "Local draft restored. Review it before saving.";
+        active = sharedDraft.Working; needsRender = true;
+        EditStatus = held > 0 ? $"Local draft restored, without {held} world effect, sound or sound volume gatherings can't carry yet. Review it before saving." : "Local draft restored. Review it before saving.";
     }
     public void KeepDraftValues()
     {
@@ -250,6 +255,9 @@ internal sealed partial class HousingController
             try
             {
                 var item = value.Value.Deserialize<Furnishing>(HostedEditing.Json)!;
+                // Checked as a piece of this home (a deletion's "before" reaches here unchecked by the relay): a
+                // malformed one would throw from every frame's drawing.
+                HouseFormat.Validate(previewScene with { Furnishings = [item] });
                 Catalogue.Get(item); Catalogue.Prefab(item);
                 previews.Add(new(proposal.Batch.Id, proposal.Name, item, !change.AfterExists));
             }

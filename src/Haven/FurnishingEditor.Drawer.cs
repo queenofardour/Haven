@@ -27,15 +27,22 @@ internal sealed partial class FurnishingEditor
         // The World source: the game's whole world, read from this PC's game data the first time it's opened.
         var world = housing.World;
         if (drawer.World) world.Start();
-        var buildingReady = drawer.World ? world.Ready && Catalogue.BuildingsReady : !drawer.Building || Catalogue.BuildingsReady;
-        var source = drawer.World ? buildingReady ? world.Entries : [] : drawer.Building ? buildingReady ? Catalogue.BuildingItems : [] : Catalogue.Items;
-        string[] filters = [drawer.World ? FurnishDrawerUi.AllWorldFilter : FurnishDrawerUi.AllFilter, FurnishDrawerUi.RecentFilter, FurnishDrawerUi.FavouritesFilter,
-            .. drawer.World ? buildingReady ? world.Categories : [] : drawer.Building ? buildingReady ? Catalogue.BuildingCategories : [] : Catalogue.Categories];
+        // The world's effects and ambient sounds, from the embedded catalogue.
+        var ambient = housing.Ambient;
+        var ambientSource = drawer.Effects || drawer.Sounds;
+        if (ambientSource) ambient.Start();
+        var buildingReady = ambientSource ? ambient.Ready : drawer.World ? world.Ready && Catalogue.BuildingsReady : !drawer.Building || Catalogue.BuildingsReady;
+        var source = drawer.Effects ? ambient.Effects : drawer.Sounds ? ambient.Sounds
+            : drawer.World ? buildingReady ? world.Entries : [] : drawer.Building ? buildingReady ? Catalogue.BuildingItems : [] : Catalogue.Items;
+        string[] filters = [drawer.World || ambientSource ? FurnishDrawerUi.AllWorldFilter : FurnishDrawerUi.AllFilter, FurnishDrawerUi.RecentFilter, FurnishDrawerUi.FavouritesFilter,
+            .. drawer.World ? [FurnishDrawerUi.LightFilter, FurnishDrawerUi.EffectsFilter, FurnishDrawerUi.SoundsFilter] : drawer.Effects ? [FurnishDrawerUi.RoomSizedFilter] : Array.Empty<string>(),
+            .. drawer.Effects ? ambient.EffectCategories : drawer.Sounds ? ambient.SoundCategories
+            : drawer.World ? buildingReady ? world.Categories : [] : drawer.Building ? buildingReady ? Catalogue.BuildingCategories : [] : Catalogue.Categories];
         drawer.Filter = Math.Clamp(drawer.Filter, 0, filters.Length - 1);
         if (drawer.World && worldZones.Length == 0 && buildingReady) worldZones = [WorldZonesAll, .. world.Zones];
         drawer.Zone = Math.Clamp(drawer.Zone, 0, Math.Max(0, worldZones.Length - 1));
         var placing = housing.Placement is {} p ? p.BuildingPart ?? p.ItemId.ToString(System.Globalization.CultureInfo.InvariantCulture) : null;
-        var key = $"{drawer.Search}\n{drawer.Filter}\n{drawer.Building}\n{drawer.World}\n{drawer.Zone}\n{buildingReady}\n{listsVersion}\n{placing}";
+        var key = $"{drawer.Search}\n{drawer.Filter}\n{drawer.Building}\n{drawer.World}\n{drawer.Effects}\n{drawer.Sounds}\n{drawer.Zone}\n{buildingReady}\n{listsVersion}\n{placing}\n{housing.PreviewingSound}";
         if (key != filterKey)
         {
             filterKey = key;
@@ -45,6 +52,10 @@ internal sealed partial class FurnishingEditor
                 FurnishDrawerUi.RecentFilter => Lists.Recent.Select(k => source.FirstOrDefault(x => x.WidgetId == k)).OfType<FurnitureEntry>(),
                 FurnishDrawerUi.FavouritesFilter => source.Where(x => Lists.IsFavourite(x.WidgetId)),
                 FurnishDrawerUi.AllFilter or FurnishDrawerUi.AllWorldFilter => source,
+                FurnishDrawerUi.LightFilter when drawer.World => source.Where(x => world.GivesLight(x.BuildingPart!)),
+                FurnishDrawerUi.EffectsFilter when drawer.World => source.Where(x => world.HasEffects(x.BuildingPart!)),
+                FurnishDrawerUi.SoundsFilter when drawer.World => source.Where(x => world.HasSounds(x.BuildingPart!)),
+                FurnishDrawerUi.RoomSizedFilter when drawer.Effects => source.Where(x => ambient.Find(x.BuildingPart!) is { Size: > 0 and < 10 }),
                 _ => source.Where(x => x.Category == filter),
             };
             if (drawer.World)
@@ -54,19 +65,33 @@ internal sealed partial class FurnishingEditor
                 filtered = matches.Where(x => (zone == null || x.Description == zone) && (x.Name.Contains(drawer.Search, StringComparison.CurrentCultureIgnoreCase)
                     || x.Description.Contains(drawer.Search, StringComparison.CurrentCultureIgnoreCase) || x.BuildingPart!.Contains(drawer.Search, StringComparison.OrdinalIgnoreCase))).ToArray();
             }
+            else if (ambientSource)
+                // An effect or sound answers to its name, its zone or its file.
+                filtered = matches.Where(x => x.Name.Contains(drawer.Search, StringComparison.CurrentCultureIgnoreCase)
+                    || x.Description.Contains(drawer.Search, StringComparison.CurrentCultureIgnoreCase) || x.BuildingPart!.Contains(drawer.Search, StringComparison.OrdinalIgnoreCase)).ToArray();
             else filtered = matches.Where(x => x.Name.Contains(drawer.Search, StringComparison.CurrentCultureIgnoreCase)).ToArray();
-            drawerItems = filtered.Select((x, i) => new DrawerItem(i, x.Name, x.Icon, Lists.IsFavourite(x.WidgetId), x.WidgetId == placing, drawer.World ? x.BuildingPart : null)).ToArray();
+            drawerItems = filtered.Select((x, i) => new DrawerItem(i, x.Name, x.Icon, Lists.IsFavourite(x.WidgetId), x.WidgetId == placing, drawer.World || drawer.Effects ? x.BuildingPart : null,
+                drawer.World && world.GivesLight(x.BuildingPart!), drawer.World && world.HasEffects(x.BuildingPart!), drawer.World && world.HasSounds(x.BuildingPart!),
+                drawer.Sounds, drawer.Sounds && x.BuildingPart == housing.PreviewingSound, ambientSource ? AmbientNote(x.BuildingPart!) : null)).ToArray();
         }
         if (drawerRoom.Length != roomRows.Length || drawerRoom.Any(r => r.Selected != IsSelected(roomRows[r.Index])))
             drawerRoom = roomRows.Select((r, i) => new DrawerRoomRow(i, r.Name, r.Detail, IsSelected(r))).ToArray();
         var notice = !housing.CanFurnish ? "Decorating access is required to place furnishings."
             : drawer.World && !buildingReady ? world.Status.Length > 0 ? world.Status : Catalogue.BuildingStatus
             : drawer.World ? "Pieces of the game's own world, from this game's data. Many are large and few are solid to walk on; guests see them when their game has them too."
-            : drawer.Building && !buildingReady ? Catalogue.BuildingStatus : "";
+            : drawer.Building && !buildingReady ? Catalogue.BuildingStatus
+            : ambientSource && housing.IsSharedVisit && !HousingController.AmbientShareable ? "World effects and sounds can be placed in Just me visits for now: gatherings can carry them once Haven's server is updated."
+            : ambientSource && !buildingReady ? ambient.Status.Length > 0 ? ambient.Status : "Reading the world's effects and sounds…"
+            : drawer.Effects ? housing.HavenEffects ? "The game's own effects. Names are guesses from a picture of each and can be wrong: place one to see it."
+                : "These show only with Haven's own effects: turn off Settings → Advanced → \"Use Stagehand's effects instead\"."
+            : drawer.Sounds ? housing.HavenSounds ? "The game's own ambient sounds. Names are guesses from where each plays: use a tile's play button to listen first."
+                : "These play only with Haven's own sounds: turn off Settings → Advanced → \"Use Stagehand's sounds instead\"."
+            : "";
         UpdateFurnitureImport();
         var yours = drawer.Tab == DrawerTab.Yours ? housing.Furniture.Library : [];
         var savedGroups = drawer.Tab == DrawerTab.Yours ? housing.SavedGroups : [];
-        var model = new FurnishDrawerModel(filters, drawerItems, drawerRoom, housing.CanFurnish, custom, notice, IconTexture)
+        var canPlace = housing.CanFurnish && !(drawer.Tab == DrawerTab.Catalogue && ambientSource && housing.IsSharedVisit && !HousingController.AmbientShareable);
+        var model = new FurnishDrawerModel(filters, drawerItems, drawerRoom, canPlace, custom, notice, IconTexture)
         {
             Yours = [.. yours.Select((f, i) => new DrawerCustom(i, f.Item.Name, f.Item.BaseItem == 0 ? "A prop made from a minion model" : "Built on " + (Catalogue.Find(f.Item.BaseItem)?.Name ?? "an unknown item"),
                 Catalogue.Find(f.Item.BaseItem)?.Icon ?? 0, housing.Placement?.CustomFurniture == f.Hash))],
@@ -77,7 +102,7 @@ internal sealed partial class FurnishingEditor
             ImportProps = furnitureChoice is { } props ? [.. props.Items.Select(i => i.PropModel != null)] : [],
             WarnProps = housing.WarnMinionProps,
             Zones = drawer.World ? worldZones : [],
-            Thumbnail = drawer.World ? WorldThumbnail : null,
+            Thumbnail = drawer.World || drawer.Effects ? WorldThumbnail : null,
             ImportGroups = furnitureChoice is { } groups ? [.. groups.Groups.Select(g => new DrawerModGroup(g.Index, g.Group.Name, g.Group.Single,
                 [.. g.Group.Options.Select(o => o.Name)], g.Group.Single ? g.Group.DefaultSettings : g.Group.Options.Count >= 64 ? ulong.MaxValue : (1UL << g.Group.Options.Count) - 1))] : [],
         };
@@ -125,6 +150,9 @@ internal sealed partial class FurnishingEditor
                 followCursor = true; movementInput.Reset();
                 housing.Run(() => { if (item.BuildingPart != null) housing.BeginBuilding(item.BuildingPart); else housing.BeginPlacement(item.ItemId); Select(housing.Placement!.Id, null); });
                 Lists.Used(item.WidgetId); SaveLists();
+                break;
+            case DrawerAction.Preview when command.Index < filtered.Length && filtered[command.Index].BuildingPart is { } heard:
+                housing.Run(() => housing.PreviewSound(heard));
                 break;
             case DrawerAction.Favourite when command.Index < filtered.Length:
                 Lists.ToggleFavourite(filtered[command.Index].WidgetId); SaveLists();

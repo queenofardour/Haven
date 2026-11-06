@@ -4062,11 +4062,11 @@ public unsafe partial class ZoneLoadService : IDisposable
             var ts = FFXIVClientStructs.FFXIV.Client.Game.Control.TargetSystem.Instance();
             if (ts != null)
             {
-                byte* tsb = (byte*)ts;
-                *(int*)(tsb + 0x148) = 0;
-                *(int*)(tsb + 0x2178) = 0;
-                *(int*)(tsb + 0x3B18) = 0;
-                *(int*)(tsb + 0x54B8) = 0;
+                // Through ClientStructs' fields, so a patch that moves them is fixed by Dalamud's update.
+                ts->TargetableObjectsOnScreen.Length = 0;
+                ts->ObjectFilterArray1.Length = 0;
+                ts->ObjectFilterArray2.Length = 0;
+                ts->ObjectFilterArray3.Length = 0;
             }
         }
         catch { /* transient during teardown; ignore */ }
@@ -4138,12 +4138,11 @@ public unsafe partial class ZoneLoadService : IDisposable
             ts->TargetObjectId = default;
 
             // THE FIX: empty the scan arrays so TargetSystem.Update's walk has nothing to deref
-            // during the reload. Length is the first field (0x00) of each GameObjectArray.
-            byte* tsb = (byte*)ts;
-            *(int*)(tsb + 0x148) = 0;   // TargetableObjectsOnScreen.Length
-            *(int*)(tsb + 0x2178) = 0;  // ObjectFilterArray1.Length
-            *(int*)(tsb + 0x3B18) = 0;  // ObjectFilterArray2.Length
-            *(int*)(tsb + 0x54B8) = 0;  // ObjectFilterArray3.Length
+            // during the reload (ClientStructs' fields, once raw offsets 0x148/0x2178/0x3B18/0x54B8).
+            ts->TargetableObjectsOnScreen.Length = 0;
+            ts->ObjectFilterArray1.Length = 0;
+            ts->ObjectFilterArray2.Length = 0;
+            ts->ObjectFilterArray3.Length = 0;
 
             DiagLog("[HavenNative] [SANITIZE] target scan arrays emptied + targets cleared (pre-reload)");
         }

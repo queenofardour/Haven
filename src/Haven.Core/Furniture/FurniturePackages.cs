@@ -336,6 +336,22 @@ public static class FurniturePackages
     }
 
     /// <summary>
+    /// A package's id (the folder it unpacks to), read from its manifest alone; null when it can't be read or isn't
+    /// valid. Nothing else in the package is opened.
+    /// </summary>
+    public static string? ManifestId(Stream package)
+    {
+        try
+        {
+            using var zip = new ZipArchive(package, ZipArchiveMode.Read, leaveOpen: true);
+            if (zip.GetEntry("manifest.json") is not { } entry) return null;
+            var id = JsonSerializer.Deserialize<FurnitureManifest>(Bytes(entry, 256 * 1024), Json)?.Id;
+            return id is { Length: 12 } && id.All(Uri.IsHexDigit) && !id.Any(char.IsUpper) ? id : null;
+        }
+        catch (Exception ex) when (ex is InvalidDataException or JsonException or IOException or NotSupportedException) { return null; }
+    }
+
+    /// <summary>
     /// Opens a package from anyone (a download), checking everything before any file reaches the game: its size, its
     /// manifest, that every file lives under its own id's folder and is one the manifest lists, the unpacked total,
     /// and each file's structure.

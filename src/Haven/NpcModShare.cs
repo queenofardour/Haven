@@ -153,6 +153,28 @@ internal sealed class NpcModShare(IDalamudPluginInterface plugin, HousingControl
         Uninstall(npc);
         older.Remove(npc);
     }
+    /// <summary>Every NPC's mods this PC keeps (Settings → Custom content → NPC mods).</summary>
+    public IReadOnlyList<NpcModSet> KeptSets() => store.All();
+
+    /// <summary>
+    /// Removes the mods this PC keeps for these NPCs (Settings), and the files no other NPC uses. Unlike Forget, guests
+    /// aren't told to drop theirs. Refused while mods are being shared, kept or fetched.
+    /// </summary>
+    public int RemoveKept(IReadOnlyCollection<Guid> npcs)
+    {
+        if (busy || sharing != null || incoming != null || preparing != null) throw new InvalidOperationException("Haven is still sharing or keeping an NPC's mods. Try again in a moment.");
+        var removed = 0;
+        foreach (var npc in npcs.Distinct())
+        {
+            if (store.Stored(npc) == null) continue;
+            DropKept(npc);
+            removed++;
+        }
+        if (removed > 0) store.TidyFiles();
+        log.Information("[NPC-MODS] removed the kept mods of {Count} NPC(s) from Settings.", removed);
+        return removed;
+    }
+
     /// <summary>The NPC whose mods are being shared from here, if any.</summary>
     public Guid? SharingNpc => sharing?.Npc ?? preparing;
     /// <summary>Said before the player is dressed as an NPC (kept with the panel, which the UI preview compiles).</summary>
