@@ -100,7 +100,7 @@ internal static class PlacementUi
                 ImGui.SameLine(); if (HavenKit.IconButton("##bar-snap", HavenIcon.Grid, "Snap and grid", snap, ToolbarHeight)) ImGui.OpenPopup("##placement-options");
                 ImGui.SameLine();
                 if (HavenKit.IconButton("##bar-camera", HavenIcon.FreeCamera, state.FreeCamera
-                        ? "Free camera is on: WASD or a middle-drag moves it, the wheel zooms, a right-drag turns it. Click to follow your character again."
+                        ? "Free camera is on: WASD or a middle-drag moves it, Space and C raise and lower it, the wheel zooms, a right-drag turns it. Click to follow your character again."
                         : "Free camera: look around the room without moving your character", state.FreeCamera, ToolbarHeight))
                     action = EditorAction.FreeCamera;
                 Divider();
@@ -179,7 +179,7 @@ internal static class PlacementUi
             ImGui.SameLine();
             HavenKit.IconButton("##hud-keys", HavenIcon.Info, "", size: ControlHeight);
             if (ImGui.IsItemHovered())
-                HavenKit.Tooltip("Move: arrows, Page Up / Page Down · Rotate: Q / E · Scale: + / −\nDrag the X / Y / Z handles to move along one axis\nShift: fine · Ctrl: coarse · F: hold or follow the cursor\nEnter, click, right-click or Done: set it down · Esc: cancel\nFree camera (toolbar): WASD or middle-drag pans · wheel zooms · right-drag turns");
+                HavenKit.Tooltip("Move: arrows, Page Up / Page Down · Rotate: Q / E · Scale: + / −\nDrag the X / Y / Z handles to move along one axis\nShift: fine · Ctrl: coarse · F: hold or follow the cursor\nEnter, click, right-click or Done: set it down · Esc: cancel\nFree camera (toolbar): WASD or middle-drag pans · Space / C up and down · wheel zooms · right-drag turns");
             ImGui.SameLine(); if (HavenKit.Button("Cancel##hud", ButtonKind.Ghost)) action = EditorAction.Cancel;
             ImGui.SameLine(); ImGui.BeginDisabled(!state.HasTarget);
             if (HavenKit.Button("Place##hud", ButtonKind.Primary)) action = EditorAction.Place;

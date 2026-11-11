@@ -56,6 +56,12 @@ internal sealed partial class FurnishingEditor
             var move = flat * walk.Forward + right * walk.Strafe;
             cameraFocus += Vector3.Normalize(move) * speed * dt;
         }
+        // Space rises and C sinks, at the same speed.
+        if (keys && WorldEditorKeys.Rising is var rise && rise != 0)
+        {
+            var speed = Math.Clamp(view.Distance * PanSpeed, 1.5f, 12) * (WorldEditorKeys.Read().Shift ? 3 : 1);
+            cameraFocus += Vector3.UnitY * rise * speed * dt;
+        }
         // A middle-drag moves the view with the pointer, in the screen's plane.
         var middle = focused && WorldEditorKeys.Middle;
         if (!middle) cameraPanning = false;

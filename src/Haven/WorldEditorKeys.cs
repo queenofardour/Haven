@@ -24,6 +24,8 @@ internal static class WorldEditorKeys
     public static bool Ctrl => Down(0x11);
     /// <summary>Movement keys for walking a possessed NPC: W/S forward, D/A right, Ctrl to walk rather than run.</summary>
     public static (int Forward, int Strafe, bool Walk, bool Jump) Walking => ((Down(0x57) ? 1 : 0) - (Down(0x53) ? 1 : 0), (Down(0x44) ? 1 : 0) - (Down(0x41) ? 1 : 0), Down(0x11), Down(0x20));
+    /// <summary>The free camera's height keys: Space up (1), C down (-1).</summary>
+    public static int Rising => (Down(0x20) ? 1 : 0) - (Down(0x43) ? 1 : 0);
     public static bool Alt => Down(0x12);
     public static bool Middle => Down(0x04);
     // Selection shortcuts while decorating: Delete, Ctrl+D, Ctrl+G (Shift unlinks), Escape.

@@ -110,7 +110,9 @@ internal sealed unsafe class EmoteWindowService : IDisposable
             if (data.GetExcelSheet<Emote>().GetRowOrDefault(id) is { } row) commands.Insert(0, row.Name.ExtractText());
             searchTerms[id] = [.. commands];
         }
-        log.Information($"[Haven] Emote window: {lockedByOrder.Count} emotes you don't own are listed inside the home.");
+        log.Information(Haven.Native.PatchCheck.PatchGuard.Allows(Haven.Core.PatchFeature.EmoteWindow)
+            ? $"[Haven] Emote window: {lockedByOrder.Count} emotes you don't own are listed inside the home."
+            : $"[Haven] Emote window: {lockedByOrder.Count} emotes you don't own aren't listed: paused after the game's update (Settings → Advanced).");
     }
 
     private List<string> Commands(uint id)

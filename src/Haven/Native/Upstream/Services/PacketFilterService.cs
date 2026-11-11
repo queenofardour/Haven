@@ -982,7 +982,10 @@ public unsafe class PacketFilterService : IDisposable
                         if (seen >= RelearnConfirmThreshold)
                         {
                             string old = SpawnOpcodes.Count > 0 ? string.Join(",", SpawnOpcodes) : "∅";
-                            SpawnOpcodes.Clear();            // PlayerSpawn is singular → replace the stale opcode wholesale
+                            // Added, not replaced (11 November 2026): on game 2026.11.03 full-signature spawns arrived on
+                            // both 764 (the community map's PlayerSpawn) and 940, so replacing made each relearn drop the
+                            // other. Every opcode here still had 3 full-signature sightings; at most 4 are kept.
+                            if (SpawnOpcodes.Count >= 4) SpawnOpcodes.Clear();
                             SpawnOpcodes.Add(rop);
                             spawnRelearnCandidates.Clear();
                             log.Warning("[HavenNative] [RELEARN] PlayerSpawn opcode rotated: spawn-signature now on opcode " + rop +

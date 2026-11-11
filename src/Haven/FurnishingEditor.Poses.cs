@@ -52,6 +52,8 @@ internal sealed partial class FurnishingEditor
     {
         if (housing.Bound is not { Playing: true } && !housing.ArcadeHolding && !housing.NpcHolding && !housing.CameraHolding || !WorldEditorKeys.Focused || GameTextInput()) return;
         foreach (var key in HeldOnBall) if (keyState[key]) keyState[key] = false;
+        // C lowers the free camera, so it mustn't open the character window as well.
+        if (housing.CameraHolding && keyState[Dalamud.Game.ClientState.Keys.VirtualKey.C]) keyState[Dalamud.Game.ClientState.Keys.VirtualKey.C] = false;
     }
 
     // The X/Y/Z handles at the player's feet, in the ball's own directions; dragging one moves the player along it.

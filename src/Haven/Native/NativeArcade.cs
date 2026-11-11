@@ -293,7 +293,7 @@ internal sealed unsafe class NativeArcade : IDisposable
         }
     }
 
-    private static bool IsText(AtkValue value) => value.Type is AtkValueType.String or AtkValueType.ManagedString or AtkValueType.String8;
+    private static bool IsText(AtkValue value) => value.Type is AtkValueType.String or AtkValueType.ManagedString or AtkValueType.ConstString;
 
     // A game-owned copy (freed with the value, as the game frees its own), null-terminated.
     private static void SetText(ref AtkValue value, byte[] text)
